@@ -37,6 +37,20 @@ class DeployTests(unittest.TestCase):
         self.assertEqual(path.parent.name, "codex_sync")
         self.assertTrue(path.exists())
 
+    def test_local_server_path_uses_pyinstaller_bundle(self) -> None:
+        bundle = Path(self.tmp.name) / "_MEI-test"
+        bundled_pkg = bundle / "codex_sync"
+        bundled_pkg.mkdir(parents=True)
+        bundled_server = bundled_pkg / "sync_server.py"
+        bundled_server.write_text("# bundled server\n", encoding="utf-8")
+        missing_source = Path(self.tmp.name) / "missing" / "codex_sync" / "deploy.py"
+
+        with (
+            mock.patch.object(deploy, "__file__", str(missing_source)),
+            mock.patch.object(deploy.sys, "_MEIPASS", str(bundle), create=True),
+        ):
+            self.assertEqual(deploy.local_sync_server_path(), bundled_server)
+
     def test_config_roundtrip(self) -> None:
         c = DeployConfig(ssh_target="user@host", ssh_port=2222, bind_port=9999, nginx_enabled=True, nginx_server_name="example.com")
         path = deploy.save_deploy_config(c)

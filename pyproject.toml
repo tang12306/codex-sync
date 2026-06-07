@@ -1,6 +1,6 @@
 [project]
 name = "codex-sync"
-version = "0.1.1"
+version = "0.1.2"
 description = "Windows-side Codex sync desktop console and agent core."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,7 @@ codex-sync-server = "codex_sync.sync_server:main"
 include = ["codex_sync*"]
 
 [tool.setuptools.package-data]
-codex_sync = ["web/**/*.html", "web/**/*.css", "web/**/*.js", "web/**/*.svg", "web/**/*.map"]
+codex_sync = ["sync_server.py", "web/**/*.html", "web/**/*.css", "web/**/*.js", "web/**/*.svg", "web/**/*.map"]
 
 [build-system]
 requires = ["setuptools>=68", "wheel"]

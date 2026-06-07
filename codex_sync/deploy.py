@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import subprocess
+import sys
 import tempfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -75,7 +76,14 @@ def save_deploy_config(cfg: DeployConfig) -> Path:
 
 def local_sync_server_path() -> Path:
     """Packaged server entry used for one-click deployment."""
-    return Path(__file__).resolve().parent / "sync_server.py"
+    candidates = [Path(__file__).resolve().parent / "sync_server.py"]
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    if bundle_root:
+        candidates.append(Path(bundle_root) / "codex_sync" / "sync_server.py")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 # ---------- SSH / scp 封装 ----------
