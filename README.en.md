@@ -2,135 +2,131 @@
 
 [中文](README.md)
 
-Codex Sync is a Windows-side Codex conversation sync and disaster recovery tool. It focuses on local full conversation backups, selective restore/import, project snapshot upload to a self-hosted server, dirty-state notifications, branch conflict protection, Windows scheduled sync, WSL support, and a local web desktop console.
+Codex Sync is a Windows desktop app for carrying Codex work across devices. It syncs project progress, uploads project snapshots, backs up and imports Codex conversations, and manages Windows and WSL Codex environments from one local console.
 
-Full conversation archives are sensitive. Client-side encryption is not implemented yet, so full backups are stored locally by default and are uploaded only when plaintext upload is explicitly enabled.
+The primary experience is the EXE desktop app. The CLI remains available for automation and troubleshooting, but daily use should happen through the desktop console.
+
+## What It Does
+
+- **Resume Codex conversations across devices**: back up full conversations from one machine, then import selected conversations into a target Windows or WSL Codex environment on another machine.
+- **Sync project progress**: choose any project directory; Git projects are uploaded as patch snapshots, while non-Git projects are packed with safety exclusions.
+- **Treat Windows and WSL as first-class homes**: each WSL distro can be backed up, restored, and used as an import target.
+- **Use your own server**: backups go to your self-hosted sync server instead of a GitHub backup branch.
+- **Protect conflicting histories**: full backups use an append-only branch model so remote changes do not overwrite older conversation chains.
+- **Create disaster backups before risky writes**: restore, import, and channel merge operations create local protection backups first.
+
+## Desktop Experience
+
+The desktop app is the main entry point:
+
+- Overview shows local, remote, and other-device sync state.
+- Conversations & Backups handles full backups, cloud backup lists, import, browsing, and channel merging.
+- Project Backup lets you choose any project directory and upload a project snapshot.
+- Settings manages server connection, one-click deployment, backup policy, scheduled tasks, and diagnostics.
+
+The local web desktop binds only to `127.0.0.1` and generates a per-process session token. Do not expose it through a reverse proxy.
 
 ## Quick Start
 
-Install from a source checkout:
+If you downloaded a release package, run:
+
+```text
+CodexSync.exe
+```
+
+From source:
 
 ```powershell
 python -m pip install -e .
-```
-
-Start the local web desktop:
-
-```powershell
 codex-sync desktop
 ```
 
-You can also run:
+The repository also includes a Windows launcher:
 
 ```text
 Start-CodexSyncDesktop.bat
 ```
 
-The legacy Tkinter console remains available:
+## Recommended Workflow
+
+1. Open Codex Sync on your main machine.
+2. Configure or one-click deploy your sync server from Settings.
+3. Create a full conversation backup from Conversations & Backups.
+4. Select your current project and upload a project snapshot from Project Backup.
+5. On another machine, open Codex Sync, list cloud backups, choose a target Windows/WSL home and channel, then import.
+
+Lightweight snapshots are diagnostic handoff state: cwd, Git status, configuration summaries, and recent events. The main cross-device conversation workflow is full backup plus selective import.
+
+## Self-Hosted Sync Server
+
+Codex Sync uses a small sync server to store lightweight snapshots, project backups, and full conversation backups. Install it on a Linux server:
 
 ```powershell
-codex-sync desktop-legacy
+python -m codex_sync deploy-config --ssh-target user@your-server
+python -m codex_sync deploy-server --install --yes
 ```
 
-## Common Commands
+Default deployment paths:
 
-```powershell
-codex-sync config --server-url https://sync.example.com --api-token YOUR_TOKEN
-codex-sync install-hooks
-codex-sync hook-status
-codex-sync sync-now
-codex-sync daemon
-codex-sync install-task --minutes 3
-codex-sync task-status
-codex-sync uninstall-task
-```
+- Code: `/opt/codex-sync-server`
+- Data: `/var/lib/codex-sync`
+- Token: `/etc/codex-sync/server-token`
+- Bind address: `0.0.0.0:8888`
 
-Full conversation backups:
+After installation, the local client config is backfilled with `server_url` and the generated API token. The desktop Settings page can also check status, update deployment, and use a temporary SSH password.
 
-```powershell
-python -m codex_sync full-backup-status
-python -m codex_sync full-backup-now
-python -m codex_sync full-backup-now --upload --allow-plaintext-upload
-python -m codex_sync list-full-backups
-python -m codex_sync download-full-backup BACKUP_ID
-python -m codex_sync restore-full-backup ARCHIVE.zip --confirm-backup-id BACKUP_ID
-```
-
-WSL and project backup commands:
-
-```powershell
-python -m codex_sync wsl-status
-python -m codex_sync wsl-pull DISTRO
-python -m codex_sync git-snapshot
-python -m codex_sync project-backup
-python -m codex_sync list-project-backups
-```
-
-`git-snapshot` creates a local patch snapshot for the current Git working tree. `project-backup` uploads a project zip to the configured sync server. Git repositories use patch snapshots; non-Git folders are packed as ordinary files with the same safety exclusions. `.env`, keys, certificates, build outputs, dependency folders, and caches are skipped.
-
-## Sync Model
-
-`sync-now` performs three operations:
-
-1. Checks local Codex state and skips unchanged lightweight snapshot uploads when possible.
-2. Flushes queued lightweight snapshots from the local outbox.
-3. Scans full conversation content digests, sends dirty notifications when content changes, and creates a local full backup after the content has been quiet.
-
-The main cross-machine workflow is:
-
-```text
-full conversation backup -> download/import -> choose target Codex home/channel
-```
-
-Remote lightweight snapshots are kept as diagnostics and fallback handoff state. They include cwd, Git status, configuration summaries, and recent events, but not full conversation text.
-
-## Server
-
-Start a local test server:
+Local test server:
 
 ```powershell
 codex-sync-server
 ```
 
-Source checkouts can also use the compatibility wrapper:
+## Backup Contents and Security
+
+Full conversation backups include Codex conversation text, thread indexes, and required state databases. They exclude by default:
+
+- `auth.json`, `cap_sid`
+- `.env`
+- SSH keys, certificates, and key files
+- `config.toml`, `hooks.json`
+- browser state, caches, temp folders, and runtime process folders
+
+Client-side encryption is not implemented yet. Full conversation archives contain real context, so cloud upload is disabled by default and requires explicit plaintext-upload approval.
+
+Project backups skip `.env`, keys, certificates, `node_modules`, `dist`, `build`, cache folders, and files exceeding the configured size limit.
+
+## Automatic Sync and Hooks
+
+Codex hooks mark local state as changed when sessions start, prompts are submitted, context is compacted, or a session stops. Periodic scans also detect conversation changes by content digest.
+
+Install a Windows scheduled task for background lightweight sync and local full-backup generation:
 
 ```powershell
-python sync_server.py
+codex-sync install-task --minutes 3
 ```
 
-Default local address:
+Plaintext full conversation archives are not uploaded automatically by default.
 
-```text
-http://127.0.0.1:8888
-```
+## Developer and Automation Commands
 
-Token source order:
-
-- `CODEX_SYNC_SERVER_TOKEN`
-- `CODEX_SYNC_SERVER_TOKEN_FILE`
-- an auto-generated token file
-
-## One-Click Deployment
-
-`deploy-server` deploys the packaged server entry to your own Linux server over SSH. Connection settings live in `~/.codex-sync/deploy.json`; `deploy.example.json` is only a template.
+The desktop app is the main UI. These commands are useful for development, automation, and troubleshooting:
 
 ```powershell
-python -m codex_sync deploy-config --ssh-target user@your-server
-python -m codex_sync deploy-server --install --yes
-python -m codex_sync deploy-server --update --yes
-python -m codex_sync deploy-server --status
-python -m codex_sync deploy-server --rollback --yes
+codex-sync desktop
+codex-sync config --server-url https://sync.example.com --api-token YOUR_TOKEN
+codex-sync sync-now
+codex-sync full-backup-now
+codex-sync full-backup-now --upload --allow-plaintext-upload
+codex-sync list-full-backups
+codex-sync project-backup
+codex-sync list-project-backups
+codex-sync wsl-status
+codex-sync deploy-server --status
 ```
 
-The default install uses `/opt/codex-sync-server` for code, `/var/lib/codex-sync` for data, `/etc/codex-sync/server-token` for the API token, and binds the server to `0.0.0.0:8888`. The generated `server_url` and token are written back to the local client config.
+## Project Status
 
-## Security Notes
-
-- Full conversation backups contain real conversation content.
-- Plaintext cloud upload is disabled by default.
-- The local web desktop binds to `127.0.0.1` and uses a per-process session token. Do not expose it through a proxy.
-- Do not commit `deploy.json`, `.env` files, SSH keys, API tokens, generated archives, or local database files.
-- The sync server uses bearer-token authentication. Use HTTPS or a trusted private network for production.
+Codex Sync is alpha software. The current focus is the Windows desktop app, WSL workflows, self-hosted server backups, and practical cross-device Codex conversation migration.
 
 ## License
 
