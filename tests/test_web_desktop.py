@@ -6,10 +6,11 @@ import threading
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from http.server import ThreadingHTTPServer
 
 from codex_sync import __version__
-from codex_sync.web_desktop import DesktopRuntime, create_local_server, make_handler
+from codex_sync.web_desktop import DesktopRuntime, SingleInstance, create_local_server, make_handler
 
 
 class WebDesktopTests(unittest.TestCase):
@@ -93,6 +94,18 @@ class WebDesktopTests(unittest.TestCase):
                     os.environ.pop("CODEX_SYNC_HOME", None)
                 else:
                     os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    @unittest.skipUnless(os.name == "nt", "Windows mutex behavior")
+    def test_single_instance_rejects_second_owner(self) -> None:
+        name = f"Local\\CodexSyncTest-{uuid.uuid4()}"
+        first = SingleInstance(name)
+        second = SingleInstance(name)
+        try:
+            self.assertTrue(first.acquire())
+            self.assertFalse(second.acquire())
+        finally:
+            second.release()
+            first.release()
 
 
 if __name__ == "__main__":

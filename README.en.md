@@ -34,7 +34,7 @@ If you downloaded a release package, run:
 CodexSync.exe
 ```
 
-By default it opens the standalone Codex Sync desktop window. Closing the window also stops the local service.
+By default it opens the standalone Codex Sync desktop window. When closing the window, Codex Sync asks whether to minimize to the taskbar or exit completely and stop the local service. Launching it again focuses the existing window instead of starting a second instance.
 
 From source:
 

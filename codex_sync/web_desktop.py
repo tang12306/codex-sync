@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import sys
@@ -61,6 +62,8 @@ HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 ASSET_VERSION = __version__
 CACHE_CONTROL = "no-store, max-age=0, must-revalidate"
+ERROR_ALREADY_EXISTS = 183
+WINDOW_TITLE = "Codex Sync"
 
 STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -73,6 +76,41 @@ STATIC_CONTENT_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+
+class SingleInstance:
+    def __init__(self, name: str = "Local\\CodexSyncDesktop") -> None:
+        self.name = name
+        self.handle: int | None = None
+        self.already_running = False
+
+    def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        handle = kernel32.CreateMutexW(None, False, self.name)
+        if not handle:
+            return True
+        self.handle = int(handle)
+        self.already_running = ctypes.get_last_error() == ERROR_ALREADY_EXISTS
+        return not self.already_running
+
+    def release(self) -> None:
+        if os.name != "nt" or not self.handle:
+            return
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        kernel32.CloseHandle(self.handle)
+        self.handle = None
 
 
 def _add_no_cache_headers(handler: BaseHTTPRequestHandler) -> None:
@@ -105,6 +143,37 @@ def _rewrite_index_assets(html: str) -> str:
         lambda match: f"{match.group(1)}{_append_asset_version(match.group(2))}{match.group(3)}",
         html,
     )
+
+
+def _focus_existing_window() -> bool:
+    if os.name != "nt":
+        return False
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    hwnd = user32.FindWindowW(None, WINDOW_TITLE)
+    if not hwnd:
+        return False
+    user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+    user32.SetForegroundWindow(hwnd)
+    return True
+
+
+def _close_choice() -> str:
+    if os.name != "nt":
+        return "exit"
+    import ctypes
+
+    message = "要将 Codex Sync 最小化到任务栏，还是彻底退出？\n\n选择“是”：最小化，后台继续运行。\n选择“否”：彻底退出。\n选择“取消”：返回应用。"
+    MB_YESNOCANCEL = 0x00000003
+    MB_ICONQUESTION = 0x00000020
+    MB_DEFBUTTON1 = 0x00000000
+    result = ctypes.windll.user32.MessageBoxW(None, message, "关闭 Codex Sync", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1)
+    if result == 6:  # IDYES
+        return "minimize"
+    if result == 7:  # IDNO
+        return "exit"
+    return "cancel"
 
 
 _DEPLOY_STR_FIELDS = (
@@ -936,6 +1005,24 @@ def _wait_for_background_server(local: LocalDesktopServer) -> None:
         pass
 
 
+def _attach_close_prompt(window: Any, local: LocalDesktopServer) -> None:
+    def on_closing() -> bool | None:
+        choice = _close_choice()
+        local.runtime.log("run", "desktop close requested", {"choice": choice})
+        if choice == "minimize":
+            try:
+                window.minimize()
+            except Exception as exc:  # noqa: BLE001 - close prompt should not crash the app
+                local.runtime.log("error", "failed to minimize window", {"error": str(exc)})
+            return False
+        if choice == "cancel":
+            return False
+        local.runtime.log("ok", "desktop window exit confirmed")
+        return None
+
+    window.events.closing += on_closing
+
+
 def open_desktop_window(local: LocalDesktopServer) -> None:
     local.start()
     try:
@@ -949,8 +1036,8 @@ def open_desktop_window(local: LocalDesktopServer) -> None:
     try:
         webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
         webview.settings["OPEN_DEVTOOLS_IN_DEBUG"] = False
-        webview.create_window(
-            "Codex Sync",
+        window = webview.create_window(
+            WINDOW_TITLE,
             local.url,
             width=1280,
             height=860,
@@ -960,6 +1047,8 @@ def open_desktop_window(local: LocalDesktopServer) -> None:
             confirm_close=False,
             background_color="#0f172a",
         )
+        if window is not None:
+            _attach_close_prompt(window, local)
         webview.start(gui="edgechromium", debug=False, private_mode=True, icon=_desktop_icon_path())
     except Exception as exc:  # noqa: BLE001 - fall back to browser if WebView2 is missing/broken
         local.runtime.log("error", "desktop window failed; falling back to browser", {"error": str(exc)})
@@ -970,12 +1059,21 @@ def open_desktop_window(local: LocalDesktopServer) -> None:
 
 
 def main(open_browser: bool = False, port: int | None = None, window: bool = True) -> None:
-    local = create_local_server(port)
-    if window:
-        open_desktop_window(local)
+    instance = SingleInstance() if window else None
+    if instance and not instance.acquire():
+        _focus_existing_window()
+        instance.release()
         return
-    if open_browser:
-        webbrowser.open(local.url)
-    print(f"Codex Sync desktop: {local.url}")
-    print("Press Ctrl+C to stop.")
-    local.serve_forever()
+    local = create_local_server(port)
+    try:
+        if window:
+            open_desktop_window(local)
+            return
+        if open_browser:
+            webbrowser.open(local.url)
+        print(f"Codex Sync desktop: {local.url}")
+        print("Press Ctrl+C to stop.")
+        local.serve_forever()
+    finally:
+        if instance:
+            instance.release()
