@@ -1,5 +1,7 @@
 # Codex Sync
 
+[English](README.en.md)
+
 Codex Sync 是一个 Windows 侧的 Codex 对话同步与灾难保护工具。当前版本重点解决：完整对话本地备份与导入、项目补丁快照上传服务器、服务器 dirty 状态通知、冲突分支保护、Windows 定时同步和桌面控制台。
 
 当前项目还没有接入客户端加密，所以完整对话包默认只生成在本地，不会自动上传云端。只有显式使用 `--allow-plaintext-upload` 或在配置里允许明文上传时，才会把完整对话包传到服务器。
