@@ -1,0 +1,38 @@
+[project]
+name = "codex-sync"
+version = "0.1.0"
+description = "Windows-side Codex sync desktop console and agent core."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Codex Sync contributors" }]
+keywords = ["codex", "backup", "sync", "wsl", "desktop"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Win32 (MS Windows)",
+  "Intended Audience :: Developers",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Topic :: Software Development :: Version Control",
+  "Topic :: System :: Archiving :: Backup",
+]
+dependencies = []
+
+[project.scripts]
+codex-sync = "codex_sync.cli:main"
+codex-sync-server = "codex_sync.sync_server:main"
+
+[tool.setuptools.packages.find]
+include = ["codex_sync*"]
+
+[tool.setuptools.package-data]
+codex_sync = ["web/**/*.html", "web/**/*.css", "web/**/*.js", "web/**/*.svg", "web/**/*.map"]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"

@@ -1,0 +1,15 @@
+{
+  "ssh_target": "user@your-server.example.com",
+  "ssh_port": 22,
+  "remote_dir": "/opt/codex-sync-server",
+  "service_name": "codex-sync-server",
+  "python": "python3",
+  "bind_host": "0.0.0.0",
+  "bind_port": 8888,
+  "data_dir": "/var/lib/codex-sync",
+  "token_file": "/etc/codex-sync/server-token",
+  "max_body_bytes": 536870912,
+  "nginx_enabled": false,
+  "nginx_server_name": "",
+  "client_max_body_size": "512m"
+}

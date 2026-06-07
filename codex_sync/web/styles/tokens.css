@@ -1,0 +1,51 @@
+/* 设计变量：现代精致暗色，融合渐变与发光微动效 */
+:root {
+  /* 背景：深邃暗色阶梯 */
+  --bg: #0b0f17;
+  --bg-elev-1: #111827;
+  --bg-elev-2: #1f2937;
+  --bg-inset: #030712;
+
+  /* 边框：带微透精致细线 */
+  --border: rgba(55, 65, 81, 0.5);
+  --border-strong: rgba(75, 85, 99, 0.8);
+
+  /* 文本：多层次高可读 */
+  --text: #f3f4f6;
+  --text-secondary: #9ca3af;
+  --text-muted: #6b7280;
+
+  /* 强调色：蓝青霓虹渐变（New API 风格） */
+  --accent: #4f46e5;
+  --accent-hover: #6366f1;
+  --accent-soft: rgba(79, 70, 229, 0.1);
+  --on-accent: #ffffff;
+  
+  /* 现代渐变色 */
+  --accent-gradient: linear-gradient(135deg, #4f46e5, #06b6d4);
+  --accent-gradient-hover: linear-gradient(135deg, #6366f1, #22d3ee);
+  --accent-glow: 0 0 15px rgba(79, 70, 229, 0.35);
+
+  /* 语义色 */
+  --ok: #10b981;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --danger-hover: #f87171;
+  --danger-bg: rgba(239, 68, 68, 0.1);
+
+  /* 字体：Outfit & Inter 现代英文与系统无衬线中文 */
+  --font-sans: 'Outfit', 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
+    "PingFang SC", "Microsoft YaHei", sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular",
+    "Liberation Mono", Menlo, monospace;
+
+  /* 形状/节奏 */
+  --radius: 12px;
+  --radius-sm: 8px;
+  --radius-lg: 16px;
+  --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* 尺寸 */
+  --sidebar-w: 240px;
+  --topbar-h: 70px;
+}

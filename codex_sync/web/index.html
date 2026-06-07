@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Codex Sync 控制台</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;500;600;700;800&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="/styles/tokens.css" />
+    <link rel="stylesheet" href="/styles/base.css" />
+    <link rel="stylesheet" href="/styles/layout.css" />
+    <link rel="stylesheet" href="/styles/components.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="brand-mark">CS</div>
+          <div class="brand-text">
+            <span class="brand-name">Codex Sync</span>
+            <span class="brand-sub" id="brand-sub">本机同步控制台</span>
+          </div>
+        </div>
+        <nav class="nav" id="nav">
+          <div class="nav-section">主要任务</div>
+          <a class="nav-item" href="#/overview" data-route="overview">首页</a>
+          <a class="nav-item" href="#/conversations" data-route="conversations">对话与备份</a>
+          <a class="nav-item" href="#/project" data-route="project">项目备份</a>
+          <div class="nav-section">管理与高级</div>
+          <a class="nav-item" href="#/settings" data-route="settings">系统设置</a>
+        </nav>
+        <div class="sidebar-foot" id="sidebar-foot">Codex Sync · v2.0</div>
+      </aside>
+
+      <div class="main">
+        <header class="topbar">
+          <div class="topbar-title">
+            <h1 id="view-title">概览</h1>
+            <p id="view-sub">本机与 Codex 云端的同步状态</p>
+          </div>
+          <div class="topbar-actions">
+            <span class="conn-pill" id="conn-pill" data-state="unknown">未连接</span>
+            <button class="btn btn-ghost btn-sm" id="logs-toggle" type="button">日志</button>
+            <button class="btn btn-ghost btn-sm" id="refresh-btn" type="button">刷新</button>
+            <button class="btn btn-primary btn-sm" id="sync-btn" type="button">立即同步</button>
+          </div>
+        </header>
+        <main class="view" id="view-root"></main>
+      </div>
+    </div>
+
+    <!-- 远端快照详情/还原抽屉（由 views/drawer.js 填充） -->
+    <div class="drawer" id="drawer-root" aria-hidden="true"></div>
+    <!-- 全局日志滑出面板（由 views/logs.js 填充） -->
+    <aside class="logs-panel" id="logs-root" aria-hidden="true"></aside>
+    <!-- 浮动通知 -->
+    <div class="toast-root" id="toast-root"></div>
+
+    <script type="module" src="/js/main.js"></script>
+  </body>
+</html>

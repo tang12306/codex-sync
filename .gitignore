@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+build/
+dist/
+
+# OS / 临时
+.DS_Store
+.vscode/
+*.tmp
+_*_domcheck.mjs
+
+# 本地配置（含服务器连接信息 / token），切勿提交；示例见 deploy.example.json
+/deploy.json
+/.env
+/.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.zip
+*.sqlite
+*.sqlite3
+*.db
+*.log
+
+# 本地运行/发布产物
+/.codex-sync/
+/codex_snapshots/
