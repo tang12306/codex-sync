@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import sys
 import threading
 import webbrowser
 from http import HTTPStatus
@@ -55,6 +56,7 @@ from .wsl import (
 
 
 STATIC_DIR = Path(__file__).resolve().parent / "web"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
 ASSET_VERSION = __version__
@@ -764,6 +766,36 @@ class DesktopRuntime:
         return {"daemon_running": False, "message": "Daemon stop requested"}
 
 
+class LocalDesktopServer:
+    def __init__(self, runtime: DesktopRuntime, server: ThreadingHTTPServer, url: str) -> None:
+        self.runtime = runtime
+        self.server = server
+        self.url = url
+        self.thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if self.thread and self.thread.is_alive():
+            return
+        self.thread = threading.Thread(target=self.server.serve_forever, name="CodexSyncDesktopServer", daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        self.runtime.stop_daemon()
+        if self.thread and self.thread.is_alive():
+            self.server.shutdown()
+            self.thread.join(timeout=5)
+        self.server.server_close()
+
+    def serve_forever(self) -> None:
+        try:
+            self.server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            self.runtime.stop_daemon()
+            self.server.server_close()
+
+
 def _json_response(handler: BaseHTTPRequestHandler, value: Any, status: int = 200) -> None:
     body = json.dumps(value, ensure_ascii=False, indent=2).encode("utf-8")
     handler.send_response(status)
@@ -868,7 +900,7 @@ def find_port(start: int = DEFAULT_PORT) -> int:
     raise RuntimeError("No free local port found for Codex Sync desktop.")
 
 
-def main(open_browser: bool = True, port: int | None = None) -> None:
+def create_local_server(port: int | None = None) -> LocalDesktopServer:
     runtime = DesktopRuntime()
     protection = create_disaster_backup(load_config(), reason="web_desktop_start")
     runtime.log("ok", "preflight backup completed before desktop start", protection)
@@ -876,12 +908,74 @@ def main(open_browser: bool = True, port: int | None = None) -> None:
     server = ThreadingHTTPServer((HOST, port), make_handler(runtime))
     url = f"http://{HOST}:{port}/"
     runtime.log("ok", "modern desktop console started", {"url": url})
-    if open_browser:
-        webbrowser.open(url)
-    print(f"Codex Sync desktop: {url}")
-    print("Press Ctrl+C to stop.")
+    return LocalDesktopServer(runtime, server, url)
+
+
+def _desktop_icon_path() -> str | None:
+    bundle_root = getattr(sys, "_MEIPASS", None)
+    candidates = []
+    if bundle_root:
+        candidates.append(Path(bundle_root) / "assets" / "CodexSync.ico")
+    candidates.extend(
+        [
+            PROJECT_ROOT / "assets" / "CodexSync.ico",
+            Path.cwd() / "assets" / "CodexSync.ico",
+        ]
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return None
+
+
+def _wait_for_background_server(local: LocalDesktopServer) -> None:
     try:
-        server.serve_forever()
+        while local.thread and local.thread.is_alive():
+            local.thread.join(timeout=0.5)
     except KeyboardInterrupt:
-        runtime.stop_daemon()
-        server.shutdown()
+        pass
+
+
+def open_desktop_window(local: LocalDesktopServer) -> None:
+    local.start()
+    try:
+        import webview
+    except Exception as exc:  # noqa: BLE001 - desktop should remain usable without WebView runtime
+        local.runtime.log("error", "pywebview unavailable; falling back to browser", {"error": str(exc)})
+        webbrowser.open(local.url)
+        _wait_for_background_server(local)
+        local.stop()
+        return
+    try:
+        webview.settings["OPEN_EXTERNAL_LINKS_IN_BROWSER"] = True
+        webview.settings["OPEN_DEVTOOLS_IN_DEBUG"] = False
+        webview.create_window(
+            "Codex Sync",
+            local.url,
+            width=1280,
+            height=860,
+            min_size=(1040, 700),
+            resizable=True,
+            text_select=True,
+            confirm_close=False,
+            background_color="#0f172a",
+        )
+        webview.start(gui="edgechromium", debug=False, private_mode=True, icon=_desktop_icon_path())
+    except Exception as exc:  # noqa: BLE001 - fall back to browser if WebView2 is missing/broken
+        local.runtime.log("error", "desktop window failed; falling back to browser", {"error": str(exc)})
+        webbrowser.open(local.url)
+        _wait_for_background_server(local)
+    finally:
+        local.stop()
+
+
+def main(open_browser: bool = False, port: int | None = None, window: bool = True) -> None:
+    local = create_local_server(port)
+    if window:
+        open_desktop_window(local)
+        return
+    if open_browser:
+        webbrowser.open(local.url)
+    print(f"Codex Sync desktop: {local.url}")
+    print("Press Ctrl+C to stop.")
+    local.serve_forever()

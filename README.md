@@ -34,6 +34,8 @@ Codex Sync 是一个面向 Windows 的桌面应用，用来在多台电脑之间
 CodexSync.exe
 ```
 
+默认会打开独立的 Codex Sync 桌面窗口。窗口关闭后，本地服务也会退出。
+
 源码运行：
 
 ```powershell
@@ -113,6 +115,8 @@ codex-sync install-task --minutes 3
 
 ```powershell
 codex-sync desktop
+codex-sync desktop --browser
+codex-sync desktop --no-open --port 8765
 codex-sync config --server-url https://sync.example.com --api-token YOUR_TOKEN
 codex-sync sync-now
 codex-sync full-backup-now

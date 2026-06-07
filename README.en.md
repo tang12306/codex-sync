@@ -34,6 +34,8 @@ If you downloaded a release package, run:
 CodexSync.exe
 ```
 
+By default it opens the standalone Codex Sync desktop window. Closing the window also stops the local service.
+
 From source:
 
 ```powershell
@@ -113,6 +115,8 @@ The desktop app is the main UI. These commands are useful for development, autom
 
 ```powershell
 codex-sync desktop
+codex-sync desktop --browser
+codex-sync desktop --no-open --port 8765
 codex-sync config --server-url https://sync.example.com --api-token YOUR_TOKEN
 codex-sync sync-now
 codex-sync full-backup-now

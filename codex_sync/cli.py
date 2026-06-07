@@ -113,7 +113,7 @@ def cmd_sync_now(args: argparse.Namespace) -> None:
 def cmd_desktop(args: argparse.Namespace) -> None:
     from .web_desktop import main as desktop_main
 
-    desktop_main(open_browser=not args.no_open, port=args.port)
+    desktop_main(open_browser=bool(args.browser), port=args.port, window=not args.browser and not args.no_open)
 
 
 def cmd_desktop_legacy(_: argparse.Namespace) -> None:
@@ -238,8 +238,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="codex-sync")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("desktop", help="Open the Windows desktop test console.")
-    p.add_argument("--no-open", action="store_true", help="Start the local web UI without opening a browser.")
+    p = sub.add_parser("desktop", help="Open the Codex Sync desktop window.")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--browser", action="store_true", help="Open the local web UI in the default browser instead of the desktop window.")
+    mode.add_argument("--no-open", action="store_true", help="Start the local web UI service without opening a window or browser.")
     p.add_argument("--port", type=int, help="Bind the local web UI to a specific port.")
     p.set_defaults(func=cmd_desktop)
 

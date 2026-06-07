@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.1.2"
+    [string]$Version = "0.1.3"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,7 +19,9 @@ python -m PyInstaller `
     --noconsole `
     --name $Name `
     --icon "assets\CodexSync.ico" `
+    --add-data "assets\CodexSync.ico;assets" `
     --add-data "codex_sync\sync_server.py;codex_sync" `
+    --collect-all webview `
     --collect-data codex_sync `
     app_entry.py
 

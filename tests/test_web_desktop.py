@@ -9,7 +9,7 @@ import urllib.request
 from http.server import ThreadingHTTPServer
 
 from codex_sync import __version__
-from codex_sync.web_desktop import DesktopRuntime, make_handler
+from codex_sync.web_desktop import DesktopRuntime, create_local_server, make_handler
 
 
 class WebDesktopTests(unittest.TestCase):
@@ -70,6 +70,25 @@ class WebDesktopTests(unittest.TestCase):
                 httpd.shutdown()
                 httpd.server_close()
                 thread.join(timeout=5)
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_local_server_can_start_and_stop_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            local = None
+            try:
+                local = create_local_server(port=None)
+                local.start()
+                response = urllib.request.urlopen(local.url, timeout=5)
+                self.assertEqual(response.status, 200)
+                self.assertIn("codex-sync-desktop-token", response.read().decode("utf-8"))
+            finally:
+                if local is not None:
+                    local.stop()
                 if old_sync is None:
                     os.environ.pop("CODEX_SYNC_HOME", None)
                 else:
