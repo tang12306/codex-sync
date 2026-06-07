@@ -5,6 +5,7 @@ from typing import Callable
 
 from .config import AppConfig
 from .full_backup import get_remote_device_state, scan_full_backup_changes
+from .project_auto_backup import process_project_auto_backup_queue
 from .server import flush_outbox, sync_once
 from .util import utc_now
 
@@ -28,6 +29,9 @@ def run_daemon(config: AppConfig, stop_check: Callable[[], bool] | None = None, 
                 remote_state = get_remote_device_state(config)
                 if log:
                     log(f"{utc_now()} device_state: {remote_state}")
+            project_auto_backup = process_project_auto_backup_queue(config, limit=3)
+            if log:
+                log(f"{utc_now()} project_auto_backup: {project_auto_backup}")
         except Exception as exc:  # noqa: BLE001 - daemon must keep running
             if log:
                 log(f"{utc_now()} daemon error: {exc}")

@@ -135,6 +135,9 @@ export function mount(root, store) {
   let compatData = null;
   let compatLoading = false;
   const compatBody = h("div", { class: "result-stack" });
+  let appUpdateData = null;
+  let appUpdateLoading = false;
+  const appUpdateBody = h("div", { class: "result-stack" });
 
   function splitSshTarget(target) {
     const text = String(target || "").trim();
@@ -228,6 +231,25 @@ export function mount(root, store) {
     }
   }
 
+  async function checkAppUpdate(force = false, notify = true) {
+    appUpdateLoading = true;
+    renderAppUpdate();
+    try {
+      appUpdateData = await runAction("app-update-check", { force });
+      if (notify) {
+        if (appUpdateData.update_available) showToast(`发现 Codex Sync ${appUpdateData.latest_version}，可下载新版安装包`, "warning");
+        else if (appUpdateData.success) showToast("本地应用已经是最新版本", "success");
+        else showToast(appUpdateData.error || "应用更新检查失败", "error");
+      }
+    } catch (e) {
+      appUpdateData = { success: false, error: String(e.message || e) };
+      if (notify) showToast(String(e.message || e), "error");
+    } finally {
+      appUpdateLoading = false;
+      renderAppUpdate();
+    }
+  }
+
   const deployCard = h(
     "div",
     { class: "card" },
@@ -298,6 +320,42 @@ export function mount(root, store) {
     deployOut
   );
 
+  const downloadUpdateBtn = actionButton("下载新版安装包", "btn-primary", async () => {
+    const result = await run("app-update-download", {
+      payload: { force: false },
+      okMsg: "新版安装包已下载",
+      errMsg: "下载失败",
+      label: "应用更新",
+      refresh: false,
+    });
+    appUpdateData = result;
+    renderAppUpdate();
+  });
+  const openUpdateBtn = actionButton("打开 GitHub 发布页", "btn-ghost", async () => {
+    await run("app-update-open", {
+      payload: { force: false },
+      okMsg: "已打开 GitHub 发布页",
+      errMsg: "打开失败",
+      label: "应用更新",
+      refresh: false,
+    });
+  });
+
+  const appUpdateCard = h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, "本地应用更新"),
+    h("p", { class: "card-desc" }, "检查 GitHub Release 中的 Windows 安装包。这里只负责提示和下载，不会在运行中替换当前 EXE。"),
+    h(
+      "div",
+      { class: "card-actions" },
+      actionButton("检查应用更新", "btn-ghost", () => checkAppUpdate(true, true)),
+      downloadUpdateBtn,
+      openUpdateBtn
+    ),
+    appUpdateBody
+  );
+
   let retentionData = null;
   let retentionLoading = false;
   const retentionBody = h("div", { class: "result-stack" });
@@ -350,7 +408,7 @@ export function mount(root, store) {
 
   const panelServer = h("div", { class: "tab-panel" }, 
     h("div", { class: "grid grid-2" }, connCard, deployCard),
-    h("div", { class: "section", style: { marginTop: "20px" } }, retentionCard)
+    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appUpdateCard, retentionCard)
   );
 
   // ==================== PANEL 2: 备份策略 ====================
@@ -362,7 +420,8 @@ export function mount(root, store) {
     toggle("full_backup_enabled", "完整对话备份开关", "允许把包含正文的完整对话打包（用于迁移接力）"),
     toggle("full_backup_include_config", "完整包包含配置", "把本地 Agent 的预设和全局系统配置打包归档"),
     toggle("full_backup_include_memories", "完整包包含记忆库", "把本地 Agent 的 memories 长期记忆目录一并打包"),
-    toggle("full_backup_allow_plaintext_upload", "允许云端明文上传", "⚠ 安全警告：在客户端加密未就绪时，允许将包含正文的完整 zip 包直接上传云端")
+    toggle("full_backup_allow_plaintext_upload", "允许云端明文上传", "⚠ 安全警告：在客户端加密未就绪时，允许将包含正文的完整 zip 包直接上传云端"),
+    toggle("project_auto_backup_on_codex_stop", "Codex 关闭时入队项目备份", "可选：Stop hook 只记录待备份任务，后台再上传当前 Git 项目")
   );
 
   const advancedCard = h(
@@ -373,6 +432,7 @@ export function mount(root, store) {
     field("max_untracked_copy_mb", "项目文件单体大小上限（MB）", "项目备份中，超过此大小的未跟踪文件将被跳过", { type: "number", min: "0", step: "1" }),
     field("disaster_backup_min_interval_hours", "灾难备份冷冻周期（小时）", "多长时间内仅允许自动创建一次灾难备份，防止 IO 开销", { type: "number", min: "0", step: "1" }),
     field("full_backup_quiet_minutes", "完整备份安静期时长（分钟）", "会话内容停止变化后，等待多久再生成本地大包", { type: "number", min: "0", step: "1" }),
+    field("project_auto_backup_min_interval_minutes", "项目自动备份最短间隔（分钟）", "用于 Git 提交和 Codex Stop 触发，避免频繁上传", { type: "number", min: "0", step: "1" }),
     field("full_backup_retention_count", "本地备份留存数量限制", "本地 full_backups 最大保留包数，0表示不限制", { type: "number", min: "0" }),
     field("full_backup_retention_max_gb", "本地备份留存容量限制（GB）", "本地 full_backups 最大允许占用的磁盘空间，0 表示不限制", { type: "number", min: "0", step: "0.5" })
   );
@@ -528,6 +588,7 @@ export function mount(root, store) {
 
     if (tabId === "server") {
       if (!compatData && !compatLoading) checkServerCompatibility().catch(() => {});
+      if (!appUpdateData && !appUpdateLoading) checkAppUpdate(false, false).catch(() => {});
     } else if (tabId === "automation") {
       refreshTaskStatus();
     } else if (tabId === "diagnosis") {
@@ -568,7 +629,9 @@ export function mount(root, store) {
       full_backup_include_config: f.full_backup_include_config.checked,
       full_backup_include_memories: f.full_backup_include_memories.checked,
       full_backup_allow_plaintext_upload: f.full_backup_allow_plaintext_upload.checked,
+      project_auto_backup_on_codex_stop: f.project_auto_backup_on_codex_stop.checked,
       full_backup_quiet_seconds: fromUnit(f.full_backup_quiet_minutes.value, 60, 60),
+      project_auto_backup_min_interval_seconds: fromUnit(f.project_auto_backup_min_interval_minutes.value, 60, 600),
       full_backup_retention_count: num("full_backup_retention_count", 20),
       full_backup_retention_max_bytes: fromUnit(f.full_backup_retention_max_gb.value, 1024 * 1024 * 1024, 2147483648),
     };
@@ -615,7 +678,9 @@ export function mount(root, store) {
     setIfUnfocused(f.full_backup_include_config, cfg.full_backup_include_config);
     setIfUnfocused(f.full_backup_include_memories, cfg.full_backup_include_memories);
     setIfUnfocused(f.full_backup_allow_plaintext_upload, cfg.full_backup_allow_plaintext_upload);
+    setIfUnfocused(f.project_auto_backup_on_codex_stop, cfg.project_auto_backup_on_codex_stop);
     setIfUnfocused(f.full_backup_quiet_minutes, toUnit(cfg.full_backup_quiet_seconds, 60));
+    setIfUnfocused(f.project_auto_backup_min_interval_minutes, toUnit(cfg.project_auto_backup_min_interval_seconds, 60));
     setIfUnfocused(f.full_backup_retention_count, cfg.full_backup_retention_count);
     setIfUnfocused(f.full_backup_retention_max_gb, toUnit(cfg.full_backup_retention_max_bytes, 1024 * 1024 * 1024));
     if (document.activeElement !== apiToken) {
@@ -670,6 +735,57 @@ export function mount(root, store) {
       Array.isArray(retentionData.warnings) && retentionData.warnings.length
         ? h("div", { class: "status-line warn" }, retentionData.warnings.join("；"))
         : null
+    );
+  }
+
+  function renderAppUpdate() {
+    if (appUpdateLoading) {
+      appUpdateBody.replaceChildren(loadingSpinner("正在检查 GitHub Release…"));
+      downloadUpdateBtn.disabled = true;
+      openUpdateBtn.disabled = true;
+      return;
+    }
+    if (!appUpdateData) {
+      appUpdateBody.replaceChildren(h("div", { class: "empty compact" }, "尚未检查本地应用版本。"));
+      downloadUpdateBtn.disabled = true;
+      openUpdateBtn.disabled = false;
+      return;
+    }
+    if (appUpdateData.success === false || appUpdateData.error) {
+      appUpdateBody.replaceChildren(h("div", { class: "status-line error" }, appUpdateData.error || "检查失败"));
+      downloadUpdateBtn.disabled = true;
+      openUpdateBtn.disabled = false;
+      return;
+    }
+    const asset = asObject(appUpdateData.windows_asset);
+    const tone = appUpdateData.update_available ? "warn" : "ok";
+    downloadUpdateBtn.disabled = !asset.url;
+    openUpdateBtn.disabled = false;
+    appUpdateBody.replaceChildren(
+      h(
+        "div",
+        { class: "result-section" },
+        h(
+          "div",
+          { class: "result-section-head" },
+          h("strong", {}, "GitHub 应用版本"),
+          h("span", { class: `badge ${tone}` }, appUpdateData.update_available ? "发现新版本" : "已是最新")
+        ),
+        h(
+          "div",
+          { class: "result-facts" },
+          fact("当前版本", appUpdateData.current_version || "-"),
+          fact("最新版本", appUpdateData.latest_version || "-"),
+          fact("发布时间", appUpdateData.published_at || "-"),
+          fact("Windows 包", asset.name || "未找到"),
+          fact("检查来源", appUpdateData.cached ? "缓存" : "GitHub")
+        ),
+        appUpdateData.downloaded
+          ? h("div", { class: "status-line ok" }, `已下载到：${appUpdateData.path || "-"}`)
+          : appUpdateData.update_available
+            ? h("div", { class: "status-line warn" }, "有新版可用。下载后请退出当前应用，再解压并运行新版 EXE。")
+            : h("div", { class: "status-line ok" }, "当前 EXE 与 GitHub 最新 Release 一致。")
+      )
     );
   }
 
@@ -751,6 +867,7 @@ export function mount(root, store) {
   syncBadges();
   loadDeployConfig();
   renderRetention();
+  renderAppUpdate();
   renderCompatibility();
   renderTabs();
   switchTab(currentTab);

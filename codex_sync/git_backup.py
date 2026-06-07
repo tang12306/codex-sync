@@ -189,6 +189,30 @@ def create_patch_snapshot(cwd: str | Path | None, config: AppConfig) -> dict[str
     return {"snapshot_dir": str(snapshot_dir), "metadata": {"repo": state, "copied_untracked": copied, "skipped_untracked": skipped}}
 
 
+def create_commit_patch_snapshot(cwd: str | Path | None, config: AppConfig, commit_ref: str | None = None) -> dict[str, Any]:
+    ensure_app_dirs()
+    root = git_root(cwd)
+    if not root:
+        raise RuntimeError("Current directory is not inside a Git repository.")
+    ref = commit_ref or "HEAD"
+    code, commit, err = run_cmd(["git", "rev-parse", ref], cwd=root)
+    if code != 0 or not commit:
+        raise RuntimeError(f"git rev-parse failed: {err}")
+    state = git_state(root)
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    repo_name = safe_filename(root.name)
+    snapshot_dir = app_dir() / "snapshots" / repo_name / stamp
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+
+    code, patch, err = run_cmd(["git", "show", "--binary", "--format=fuller", "--stat", "--patch", commit], cwd=root, timeout=120)
+    if code != 0:
+        raise RuntimeError(f"git show failed: {err}")
+
+    (snapshot_dir / "commit.patch").write_text(redact_text(patch), encoding="utf-8")
+    write_json(snapshot_dir / "metadata.json", {"created_at": utc_now(), "repo": state, "commit": commit})
+    return {"snapshot_dir": str(snapshot_dir), "metadata": {"repo": state, "commit": commit}}
+
+
 def project_backup_dir() -> Path:
     ensure_app_dirs()
     path = app_dir() / "project-backups"
@@ -209,20 +233,34 @@ def _metadata_header(metadata: dict[str, Any]) -> str:
     return base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def create_project_backup_package(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
+def create_project_backup_package(
+    cwd: str | Path | None,
+    config: AppConfig,
+    *,
+    mode: str = "worktree",
+    trigger_reason: str = "manual",
+    commit_ref: str | None = None,
+) -> dict[str, Any]:
     root = git_root(cwd)
     if root:
-        snapshot = create_patch_snapshot(root, config)
-        project = snapshot.get("metadata", {}).get("repo", {})
-        source_mode = "git_patch"
+        if mode == "git_commit":
+            snapshot = create_commit_patch_snapshot(root, config, commit_ref=commit_ref)
+            project = dict(snapshot.get("metadata", {}).get("repo", {}))
+            project["commit"] = snapshot.get("metadata", {}).get("commit") or project.get("commit")
+            source_mode = "git_commit"
+        else:
+            snapshot = create_patch_snapshot(root, config)
+            project = snapshot.get("metadata", {}).get("repo", {})
+            source_mode = "git_patch"
     else:
         snapshot = create_filesystem_project_snapshot(cwd, config)
         project = snapshot.get("metadata", {}).get("project", {})
         source_mode = "filesystem"
-    repo_name = safe_filename(Path(str(project.get("root") or "project")).name)
+    repo_name = Path(str(project.get("root") or "project")).name or "project"
+    archive_repo_name = safe_filename(repo_name)
     backup_id = str(uuid.uuid4())
     created_at = utc_now()
-    archive = project_backup_dir() / f"{created_at.replace(':', '').replace('+', 'Z')}-{repo_name}-{backup_id}.zip"
+    archive = project_backup_dir() / f"{created_at.replace(':', '').replace('+', 'Z')}-{archive_repo_name}-{backup_id}.zip"
     manifest = {
         "id": backup_id,
         "type": "project_backup",
@@ -234,7 +272,9 @@ def create_project_backup_package(cwd: str | Path | None, config: AppConfig) -> 
         "repo_root": project.get("root"),
         "branch": project.get("branch"),
         "commit": project.get("commit"),
+        "commit_ref": commit_ref,
         "dirty": project.get("dirty"),
+        "trigger_reason": trigger_reason,
         "snapshot": snapshot,
     }
     snapshot_dir = Path(str(snapshot["snapshot_dir"]))
@@ -274,6 +314,7 @@ def upload_project_backup(config: AppConfig, archive: str | Path, manifest: dict
         "repo_root": manifest.get("repo_root"),
         "branch": manifest.get("branch"),
         "commit": manifest.get("commit"),
+        "trigger_reason": manifest.get("trigger_reason"),
         "created_at": manifest.get("created_at"),
         "archive_sha256": _hash_file(archive_path),
         "archive_bytes": archive_path.stat().st_size,
@@ -330,4 +371,3 @@ def list_project_backups(config: AppConfig) -> dict[str, Any]:
         return {"success": False, "error": _server_unsupported_message(exc), "status": exc.code}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
-

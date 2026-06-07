@@ -2,9 +2,11 @@
 import { h, asObject } from "../dom.js";
 import { runAction } from "../api.js";
 import { makeRun, actionButton } from "../ui.js";
+import { showToast } from "../toast.js";
 
 export function mount(root, store) {
   const run = makeRun(store);
+  const appUpdateWrap = h("div", { class: "section" });
   const versionWrap = h("div", { class: "section" });
   const healthWrap = h("div", { class: "section" });
   const statusWrap = h("div", { class: "section" });
@@ -17,10 +19,35 @@ export function mount(root, store) {
       taskCard("01", "对话与备份", "Windows / WSL 的完整对话备份、导入迁移、渠道合并与对话浏览。", "进入管理", "#/conversations"),
       taskCard("02", "项目备份", "打包并上传当前项目代码快照到同步服务器，支持补丁包格式。", "备份项目", "#/project")
     ),
+    appUpdateWrap,
     versionWrap,
     healthWrap,
     statusWrap
   );
+
+  let appUpdate = null;
+  let appUpdateBusy = false;
+  const renderAppUpdate = () => {
+    appUpdateWrap.replaceChildren(buildAppUpdate({ appUpdate, busy: appUpdateBusy, refresh: refreshAppUpdate, run }));
+  };
+  async function refreshAppUpdate(force = false) {
+    appUpdateBusy = true;
+    renderAppUpdate();
+    try {
+      appUpdate = await runAction("app-update-check", { force });
+      if (appUpdate.update_available) {
+        const key = `codex-sync-update-${appUpdate.latest_version || "latest"}`;
+        if (!sessionStorage.getItem(key)) {
+          showToast(`发现 Codex Sync ${appUpdate.latest_version}，可下载新版安装包`, "warning");
+          sessionStorage.setItem(key, "1");
+        }
+      }
+    } catch (e) {
+      appUpdate = { success: false, error: String(e.message || e) };
+    }
+    appUpdateBusy = false;
+    renderAppUpdate();
+  }
 
   let compatibility = null;
   let compatibilityBusy = false;
@@ -64,6 +91,7 @@ export function mount(root, store) {
   renderCompatibility();
   renderHealth();
   renderStatus();
+  refreshAppUpdate(false);
   refreshCompatibility();
   refreshHealth();
 
@@ -73,6 +101,49 @@ export function mount(root, store) {
     u1();
     u2();
   };
+}
+
+function buildAppUpdate({ appUpdate, busy, refresh, run }) {
+  if (busy && !appUpdate) {
+    return h("div", {});
+  }
+  if (!appUpdate || appUpdate.success === false || !appUpdate.update_available) {
+    return h("div", {});
+  }
+  const asset = asObject(appUpdate.windows_asset);
+  return h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, h("span", {}, "本地应用有新版本"), h("span", { class: "badge warn" }, appUpdate.latest_version || "新版本")),
+    h(
+      "p",
+      { class: "card-desc" },
+      `当前版本 ${appUpdate.current_version || "-"}，GitHub 最新版本 ${appUpdate.latest_version || "-"}。${asset.name ? `可下载 ${asset.name}。` : "发布页暂未识别到 Windows 包。"}`
+    ),
+    h(
+      "div",
+      { class: "card-actions" },
+      actionButton("下载新版", "btn-primary", async () => {
+        await run("app-update-download", {
+          payload: { force: false },
+          okMsg: "新版安装包已下载",
+          errMsg: "下载失败",
+          label: "应用更新",
+          refresh: false,
+        });
+      }),
+      actionButton("打开发布页", "btn-ghost", async () => {
+        await run("app-update-open", {
+          payload: { force: false },
+          okMsg: "已打开 GitHub 发布页",
+          errMsg: "打开失败",
+          label: "应用更新",
+          refresh: false,
+        });
+      }),
+      actionButton(busy ? "检查中…" : "重新检查", "btn-ghost", () => refresh(true))
+    )
+  );
 }
 
 function buildCompatibility({ compatibility, busy, refresh }) {

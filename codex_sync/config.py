@@ -34,6 +34,8 @@ class AppConfig:
     full_backup_quiet_seconds: int = 60
     full_backup_retention_count: int = 20
     full_backup_retention_max_bytes: int = 2 * 1024 * 1024 * 1024
+    project_auto_backup_on_codex_stop: bool = False
+    project_auto_backup_min_interval_seconds: int = 10 * 60
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "AppConfig":

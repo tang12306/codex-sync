@@ -10,8 +10,10 @@ export function mount(root, store) {
   let projectStatus = asObject(store.getState().status?.git);
   let selectedPath = projectStatus.root || projectStatus.selected_path || store.getState().status?.cwd || "";
   let serverBackups = null;
+  let autoBackupStatus = null;
   let loadingStatus = false;
   let loadingBackups = false;
+  let loadingAutoBackup = false;
 
   const projectPathInput = h("input", {
     class: "input project-path-input",
@@ -24,6 +26,7 @@ export function mount(root, store) {
   });
 
   const projectStatusCard = h("div", { class: "card" });
+  const autoBackupCard = h("div", { class: "card" });
   const serverBackupsCard = h("div", { class: "card" });
 
   const currentProjectPath = () => projectPathInput.value.trim();
@@ -39,6 +42,7 @@ export function mount(root, store) {
         projectPathInput.value = projectStatus.root;
         selectedPath = projectStatus.root;
       }
+      await refreshAutoBackupStatus(false);
     } finally {
       loadingStatus = false;
       renderProjectStatus();
@@ -59,6 +63,55 @@ export function mount(root, store) {
   const uploadProject = async () => {
     const result = await run("project-backup", { payload: { project_path: currentProjectPath() }, okMsg: "项目备份已上传到服务器", refresh: false });
     if (result?.success) await refreshServerBackups();
+  };
+
+  const refreshAutoBackupStatus = async (notify = true) => {
+    loadingAutoBackup = true;
+    renderAutoBackupStatus();
+    try {
+      autoBackupStatus = notify
+        ? await run("project-auto-backup-status", { payload: { project_path: currentProjectPath() }, refresh: false, okMsg: "自动备份状态已更新" })
+        : await runAction("project-auto-backup-status", { project_path: currentProjectPath() });
+    } finally {
+      loadingAutoBackup = false;
+      renderAutoBackupStatus();
+    }
+  };
+
+  const installGitAutoBackup = async () => {
+    await run("project-auto-backup-install-git-hook", {
+      payload: { project_path: currentProjectPath() },
+      refresh: false,
+      okMsg: "Git 提交自动备份已安装",
+      errMsg: "安装失败",
+      label: "项目自动备份",
+    });
+    await refreshAutoBackupStatus(false);
+  };
+
+  const uninstallGitAutoBackup = async () => {
+    await run("project-auto-backup-uninstall-git-hook", {
+      payload: { project_path: currentProjectPath() },
+      refresh: false,
+      okMsg: "Git 提交自动备份已关闭",
+      errMsg: "关闭失败",
+      label: "项目自动备份",
+    });
+    await refreshAutoBackupStatus(false);
+  };
+
+  const processAutoBackupQueue = async () => {
+    const result = await run("project-auto-backup-process", {
+      payload: { limit: 5 },
+      refresh: false,
+      okMsg: "自动备份队列已处理",
+      errMsg: "处理失败",
+      label: "项目自动备份",
+    });
+    if (result?.success) {
+      await refreshAutoBackupStatus(false);
+      await refreshServerBackups();
+    }
   };
 
   const chooseProjectDir = async () => {
@@ -135,7 +188,8 @@ export function mount(root, store) {
 
   root.replaceChildren(
     h("div", { class: "section" }, primary),
-    h("div", { class: "section grid grid-2" }, projectStatusCard, serverBackupsCard),
+    h("div", { class: "section grid grid-2" }, projectStatusCard, autoBackupCard),
+    h("div", { class: "section" }, serverBackupsCard),
     h("div", { class: "section" }, details),
     h("div", { class: "section" }, outCard)
   );
@@ -174,6 +228,39 @@ export function mount(root, store) {
     projectStatusCard.replaceChildren(...nodes.filter(Boolean));
   }
 
+  function renderAutoBackupStatus() {
+    const state = asObject(autoBackupStatus);
+    const isRepo = Boolean(state.is_repo);
+    const enabled = Boolean(state.enabled_for_git_commit);
+    const last = asObject(state.last);
+    autoBackupCard.replaceChildren(
+      h(
+        "div",
+        { class: "card-title" },
+        h("span", {}, "自动备份"),
+        h("span", { class: `badge ${loadingAutoBackup ? "" : !isRepo ? "warn" : enabled ? "ok" : ""}` }, loadingAutoBackup ? "检查中" : !isRepo ? "仅 Git 项目" : enabled ? "已开启" : "未开启")
+      ),
+      h("p", { class: "card-desc" }, "为当前 Git 项目安装 post-commit hook：每次提交后入队并后台上传提交补丁，不阻塞提交。"),
+      h(
+        "div",
+        { class: "result-facts" },
+        fact("Git 提交触发", enabled ? "已安装" : "未安装"),
+        fact("待处理队列", state.queue_count != null ? `${state.queue_count} 个` : "-"),
+        fact("Codex 关闭触发", state.codex_stop_enabled ? "已在设置中开启" : "未开启"),
+        fact("最近备份", last.last_backup_at || "-")
+      ),
+      !isRepo ? h("div", { class: "status-line warn" }, "自动项目备份当前只支持 Git 仓库。非 Git 目录请使用手动上传。") : null,
+      h(
+        "div",
+        { class: "card-actions" },
+        actionButton("安装提交后自动备份", "btn-primary", installGitAutoBackup),
+        actionButton("关闭提交后自动备份", "btn-ghost", uninstallGitAutoBackup),
+        actionButton("处理待备份队列", "btn-ghost", processAutoBackupQueue),
+        actionButton("刷新自动备份状态", "btn-ghost", () => refreshAutoBackupStatus(true))
+      )
+    );
+  }
+
   function renderServerBackups() {
     const backups = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
     serverBackupsCard.replaceChildren(
@@ -201,6 +288,7 @@ export function mount(root, store) {
   }
 
   renderProjectStatus();
+  renderAutoBackupStatus();
   renderServerBackups();
   refreshProjectStatus(false);
   setOutput(store.getState().console);

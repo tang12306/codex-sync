@@ -11,6 +11,13 @@ from .daemon import run_daemon
 from .disaster_backup import create_disaster_backup
 from .git_backup import backup_project_to_server, create_patch_snapshot, list_project_backups
 from .hooks import hook_status, install_hooks
+from .project_auto_backup import (
+    enqueue_project_auto_backup,
+    install_project_git_hook,
+    process_project_auto_backup_queue,
+    project_auto_backup_status,
+    uninstall_project_git_hook,
+)
 from .full_backup import (
     download_full_backup,
     full_backup_now,
@@ -69,6 +76,8 @@ def cmd_config(args: argparse.Namespace) -> None:
         "full_backup_quiet_seconds",
         "full_backup_retention_count",
         "full_backup_retention_max_bytes",
+        "project_auto_backup_on_codex_stop",
+        "project_auto_backup_min_interval_seconds",
     ):
         value = getattr(args, field, None)
         if value is not None:
@@ -97,6 +106,8 @@ def cmd_capture(args: argparse.Namespace) -> None:
     }
     if args.sync:
         result["sync"] = sync_once(cfg, cwd=os.getcwd())
+    if args.event == "Stop" and cfg.project_auto_backup_on_codex_stop:
+        result["project_auto_backup"] = enqueue_project_auto_backup(os.getcwd(), cfg, reason="codex-stop")
     print_json(result)
 
 
@@ -107,6 +118,7 @@ def cmd_sync_now(args: argparse.Namespace) -> None:
     if cfg.full_backup_enabled:
         result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True)
         result["device_state"] = get_remote_device_state(cfg)
+    result["project_auto_backup"] = process_project_auto_backup_queue(cfg)
     print_json(result)
 
 
@@ -114,6 +126,25 @@ def cmd_desktop(args: argparse.Namespace) -> None:
     from .web_desktop import main as desktop_main
 
     desktop_main(open_browser=bool(args.browser), port=args.port, window=not args.browser and not args.no_open)
+
+
+def cmd_project_auto_backup(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    cwd = args.cwd or os.getcwd()
+    if args.install_git_hook:
+        print_json(install_project_git_hook(cwd, cfg))
+        return
+    if args.uninstall_git_hook:
+        print_json(uninstall_project_git_hook(cwd))
+        return
+    if args.status:
+        print_json(project_auto_backup_status(cwd, cfg))
+        return
+    queued = enqueue_project_auto_backup(cwd, cfg, reason=args.reason)
+    result: dict[str, object] = {"queue": queued}
+    if args.process:
+        result["process"] = process_project_auto_backup_queue(cfg, limit=args.limit)
+    print_json(result)
 
 
 def cmd_desktop_legacy(_: argparse.Namespace) -> None:
@@ -261,6 +292,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--full-backup-quiet-seconds", type=int)
     p.add_argument("--full-backup-retention-count", type=int)
     p.add_argument("--full-backup-retention-max-bytes", type=int)
+    p.add_argument("--project-auto-backup-on-codex-stop", action=argparse.BooleanOptionalAction)
+    p.add_argument("--project-auto-backup-min-interval-seconds", type=int)
     p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("install-hooks", help="Install global Codex hooks for sync capture.")
@@ -303,6 +336,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("list-project-backups", help="List project backups on the sync server.")
     p.set_defaults(func=lambda _args: print_json(list_project_backups(load_config())))
+
+    p = sub.add_parser("project-auto-backup", help="Queue/process automatic project backups and install per-repo Git hooks.")
+    p.add_argument("--cwd", help="Project directory. Defaults to the current directory.")
+    p.add_argument("--reason", default="manual", choices=("manual", "git-post-commit", "codex-stop"))
+    p.add_argument("--process", action="store_true", help="Process queued project backup jobs after enqueueing.")
+    p.add_argument("--limit", type=int, default=5, help="Maximum queued jobs to process.")
+    p.add_argument("--install-git-hook", action="store_true", help="Install the current repo post-commit backup hook.")
+    p.add_argument("--uninstall-git-hook", action="store_true", help="Remove the managed post-commit backup hook.")
+    p.add_argument("--status", action="store_true", help="Show project auto-backup status.")
+    p.set_defaults(func=cmd_project_auto_backup)
 
     p = sub.add_parser("full-backup-now", help="Create a full Codex conversation backup package, optionally uploading it.")
     p.add_argument("--force", action="store_true", help="Create a package even when the content digest has not changed.")

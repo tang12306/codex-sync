@@ -22,9 +22,17 @@ from .daemon import run_daemon
 from .conversations import export_conversation, list_conversations, read_conversation
 from .deploy import DeployConfig, deploy_config_path, deploy_status, install_server, load_deploy_config, save_deploy_config, update_server
 from .disaster_backup import create_disaster_backup
+from .app_update import check_app_update, download_latest_update, open_update_page
 from .git_backup import backup_project_to_server, create_patch_snapshot, git_state, list_project_backups
 from .full_backup import full_backup_now, get_remote_device_state, list_full_backups, list_remote_devices, notify_codex_changed, scan_full_backup_changes, summarize_sync_health
 from .hooks import hook_status, install_hooks
+from .project_auto_backup import (
+    enqueue_project_auto_backup,
+    install_project_git_hook,
+    process_project_auto_backup_queue,
+    project_auto_backup_status,
+    uninstall_project_git_hook,
+)
 from .server import (
     check_server_compatibility,
     flush_outbox,
@@ -442,6 +450,8 @@ class DesktopRuntime:
                 "full_backup_quiet_seconds": cfg.full_backup_quiet_seconds,
                 "full_backup_retention_count": cfg.full_backup_retention_count,
                 "full_backup_retention_max_bytes": cfg.full_backup_retention_max_bytes,
+                "project_auto_backup_on_codex_stop": cfg.project_auto_backup_on_codex_stop,
+                "project_auto_backup_min_interval_seconds": cfg.project_auto_backup_min_interval_seconds,
             },
             "outbox_count": outbox_count(),
             "hooks": hook_status(),
@@ -467,6 +477,8 @@ class DesktopRuntime:
             "full_backup_quiet_seconds",
             "full_backup_retention_count",
             "full_backup_retention_max_bytes",
+            "project_auto_backup_on_codex_stop",
+            "project_auto_backup_min_interval_seconds",
         ):
             if key in payload:
                 value = payload[key]
@@ -477,6 +489,7 @@ class DesktopRuntime:
                     "full_backup_quiet_seconds",
                     "full_backup_retention_count",
                     "full_backup_retention_max_bytes",
+                    "project_auto_backup_min_interval_seconds",
                 ):
                     value = int(value)
                 if key in (
@@ -485,6 +498,7 @@ class DesktopRuntime:
                     "full_backup_include_config",
                     "full_backup_include_memories",
                     "full_backup_allow_plaintext_upload",
+                    "project_auto_backup_on_codex_stop",
                 ):
                     value = bool(value)
                 setattr(cfg, key, value)
@@ -504,6 +518,7 @@ class DesktopRuntime:
             if cfg.full_backup_enabled:
                 result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True)
                 result["device_state"] = get_remote_device_state(cfg)
+            result["project_auto_backup"] = process_project_auto_backup_queue(cfg)
         elif name == "flush-outbox":
             result = flush_outbox(cfg)
         elif name == "install-hooks":
@@ -520,6 +535,16 @@ class DesktopRuntime:
             result = backup_project_to_server(_project_path_from_payload(payload), cfg)
         elif name == "list-project-backups":
             result = list_project_backups(cfg)
+        elif name == "project-auto-backup-status":
+            result = project_auto_backup_status(_project_path_from_payload(payload), cfg)
+        elif name == "project-auto-backup-install-git-hook":
+            result = install_project_git_hook(_project_path_from_payload(payload), cfg)
+        elif name == "project-auto-backup-uninstall-git-hook":
+            result = uninstall_project_git_hook(_project_path_from_payload(payload))
+        elif name == "project-auto-backup-queue":
+            result = enqueue_project_auto_backup(_project_path_from_payload(payload), cfg, reason=str(payload.get("reason") or "manual"))
+        elif name == "project-auto-backup-process":
+            result = process_project_auto_backup_queue(cfg, limit=int(payload.get("limit") or 5))
         elif name == "choose-project-dir":
             result = _choose_project_directory(_project_path_from_payload(payload))
         elif name == "full-backup-now":
@@ -537,6 +562,12 @@ class DesktopRuntime:
             result = list_remote_devices(cfg)
         elif name in {"server-compatibility", "server-version"}:
             result = check_server_compatibility(cfg)
+        elif name == "app-update-check":
+            result = check_app_update(force=bool(payload.get("force", False)))
+        elif name == "app-update-download":
+            result = download_latest_update(force=bool(payload.get("force", False)))
+        elif name == "app-update-open":
+            result = open_update_page(force=bool(payload.get("force", False)))
         elif name == "server-retention-status":
             result = get_server_retention(cfg)
         elif name == "server-retention-prune":
