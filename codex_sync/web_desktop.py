@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import threading
 import webbrowser
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlparse
 
+from . import __version__
 from .backup_import import _ensure_local_archive, import_conversations, list_backup_conversations, list_importable_backups, read_backup_conversation
 from .codex_channels import list_channels, merge_channels, merge_threads, restore_channels, restore_threads
 from .collector import capture_event, create_resume_prompt
@@ -55,6 +57,8 @@ from .wsl import (
 STATIC_DIR = Path(__file__).resolve().parent / "web"
 HOST = "127.0.0.1"
 DEFAULT_PORT = 8765
+ASSET_VERSION = __version__
+CACHE_CONTROL = "no-store, max-age=0, must-revalidate"
 
 STATIC_CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -67,6 +71,38 @@ STATIC_CONTENT_TYPES = {
     ".ico": "image/x-icon",
     ".woff2": "font/woff2",
 }
+
+
+def _add_no_cache_headers(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_header("Cache-Control", CACHE_CONTROL)
+    handler.send_header("Pragma", "no-cache")
+    handler.send_header("Expires", "0")
+
+
+def _append_asset_version(spec: str) -> str:
+    separator = "&" if "?" in spec else "?"
+    return spec if "v=" in spec else f"{spec}{separator}v={ASSET_VERSION}"
+
+
+def _rewrite_js_imports(source: str) -> str:
+    source = re.sub(
+        r'(from\s+["\'])(\.{1,2}/[^"\']+?\.js)(["\'])',
+        lambda match: f"{match.group(1)}{_append_asset_version(match.group(2))}{match.group(3)}",
+        source,
+    )
+    return re.sub(
+        r"(import\(\s*`)(\.{1,2}/[^`]*?\.js)(`\s*\))",
+        lambda match: f"{match.group(1)}{_append_asset_version(match.group(2))}{match.group(3)}",
+        source,
+    )
+
+
+def _rewrite_index_assets(html: str) -> str:
+    return re.sub(
+        r'((?:href|src)=["\'])(/(?:styles|js)/[^"\']+\.(?:css|js))(["\'])',
+        lambda match: f"{match.group(1)}{_append_asset_version(match.group(2))}{match.group(3)}",
+        html,
+    )
 
 
 _DEPLOY_STR_FIELDS = (
@@ -428,7 +464,7 @@ class DesktopRuntime:
             result = summarize_sync_health(cfg)
         elif name == "list-devices":
             result = list_remote_devices(cfg)
-        elif name == "server-compatibility":
+        elif name in {"server-compatibility", "server-version"}:
             result = check_server_compatibility(cfg)
         elif name == "server-retention-status":
             result = get_server_retention(cfg)
@@ -733,28 +769,34 @@ def _json_response(handler: BaseHTTPRequestHandler, value: Any, status: int = 20
     handler.send_response(status)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
+    _add_no_cache_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 
 
 def _file_response(handler: BaseHTTPRequestHandler, path: Path, content_type: str) -> None:
-    body = path.read_bytes()
+    if content_type.startswith("application/javascript"):
+        body = _rewrite_js_imports(path.read_text(encoding="utf-8")).encode("utf-8")
+    else:
+        body = path.read_bytes()
     handler.send_response(200)
     handler.send_header("Content-Type", content_type)
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Cache-Control", "no-store")
+    _add_no_cache_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 
 
 def _index_response(handler: BaseHTTPRequestHandler, path: Path, runtime: DesktopRuntime) -> None:
-    html = path.read_text(encoding="utf-8")
+    html = _rewrite_index_assets(path.read_text(encoding="utf-8"))
+    html = re.sub(r"Codex Sync · v[0-9.]+", f"Codex Sync · v{ASSET_VERSION}", html)
     meta = f'<meta name="codex-sync-desktop-token" content="{runtime.session_token}" />'
-    body = html.replace("</head>", f"    {meta}\n  </head>", 1).encode("utf-8")
+    version_meta = f'<meta name="codex-sync-version" content="{ASSET_VERSION}" />'
+    body = html.replace("</head>", f"    {meta}\n    {version_meta}\n  </head>", 1).encode("utf-8")
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
     handler.send_header("Content-Length", str(len(body)))
-    handler.send_header("Cache-Control", "no-store")
+    _add_no_cache_headers(handler)
     handler.end_headers()
     handler.wfile.write(body)
 

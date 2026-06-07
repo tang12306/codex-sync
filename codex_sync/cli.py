@@ -383,7 +383,11 @@ def build_parser() -> argparse.ArgumentParser:
         )
     )
 
-    p = sub.add_parser("server-version", help="Check whether the remote sync server API is compatible with this client.")
+    p = sub.add_parser(
+        "server-version",
+        aliases=["server-compatibility"],
+        help="Check whether the remote sync server API is compatible with this client.",
+    )
     p.set_defaults(func=lambda _args: print_json(check_server_compatibility(load_config())))
 
     p = sub.add_parser("snapshot-detail", help="Fetch one remote snapshot by id.")

@@ -5,6 +5,7 @@ __pycache__/
 .pytest_cache/
 build/
 dist/
+*.spec
 
 # OS / 临时
 .DS_Store
