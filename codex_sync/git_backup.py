@@ -10,7 +10,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from .config import AppConfig
 from .paths import app_dir, ensure_app_dirs
@@ -374,13 +374,32 @@ def backup_project_to_server(cwd: str | Path | None, config: AppConfig) -> dict[
     return result
 
 
-def list_project_backups(config: AppConfig) -> dict[str, Any]:
+def list_project_backups(
+    config: AppConfig,
+    *,
+    limit: int = 50,
+    offset: int = 0,
+    repo_name: str | None = None,
+    device_id: str | None = None,
+) -> dict[str, Any]:
     if not config.server_url:
         return {"success": False, "error": "server_url is empty"}
     headers = {"User-Agent": "codex-sync/0.1"}
     if config.api_token:
         headers["Authorization"] = f"Bearer {config.api_token}"
-    request = urllib.request.Request(config.server_url.rstrip("/") + "/api/project-backups", headers=headers, method="GET")
+    query: dict[str, str] = {
+        "limit": str(max(1, min(int(limit), 200))),
+        "offset": str(max(0, int(offset))),
+    }
+    if repo_name:
+        query["repo_name"] = repo_name
+    if device_id:
+        query["device_id"] = device_id
+    request = urllib.request.Request(
+        config.server_url.rstrip("/") + f"/api/project-backups?{urlencode(query)}",
+        headers=headers,
+        method="GET",
+    )
     try:
         with DIRECT_OPENER.open(request, timeout=15) as response:
             return json.loads(response.read().decode("utf-8", errors="replace"))

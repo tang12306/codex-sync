@@ -71,6 +71,26 @@ export function mount(root, store) {
       ),
       input(key, attrs)
     );
+  const select = (key, options, attrs = {}) => {
+    const el = (f[key] = bindDirty(h(
+      "select",
+      { class: "input", ...attrs },
+      ...options.map(item => h("option", { value: item.value }, item.label))
+    )));
+    return el;
+  };
+  const selectField = (key, label, hint, options, attrs = {}) =>
+    h(
+      "div",
+      { class: "field" },
+      h(
+        "label",
+        { class: "field-label" },
+        h("span", {}, label),
+        hint ? h("span", { class: "field-hint" }, hint) : null
+      ),
+      select(key, options, attrs)
+    );
   const toggle = (key, title, desc) => {
     const cb = (f[key] = bindDirty(h("input", { type: "checkbox" })));
     return h(
@@ -424,6 +444,23 @@ export function mount(root, store) {
     toggle("project_auto_backup_on_codex_stop", "Codex 关闭时入队项目备份", "可选：Stop hook 只记录待备份任务，后台再上传当前 Git 项目")
   );
 
+  const appBehaviorCard = h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, "桌面应用行为"),
+    h("p", { class: "card-desc" }, "控制桌面窗口关闭时的默认动作。选择“每次询问”时，可在关闭提示里勾选以后不再提示。"),
+    selectField(
+      "desktop_close_behavior",
+      "点击窗口关闭按钮",
+      "最小化到托盘会保留后台同步；直接退出会停止本地服务",
+      [
+        { value: "ask", label: "每次询问" },
+        { value: "minimize_to_tray", label: "最小化到托盘" },
+        { value: "exit", label: "直接退出" },
+      ]
+    )
+  );
+
   const advancedCard = h(
     "div",
     { class: "card" },
@@ -438,7 +475,8 @@ export function mount(root, store) {
   );
 
   const panelPolicy = h("div", { class: "tab-panel" },
-    h("div", { class: "grid grid-2" }, policyCard, advancedCard)
+    h("div", { class: "grid grid-2" }, policyCard, appBehaviorCard),
+    h("div", { class: "section", style: { marginTop: "20px" } }, advancedCard)
   );
 
   // ==================== PANEL 3: 任务与 Hooks ====================
@@ -472,6 +510,9 @@ export function mount(root, store) {
 
   const taskStatusLine = h("p", { class: "card-desc" }, "点「刷新任务状态」查询计划任务信息。");
   const minutesInput = h("input", { class: "input input-narrow", type: "number", min: "1", value: "3" });
+  let appInstallData = null;
+  let appInstallLoading = false;
+  const appInstallBody = h("div", { class: "result-stack" });
 
   async function refreshTaskStatus() {
     try {
@@ -486,6 +527,63 @@ export function mount(root, store) {
       taskStatusLine.textContent = "无法获取定时任务状态：" + (e.message || e);
     }
   }
+
+  async function refreshAppInstall(options = {}) {
+    appInstallLoading = true;
+    renderAppInstall();
+    try {
+      appInstallData = await runAction("app-install-status");
+      if (options.notify) showToast("应用安装状态已刷新", "success");
+    } catch (e) {
+      appInstallData = { success: false, error: String(e.message || e) };
+      if (options.notify) showToast(String(e.message || e), "error");
+    } finally {
+      appInstallLoading = false;
+      renderAppInstall();
+    }
+  }
+
+  async function installDesktopApp(enableStartup = false) {
+    const result = await run("app-install", {
+      payload: { create_shortcuts: true, enable_startup: enableStartup },
+      okMsg: enableStartup ? "已安装到本机并开启开机自启" : "已安装到本机",
+      errMsg: "安装失败",
+      label: "本机安装",
+    });
+    appInstallData = result.status || result;
+    renderAppInstall();
+    await refreshAppInstall();
+  }
+
+  async function toggleStartup() {
+    const data = asObject(appInstallData || store.getState().status?.app_install);
+    const startup = asObject(data.startup);
+    if (startup.enabled) {
+      await run("app-startup-disable", { okMsg: "开机自启已关闭", errMsg: "关闭自启失败", label: "开机自启" });
+      await refreshAppInstall();
+      return;
+    }
+    if (!data.installed_available) {
+      if (!window.confirm("开机自启需要先把 EXE 安装到本机固定目录，避免移动解压文件后失效。现在安装并开启自启吗？")) return;
+      await installDesktopApp(true);
+      return;
+    }
+    await run("app-startup-enable", { okMsg: "开机自启已开启", errMsg: "开启自启失败", label: "开机自启" });
+    await refreshAppInstall();
+  }
+
+  const installAppBtn = actionButton("安装到本机", "btn-primary", () => installDesktopApp(false));
+  const startupToggleBtn = actionButton("开启开机自启", "btn-ghost", toggleStartup);
+  const refreshAppBtn = actionButton("刷新状态", "btn-ghost", () => refreshAppInstall({ notify: true }));
+
+  const appInstallCard = h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, "桌面应用安装"),
+    h("p", { class: "card-desc" }, "把便携版 EXE 固定到本机目录，并管理桌面/开始菜单快捷方式和开机自启。"),
+    h("div", { class: "card-actions" }, installAppBtn, startupToggleBtn, refreshAppBtn),
+    appInstallBody
+  );
 
   const taskCard = h(
     "div",
@@ -511,7 +609,7 @@ export function mount(root, store) {
 
   const panelAutomation = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, daemonCard, hooksCard),
-    h("div", { class: "section", style: { marginTop: "20px" } }, taskCard)
+    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appInstallCard, taskCard)
   );
 
   // ==================== PANEL 4: 高级同步诊断 ====================
@@ -591,6 +689,7 @@ export function mount(root, store) {
       if (!appUpdateData && !appUpdateLoading) checkAppUpdate(false, false).catch(() => {});
     } else if (tabId === "automation") {
       refreshTaskStatus();
+      refreshAppInstall();
     } else if (tabId === "diagnosis") {
       fetchSnapshots(store, { force: false }).catch(() => {});
     }
@@ -634,6 +733,7 @@ export function mount(root, store) {
       project_auto_backup_min_interval_seconds: fromUnit(f.project_auto_backup_min_interval_minutes.value, 60, 600),
       full_backup_retention_count: num("full_backup_retention_count", 20),
       full_backup_retention_max_bytes: fromUnit(f.full_backup_retention_max_gb.value, 1024 * 1024 * 1024, 2147483648),
+      desktop_close_behavior: f.desktop_close_behavior.value || "ask",
     };
 
     const token = f.api_token.value.trim();
@@ -683,6 +783,7 @@ export function mount(root, store) {
     setIfUnfocused(f.project_auto_backup_min_interval_minutes, toUnit(cfg.project_auto_backup_min_interval_seconds, 60));
     setIfUnfocused(f.full_backup_retention_count, cfg.full_backup_retention_count);
     setIfUnfocused(f.full_backup_retention_max_gb, toUnit(cfg.full_backup_retention_max_bytes, 1024 * 1024 * 1024));
+    setIfUnfocused(f.desktop_close_behavior, cfg.desktop_close_behavior || "ask");
     if (document.activeElement !== apiToken) {
       apiToken.placeholder = cfg.api_token_configured ? "已保存 Token，留空保持不变" : "请输入 API Token 进行认证";
     }
@@ -697,6 +798,58 @@ export function mount(root, store) {
     hooksBadge.textContent = n ? `${n} 个事件` : "未安装";
     hooksBadge.className = `badge ${n ? "ok" : "warn"}`;
   };
+
+  function renderAppInstall() {
+    if (appInstallLoading) {
+      appInstallBody.replaceChildren(loadingSpinner("正在读取应用安装状态…"));
+      installAppBtn.disabled = true;
+      startupToggleBtn.disabled = true;
+      return;
+    }
+    const data = asObject(appInstallData || store.getState().status?.app_install);
+    const startup = asObject(data.startup);
+    const supported = data.supported !== false;
+    const installedHere = Boolean(data.installed);
+    const installedAvailable = Boolean(data.installed_available);
+    const installable = Boolean(data.installable);
+    installAppBtn.textContent = installedAvailable ? "重新安装到本机" : "安装到本机";
+    installAppBtn.disabled = !supported || (!installable && !installedAvailable);
+    startupToggleBtn.textContent = startup.enabled ? "关闭开机自启" : installedAvailable ? "开启开机自启" : "安装并开启自启";
+    startupToggleBtn.disabled = !supported || (!installable && !installedAvailable);
+
+    if (data.error) {
+      appInstallBody.replaceChildren(h("div", { class: "status-line error" }, data.error));
+      return;
+    }
+    if (!supported) {
+      appInstallBody.replaceChildren(h("div", { class: "status-line warn" }, "本机安装和开机自启仅支持 Windows EXE。"));
+      return;
+    }
+
+    const runMode = installedHere ? "已从安装目录运行" : installedAvailable ? "当前是便携位置运行" : "未安装";
+    const startupText = startup.enabled ? (startup.target_exists === false ? "已开启，但目标不存在" : "已开启") : "未开启";
+    appInstallBody.replaceChildren(
+      h(
+        "div",
+        { class: "result-facts" },
+        fact("安装状态", runMode),
+        fact("当前 EXE", data.current_executable || "-"),
+        fact("安装目录", data.install_dir || "-"),
+        fact("安装版 EXE", data.installed_executable || "-"),
+        fact("桌面快捷方式", data.desktop_shortcut_exists ? "已创建" : "未创建"),
+        fact("开始菜单", data.start_menu_shortcut_exists ? "已创建" : "未创建"),
+        fact("开机自启", startupText),
+        fact("自启目标", startup.target || "-")
+      ),
+      !installable && !installedAvailable
+        ? h("div", { class: "status-line warn" }, "当前是源码/开发模式运行。发布版 EXE 才能执行本机安装。")
+        : installedAvailable && !installedHere
+          ? h("div", { class: "status-line warn" }, "已存在安装版。建议从安装目录或开始菜单启动，避免继续使用临时解压位置。")
+          : installedHere
+            ? h("div", { class: "status-line ok" }, "当前正在使用固定安装位置，自启和快捷方式不会随解压目录移动而失效。")
+            : null
+    );
+  }
 
   function renderRetention() {
     if (retentionLoading) {
@@ -869,6 +1022,7 @@ export function mount(root, store) {
   renderRetention();
   renderCompatibility();
   renderAppUpdate();
+  renderAppInstall();
   renderTabs();
   switchTab(currentTab);
 
@@ -876,12 +1030,14 @@ export function mount(root, store) {
 
   const uConfig = store.select(s => s.status?.config, syncFields);
   const uStatus = store.select(s => s.status, syncBadges);
+  const uAppInstall = store.select(s => s.status?.app_install, renderAppInstall);
   const uSnapshots = store.select(s => s.snapshots, renderTable);
   const uCon = store.select(s => s.console, () => setOutput(store.getState().console));
 
   return () => {
     uConfig();
     uStatus();
+    uAppInstall();
     uSnapshots();
     uCon();
   };

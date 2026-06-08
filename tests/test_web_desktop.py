@@ -37,6 +37,8 @@ class WebDesktopTests(unittest.TestCase):
                 request = urllib.request.Request(base + "/api/status", headers={"X-Codex-Sync-Desktop-Token": token})
                 payload = json.loads(urllib.request.urlopen(request, timeout=5).read().decode("utf-8"))
                 self.assertIn("config", payload)
+                self.assertIn("desktop_close_behavior", payload["config"])
+                self.assertIn("app_install", payload)
             finally:
                 httpd.shutdown()
                 httpd.server_close()

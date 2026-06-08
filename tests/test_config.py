@@ -28,6 +28,13 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(public["api_token"], "<configured>")
         self.assertEqual(cfg.to_dict()["api_token"], "secret-token")
 
+    def test_desktop_close_behavior_defaults_to_ask(self) -> None:
+        cfg = AppConfig.from_dict({"desktop_close_behavior": "invalid"})
+        self.assertEqual(cfg.desktop_close_behavior, "ask")
+
+        cfg = AppConfig.from_dict({"desktop_close_behavior": "minimize_to_tray"})
+        self.assertEqual(cfg.desktop_close_behavior, "minimize_to_tray")
+
 
 if __name__ == "__main__":
     unittest.main()

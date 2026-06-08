@@ -1,4 +1,4 @@
-// 对话与备份综合管理页：备份管理、对话浏览与渠道重组、外部备份导入。
+// 对话与备份综合管理页：备份管理、对话浏览与渠道重组、备份导入。
 import { h, asObject, shortId } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
@@ -14,6 +14,11 @@ const CONFIRM_MSG =
 
 const WSL_CONFIRM_MSG =
   "检测到目标 WSL 里 Codex 正在运行。\n\n导入会写入该发行版的 ~/.codex 状态库，需要先关闭它的 Codex 后台进程。\n\n确认关闭并导入吗？";
+
+const browseCache = {
+  homes: null,
+  channelsByHome: new Map(),
+};
 
 function fmtTime(sec) {
   if (!sec) return "";
@@ -50,7 +55,7 @@ export function mount(root, store) {
   const tabs = [
     { id: "backups", label: "备份与灾备" },
     { id: "browse", label: "对话与渠道" },
-    { id: "import", label: "外部包导入" }
+    { id: "import", label: "备份导入" }
   ];
 
   let unmountCurrent = null;
@@ -360,11 +365,13 @@ function mountBrowse(container, run, store, setOutput) {
   let search = "";
   let fcwd = "";
   let fprovider = "";
+  let targetProvider = "";
 
   const homeSel = h("select", { class: "input", style: { flex: "0 1 180px" } });
   const searchInput = h("input", { class: "input", type: "search", style: { flex: "1 1 200px" }, placeholder: "搜索标题、预览、对话历史…" });
   const cwdSel = h("select", { class: "input", style: { flex: "1 1 150px" } });
   const provSel = h("select", { class: "input", style: { flex: "1 1 150px" } });
+  const targetProviderSel = h("select", { class: "input", style: { flex: "0 1 180px" } });
 
   const listWrap = h("div", { class: "card", style: { maxHeight: "60vh", overflow: "auto" } });
   const detailWrap = h("div", { class: "card", style: { maxHeight: "60vh", overflow: "auto" } });
@@ -380,13 +387,23 @@ function mountBrowse(container, run, store, setOutput) {
   searchInput.addEventListener("change", () => { search = searchInput.value.trim(); refreshConversations(); });
   cwdSel.addEventListener("change", () => { fcwd = cwdSel.value; refreshConversations(); });
   provSel.addEventListener("change", () => { fprovider = provSel.value; refreshConversations(); });
+  targetProviderSel.addEventListener("change", () => { targetProvider = targetProviderSel.value; });
 
   const browserCard = h(
     "div",
     { class: "card" },
     h("div", { class: "card-title" }, "对话浏览"),
     h("p", { class: "card-desc" }, "检索和批量管理本机所有 Codex 对话历史，点标题看正文。"),
-    h("div", { class: "card-actions" }, homeSel, searchInput, cwdSel, provSel, h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: refreshAll }, "刷新列表"))
+    h(
+      "div",
+      { class: "card-actions" },
+      homeSel,
+      searchInput,
+      cwdSel,
+      provSel,
+      h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: refreshConversations }, "刷新对话"),
+      h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: refreshEnvironment }, "刷新环境/渠道")
+    )
   );
 
   container.replaceChildren(
@@ -430,13 +447,21 @@ function mountBrowse(container, run, store, setOutput) {
     homeSel.value = sourceHome;
   }
 
-  async function loadHomes() {
+  async function loadHomes(force = false) {
+    if (!force && Array.isArray(browseCache.homes)) {
+      homes = browseCache.homes;
+      renderHomeOptions(false);
+      return;
+    }
+    if (force) browseCache.channelsByHome.clear();
     renderHomeOptions(true);
     try {
       const result = await runAction("list-codex-homes");
       homes = Array.isArray(result.homes) ? result.homes : [];
+      browseCache.homes = homes;
     } catch {
       homes = [{ id: "windows", kind: "windows", label: "Windows", ok: true, has_codex: true }];
+      browseCache.homes = homes;
     }
     renderHomeOptions(false);
   }
@@ -457,8 +482,14 @@ function mountBrowse(container, run, store, setOutput) {
     return h("button", { class: `btn ${cls}`, type: "button", disabled: true, title }, label);
   }
 
-  async function refreshAll() {
-    await Promise.all([refreshChannels(), refreshConversations()]);
+  async function refreshAll(force = false) {
+    await Promise.all([refreshChannels(force), refreshConversations()]);
+  }
+
+  async function refreshEnvironment() {
+    await loadHomes(true);
+    await refreshChannels(true);
+    await refreshConversations();
   }
 
   homeSel.addEventListener("change", async () => {
@@ -468,17 +499,26 @@ function mountBrowse(container, run, store, setOutput) {
     fcwd = "";
     fprovider = "";
     renderDetail();
-    await refreshAll();
+    await refreshAll(false);
   });
 
   // --- 渠道分布渲染 ---
-  async function refreshChannels() {
+  async function refreshChannels(force = false) {
+    const cacheKey = sourceHome || "windows";
+    if (!force && browseCache.channelsByHome.has(cacheKey)) {
+      channelsData = browseCache.channelsByHome.get(cacheKey);
+      renderChannels();
+      fillTargetProviderOptions();
+      return;
+    }
     try {
       channelsData = await runAction("list-channels", { source_home: sourceHome });
+      browseCache.channelsByHome.set(cacheKey, channelsData);
     } catch(e) {
       channelsData = { success: false, error: String(e.message || e) };
     }
     renderChannels();
+    fillTargetProviderOptions();
   }
 
   async function submitChannelOp(action, opts, label) {
@@ -512,7 +552,7 @@ function mountBrowse(container, run, store, setOutput) {
       showToast(String(e.message || e), "error");
     } finally {
       busy = false;
-      await refreshChannels();
+      await refreshChannels(true);
       await refreshConversations();
       refreshStatus(store).catch(() => {});
     }
@@ -642,8 +682,30 @@ function mountBrowse(container, run, store, setOutput) {
       fillSelect(cwdSel, conversationsData.cwds, fcwd, "全部项目", shortCwd);
       fillSelect(provSel, conversationsData.providers, fprovider, "全部渠道");
     }
+    fillTargetProviderOptions();
     renderList();
     renderBatch();
+  }
+
+  function fillTargetProviderOptions() {
+    const current = channelsData?.current_provider || "";
+    const fromChannels = Array.isArray(channelsData?.channels) ? channelsData.channels.map(c => c.provider) : [];
+    const fromConversations = Array.isArray(conversationsData?.providers) ? conversationsData.providers : [];
+    const providers = [...new Set([current, ...fromChannels, ...fromConversations].filter(p => p && p !== "(unknown)"))].sort();
+    if (!providers.length) {
+      targetProvider = "";
+      targetProviderSel.replaceChildren(h("option", { value: "" }, "无可用目标渠道"));
+      targetProviderSel.disabled = true;
+      return;
+    }
+    targetProviderSel.disabled = false;
+    if (!targetProvider || !providers.includes(targetProvider)) targetProvider = current || providers[0];
+    targetProviderSel.replaceChildren(
+      ...providers.map(provider =>
+        h("option", { value: provider }, provider === current ? `${provider}（当前）` : provider)
+      )
+    );
+    targetProviderSel.value = targetProvider;
   }
 
   function renderList() {
@@ -754,7 +816,9 @@ function mountBrowse(container, run, store, setOutput) {
         renderBatch();
       }),
       actionButton("导出 Markdown", "btn-ghost btn-sm", doExport),
-      canWrite ? actionButton("并入当前渠道", "btn-primary btn-sm", () => writeOp("merge-threads", "已并入")) : disabledButton("并入当前渠道", "btn-primary btn-sm", writeTip),
+      h("span", { class: "muted", style: { marginLeft: "8px" } }, "目标渠道"),
+      targetProviderSel,
+      canWrite ? actionButton("改到目标渠道", "btn-primary btn-sm", () => writeOp("merge-threads", "已改到目标渠道", targetProvider || targetProviderSel.value)) : disabledButton("改到目标渠道", "btn-primary btn-sm", writeTip),
       canWrite ? actionButton("还原原始渠道", "btn-ghost btn-sm", () => writeOp("restore-threads", "已还原")) : disabledButton("还原原始渠道", "btn-ghost btn-sm", writeTip)
     );
   }
@@ -772,22 +836,28 @@ function mountBrowse(container, run, store, setOutput) {
     showToast(`已成功导出 ${paths.length} 个对话到 ~/.codex-sync/exports`, paths.length ? "success" : "error");
   }
 
-  async function writeOp(action, label) {
+  async function writeOp(action, label, target = "") {
     if (!selected.size) { showToast("请先勾选对话", "warning"); return; }
     const rows = selectedRows();
     if (sourceHome !== "windows" || rows.some(row => !isWindowsRow(row))) {
       showToast("并入/还原只支持 Windows 单环境，请先选择 Windows。", "warning");
       return;
     }
+    if (action === "merge-threads" && !target) {
+      showToast("请先选择目标渠道", "warning");
+      return;
+    }
     const ids = rows.map(row => row.id);
     try {
-      let res = await runAction(action, { source_home: sourceHome, thread_ids: ids });
+      const payload = { source_home: sourceHome, thread_ids: ids };
+      if (action === "merge-threads") payload.target = target;
+      let res = await runAction(action, payload);
       if (res && res.needs_close) {
         if (!window.confirm(CONFIRM_MSG)) {
           setOutput(res);
           return;
         }
-        res = await runAction(action, { source_home: sourceHome, thread_ids: ids, close_codex: true });
+        res = await runAction(action, { ...payload, close_codex: true });
       }
       setOutput(res);
       const ok = res && res.success;
@@ -797,6 +867,7 @@ function mountBrowse(container, run, store, setOutput) {
     } catch (e) {
       showToast(String(e.message || e), "error");
     } finally {
+      await refreshChannels(true);
       await refreshConversations();
       refreshStatus(store).catch(() => {});
     }
@@ -805,12 +876,12 @@ function mountBrowse(container, run, store, setOutput) {
   renderHomeOptions(true);
   listWrap.replaceChildren(loadingSpinner("正在检测本机环境…"));
   detailWrap.replaceChildren(h("div", { class: "empty" }, "点左侧对话标题查看具体正文"));
-  loadHomes().finally(refreshAll);
+  loadHomes(false).finally(() => refreshAll(false));
 
   return () => {};
 }
 
-// ==================== TAB 3: 外部包导入 ====================
+// ==================== TAB 3: 备份导入 ====================
 function mountImport(container, run, store, setOutput) {
   let backups = null;
   let homes = [];
@@ -848,7 +919,7 @@ function mountImport(container, run, store, setOutput) {
   const toolbar = h(
     "div",
     { class: "card" },
-    h("div", { class: "card-title" }, "外部备份对话导入向导"),
+    h("div", { class: "card-title" }, "备份导入向导"),
     h("p", { class: "card-desc" }, "第一步：在下拉框中选择要加载的备份包。第二步：勾选需要恢复导入的对话。第三步：指定目标环境和渠道，执行导入。"),
     h("div", { class: "card-actions" }, h("span", { class: "muted" }, "选择备份源包"), backupSel, actionButton("刷新备份包列表", "btn-ghost btn-sm", loadBackups))
   );

@@ -222,6 +222,10 @@ class HttpIntegrationTests(unittest.TestCase):
                     self.assertEqual(listed["project_backups"][0]["repo_name"], repo.name)
                     self.assertEqual(listed["project_backups"][0]["source_mode"], "git_full")
                     self.assertEqual(listed["project_backups"][0]["backup_kind"], "full")
+                    filtered = list_project_backups(cfg, limit=1, repo_name=repo.name)
+                    self.assertTrue(filtered["success"])
+                    self.assertEqual(filtered["limit"], 1)
+                    self.assertEqual(filtered["project_backups"][0]["id"], backup_id)
 
                     downloaded = download_project_backup(cfg, backup_id)
                     self.assertTrue(downloaded["success"])

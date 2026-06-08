@@ -17,11 +17,12 @@ from . import __version__
 from .backup_import import _ensure_local_archive, import_conversations, list_backup_conversations, list_importable_backups, read_backup_conversation
 from .codex_channels import list_channels, merge_channels, merge_threads, restore_channels, restore_threads
 from .collector import capture_event, create_resume_prompt
-from .config import load_config, save_config
+from .config import AppConfig, load_config, save_config
 from .daemon import run_daemon
 from .conversations import export_conversation, list_conversations, read_conversation
 from .deploy import DeployConfig, deploy_config_path, deploy_status, install_server, load_deploy_config, save_deploy_config, update_server
 from .disaster_backup import create_disaster_backup
+from .app_install import app_install_status, install_app, set_startup_enabled
 from .app_update import check_app_update, download_latest_update, open_update_page
 from .git_backup import (
     backup_project_to_server,
@@ -174,21 +175,345 @@ def _focus_existing_window() -> bool:
     return True
 
 
-def _close_choice() -> str:
+def _show_close_dialog() -> tuple[str, bool]:
+    """Return (choice, remember), where choice is minimize_to_tray | exit | cancel."""
     if os.name != "nt":
-        return "exit"
+        return "exit", False
     import ctypes
+    from ctypes import wintypes
 
-    message = "要将 Codex Sync 最小化到任务栏，还是彻底退出？\n\n选择“是”：最小化，后台继续运行。\n选择“否”：彻底退出。\n选择“取消”：返回应用。"
-    MB_YESNOCANCEL = 0x00000003
-    MB_ICONQUESTION = 0x00000020
-    MB_DEFBUTTON1 = 0x00000000
-    result = ctypes.windll.user32.MessageBoxW(None, message, "关闭 Codex Sync", MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1)
-    if result == 6:  # IDYES
-        return "minimize"
-    if result == 7:  # IDNO
-        return "exit"
-    return "cancel"
+    ID_MINIMIZE = 1001
+    ID_EXIT = 1002
+    ID_CANCEL = 2
+
+    try:
+        class TASKDIALOG_BUTTON(ctypes.Structure):
+            _fields_ = [
+                ("nButtonID", ctypes.c_int),
+                ("pszButtonText", wintypes.LPCWSTR),
+            ]
+
+        class TASKDIALOGCONFIG(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwndParent", wintypes.HWND),
+                ("hInstance", wintypes.HINSTANCE),
+                ("dwFlags", wintypes.UINT),
+                ("dwCommonButtons", wintypes.UINT),
+                ("pszWindowTitle", wintypes.LPCWSTR),
+                ("hMainIcon", ctypes.c_void_p),
+                ("pszMainInstruction", wintypes.LPCWSTR),
+                ("pszContent", wintypes.LPCWSTR),
+                ("cButtons", wintypes.UINT),
+                ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
+                ("nDefaultButton", ctypes.c_int),
+                ("cRadioButtons", wintypes.UINT),
+                ("pRadioButtons", ctypes.c_void_p),
+                ("nDefaultRadioButton", ctypes.c_int),
+                ("pszVerificationText", wintypes.LPCWSTR),
+                ("pszExpandedInformation", wintypes.LPCWSTR),
+                ("pszExpandedControlText", wintypes.LPCWSTR),
+                ("pszCollapsedControlText", wintypes.LPCWSTR),
+                ("hFooterIcon", ctypes.c_void_p),
+                ("pszFooter", wintypes.LPCWSTR),
+                ("pfCallback", ctypes.c_void_p),
+                ("lpCallbackData", ctypes.c_ssize_t),
+                ("cxWidth", wintypes.UINT),
+            ]
+
+        buttons = (TASKDIALOG_BUTTON * 3)(
+            TASKDIALOG_BUTTON(ID_MINIMIZE, "最小化到托盘"),
+            TASKDIALOG_BUTTON(ID_EXIT, "直接退出"),
+            TASKDIALOG_BUTTON(ID_CANCEL, "取消"),
+        )
+        config = TASKDIALOGCONFIG()
+        config.cbSize = ctypes.sizeof(TASKDIALOGCONFIG)
+        config.dwFlags = 0x0008  # TDF_ALLOW_DIALOG_CANCELLATION
+        config.pszWindowTitle = "关闭 Codex Sync"
+        config.pszMainInstruction = "关闭窗口时要怎么处理？"
+        config.pszContent = "最小化到托盘会让同步服务继续运行；直接退出会停止本地桌面服务。"
+        config.cButtons = len(buttons)
+        config.pButtons = buttons
+        config.nDefaultButton = ID_MINIMIZE
+        config.pszVerificationText = "以后不再提示，记住我的选择"
+        config.cxWidth = 220
+
+        selected = ctypes.c_int()
+        verified = wintypes.BOOL()
+        result = ctypes.windll.comctl32.TaskDialogIndirect(ctypes.byref(config), ctypes.byref(selected), None, ctypes.byref(verified))
+        if result != 0:
+            raise OSError(f"TaskDialogIndirect failed: {result}")
+        if selected.value == ID_MINIMIZE:
+            return "minimize_to_tray", bool(verified.value)
+        if selected.value == ID_EXIT:
+            return "exit", bool(verified.value)
+        return "cancel", False
+    except Exception:
+        message = "关闭窗口时要怎么处理？\n\n是：最小化到托盘/任务栏，后台继续运行。\n否：直接退出，停止本地服务。\n取消：返回应用。"
+        MB_YESNOCANCEL = 0x00000003
+        MB_ICONQUESTION = 0x00000020
+        result = ctypes.windll.user32.MessageBoxW(None, message, "关闭 Codex Sync", MB_YESNOCANCEL | MB_ICONQUESTION)
+        if result == 6:  # IDYES
+            return "minimize_to_tray", False
+        if result == 7:  # IDNO
+            return "exit", False
+        return "cancel", False
+
+
+def _close_choice(config: AppConfig) -> str:
+    if config.desktop_close_behavior in {"minimize_to_tray", "exit"}:
+        return config.desktop_close_behavior
+    choice, remember = _show_close_dialog()
+    if remember and choice in {"minimize_to_tray", "exit"}:
+        config.desktop_close_behavior = choice
+        save_config(config)
+    return choice
+
+
+class WindowsTrayIcon:
+    def __init__(self, window: Any, local: "LocalDesktopServer") -> None:
+        self.window = window
+        self.local = local
+        self.hwnd: int | None = None
+        self.exit_requested = False
+        self._ready = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._wndproc: Any | None = None
+        self._notify_data_type: Any | None = None
+        self._shell32: Any | None = None
+        self._user32: Any | None = None
+        self._icon_handle: int | None = None
+
+    @property
+    def available(self) -> bool:
+        return os.name == "nt" and bool(self.hwnd)
+
+    def start(self) -> bool:
+        if os.name != "nt":
+            return False
+        self._thread = threading.Thread(target=self._run, name="CodexSyncTray", daemon=True)
+        self._thread.start()
+        self._ready.wait(timeout=2)
+        return bool(self.hwnd)
+
+    def stop(self) -> None:
+        if os.name != "nt":
+            return
+        hwnd = self.hwnd
+        if hwnd and self._user32:
+            try:
+                self._user32.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+            except Exception:  # noqa: BLE001
+                pass
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
+
+    def restore_window(self) -> None:
+        try:
+            self.window.show()
+            self.window.restore()
+        except Exception as exc:  # noqa: BLE001
+            self.local.runtime.log("error", "failed to restore tray window", {"error": str(exc)})
+
+    def exit_app(self) -> None:
+        self.exit_requested = True
+        try:
+            self.window.destroy()
+        except Exception as exc:  # noqa: BLE001
+            self.local.runtime.log("error", "failed to exit from tray", {"error": str(exc)})
+
+    def _run(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+
+        class WNDCLASSW(ctypes.Structure):
+            _fields_ = [
+                ("style", wintypes.UINT),
+                ("lpfnWndProc", WNDPROC),
+                ("cbClsExtra", ctypes.c_int),
+                ("cbWndExtra", ctypes.c_int),
+                ("hInstance", wintypes.HINSTANCE),
+                ("hIcon", wintypes.HICON),
+                ("hCursor", wintypes.HCURSOR),
+                ("hbrBackground", wintypes.HBRUSH),
+                ("lpszMenuName", wintypes.LPCWSTR),
+                ("lpszClassName", wintypes.LPCWSTR),
+            ]
+
+        class GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        class NOTIFYICONDATAW(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("hWnd", wintypes.HWND),
+                ("uID", wintypes.UINT),
+                ("uFlags", wintypes.UINT),
+                ("uCallbackMessage", wintypes.UINT),
+                ("hIcon", wintypes.HICON),
+                ("szTip", wintypes.WCHAR * 128),
+                ("dwState", wintypes.DWORD),
+                ("dwStateMask", wintypes.DWORD),
+                ("szInfo", wintypes.WCHAR * 256),
+                ("uTimeoutOrVersion", wintypes.UINT),
+                ("szInfoTitle", wintypes.WCHAR * 64),
+                ("dwInfoFlags", wintypes.DWORD),
+                ("guidItem", GUID),
+                ("hBalloonIcon", wintypes.HICON),
+            ]
+
+        self._notify_data_type = NOTIFYICONDATAW
+        self._user32 = ctypes.WinDLL("user32", use_last_error=True)
+        self._shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        user32 = self._user32
+        kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
+        user32.RegisterClassW.restype = wintypes.ATOM
+        user32.CreateWindowExW.restype = wintypes.HWND
+        user32.DefWindowProcW.restype = LRESULT
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.LoadIconW.restype = wintypes.HICON
+        user32.CreatePopupMenu.restype = wintypes.HMENU
+
+        WM_CLOSE = 0x0010
+        WM_DESTROY = 0x0002
+        WM_TRAYICON = 0x0400 + 20
+        WM_LBUTTONDBLCLK = 0x0203
+        WM_RBUTTONUP = 0x0205
+        WM_CONTEXTMENU = 0x007B
+
+        def wndproc(hwnd: int, msg: int, wparam: int, lparam: int) -> int:
+            if msg == WM_TRAYICON:
+                if lparam == WM_LBUTTONDBLCLK:
+                    self.restore_window()
+                    return 0
+                if lparam in {WM_RBUTTONUP, WM_CONTEXTMENU}:
+                    self._show_menu(hwnd)
+                    return 0
+            if msg == WM_CLOSE:
+                user32.DestroyWindow(hwnd)
+                return 0
+            if msg == WM_DESTROY:
+                self._delete_icon()
+                user32.PostQuitMessage(0)
+                return 0
+            return user32.DefWindowProcW(hwnd, msg, wparam, lparam)
+
+        self._wndproc = WNDPROC(wndproc)
+        hinstance = kernel32.GetModuleHandleW(None)
+        class_name = f"CodexSyncTrayWindow{os.getpid()}"
+        wc = WNDCLASSW()
+        wc.lpfnWndProc = self._wndproc
+        wc.hInstance = hinstance
+        wc.lpszClassName = class_name
+        try:
+            user32.RegisterClassW(ctypes.byref(wc))
+            hwnd = user32.CreateWindowExW(0, class_name, class_name, 0, 0, 0, 0, 0, None, None, hinstance, None)
+            if not hwnd:
+                self.local.runtime.log("error", "failed to create tray message window", {"error": ctypes.get_last_error()})
+                self._ready.set()
+                return
+            self.hwnd = int(hwnd)
+            self._add_icon()
+            self._ready.set()
+            msg = wintypes.MSG()
+            while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                user32.TranslateMessage(ctypes.byref(msg))
+                user32.DispatchMessageW(ctypes.byref(msg))
+        except Exception as exc:  # noqa: BLE001
+            self.local.runtime.log("error", "tray icon failed", {"error": str(exc)})
+            self._ready.set()
+        finally:
+            self.hwnd = None
+
+    def _load_icon(self) -> int:
+        import ctypes
+
+        if self._user32 is None:
+            return 0
+        icon_path = _desktop_icon_path()
+        if icon_path:
+            IMAGE_ICON = 1
+            LR_LOADFROMFILE = 0x0010
+            LR_DEFAULTSIZE = 0x0040
+            icon = self._user32.LoadImageW(None, icon_path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE | LR_DEFAULTSIZE)
+            if icon:
+                self._icon_handle = int(icon)
+                return int(icon)
+        IDI_APPLICATION = 32512
+        icon = self._user32.LoadIconW(None, ctypes.c_void_p(IDI_APPLICATION))
+        return int(icon or 0)
+
+    def _icon_data(self) -> Any:
+        import ctypes
+
+        if self._notify_data_type is None or self.hwnd is None:
+            return None
+        data = self._notify_data_type()
+        data.cbSize = ctypes.sizeof(self._notify_data_type)
+        data.hWnd = self.hwnd
+        data.uID = 1
+        data.uFlags = 0x0001 | 0x0002 | 0x0004  # NIF_MESSAGE | NIF_ICON | NIF_TIP
+        data.uCallbackMessage = 0x0400 + 20
+        data.hIcon = self._load_icon()
+        data.szTip = "Codex Sync"
+        return data
+
+    def _add_icon(self) -> None:
+        import ctypes
+
+        if self._shell32 is None:
+            return
+        data = self._icon_data()
+        if data is not None:
+            self._shell32.Shell_NotifyIconW(0x00000000, ctypes.byref(data))  # NIM_ADD
+
+    def _delete_icon(self) -> None:
+        import ctypes
+
+        if self._shell32 is None or self._notify_data_type is None or self.hwnd is None:
+            return
+        data = self._notify_data_type()
+        data.cbSize = ctypes.sizeof(self._notify_data_type)
+        data.hWnd = self.hwnd
+        data.uID = 1
+        self._shell32.Shell_NotifyIconW(0x00000002, ctypes.byref(data))  # NIM_DELETE
+
+    def _show_menu(self, hwnd: int) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        if self._user32 is None:
+            return
+        ID_SHOW = 2001
+        ID_EXIT = 2002
+        MF_STRING = 0x0000
+        TPM_RIGHTBUTTON = 0x0002
+        TPM_RETURNCMD = 0x0100
+        menu = self._user32.CreatePopupMenu()
+        if not menu:
+            return
+        try:
+            self._user32.AppendMenuW(menu, MF_STRING, ID_SHOW, "显示 Codex Sync")
+            self._user32.AppendMenuW(menu, MF_STRING, ID_EXIT, "退出 Codex Sync")
+            point = wintypes.POINT()
+            self._user32.GetCursorPos(ctypes.byref(point))
+            self._user32.SetForegroundWindow(hwnd)
+            command = self._user32.TrackPopupMenu(menu, TPM_RIGHTBUTTON | TPM_RETURNCMD, point.x, point.y, 0, hwnd, None)
+            if command == ID_SHOW:
+                self.restore_window()
+            elif command == ID_EXIT:
+                self.exit_app()
+        finally:
+            self._user32.DestroyMenu(menu)
 
 
 _DEPLOY_STR_FIELDS = (
@@ -459,7 +784,9 @@ class DesktopRuntime:
                 "full_backup_retention_max_bytes": cfg.full_backup_retention_max_bytes,
                 "project_auto_backup_on_codex_stop": cfg.project_auto_backup_on_codex_stop,
                 "project_auto_backup_min_interval_seconds": cfg.project_auto_backup_min_interval_seconds,
+                "desktop_close_behavior": cfg.desktop_close_behavior,
             },
+            "app_install": app_install_status(),
             "outbox_count": outbox_count(),
             "hooks": hook_status(),
             "git": _project_state(),
@@ -486,6 +813,7 @@ class DesktopRuntime:
             "full_backup_retention_max_bytes",
             "project_auto_backup_on_codex_stop",
             "project_auto_backup_min_interval_seconds",
+            "desktop_close_behavior",
         ):
             if key in payload:
                 value = payload[key]
@@ -508,6 +836,8 @@ class DesktopRuntime:
                     "project_auto_backup_on_codex_stop",
                 ):
                     value = bool(value)
+                if key == "desktop_close_behavior" and value not in {"ask", "minimize_to_tray", "exit"}:
+                    value = "ask"
                 setattr(cfg, key, value)
         path = save_config(cfg)
         self.log("ok", "config saved", {"path": str(path)})
@@ -541,7 +871,13 @@ class DesktopRuntime:
         elif name == "project-backup":
             result = backup_project_to_server(_project_path_from_payload(payload), cfg)
         elif name == "list-project-backups":
-            result = list_project_backups(cfg)
+            result = list_project_backups(
+                cfg,
+                limit=int(payload.get("limit") or 200),
+                offset=int(payload.get("offset") or 0),
+                repo_name=str(payload.get("repo_name") or "").strip() or None,
+                device_id=str(payload.get("device_id") or "").strip() or None,
+            )
         elif name == "preview-project-restore":
             result = preview_project_backup_from_server(cfg, str(payload.get("backup_id") or ""), _project_path_from_payload(payload) or str(Path.cwd()))
         elif name == "restore-project-backup":
@@ -585,6 +921,17 @@ class DesktopRuntime:
             result = download_latest_update(force=bool(payload.get("force", False)))
         elif name == "app-update-open":
             result = open_update_page(force=bool(payload.get("force", False)))
+        elif name == "app-install-status":
+            result = app_install_status()
+        elif name == "app-install":
+            result = install_app(
+                create_shortcuts=bool(payload.get("create_shortcuts", True)),
+                enable_startup=bool(payload.get("enable_startup", False)),
+            )
+        elif name == "app-startup-enable":
+            result = set_startup_enabled(True)
+        elif name == "app-startup-disable":
+            result = set_startup_enabled(False)
         elif name == "server-retention-status":
             result = get_server_retention(cfg)
         elif name == "server-retention-prune":
@@ -1053,13 +1400,20 @@ def _wait_for_background_server(local: LocalDesktopServer) -> None:
         pass
 
 
-def _attach_close_prompt(window: Any, local: LocalDesktopServer) -> None:
+def _attach_close_prompt(window: Any, local: LocalDesktopServer, tray: WindowsTrayIcon | None = None) -> None:
     def on_closing() -> bool | None:
-        choice = _close_choice()
+        if tray and tray.exit_requested:
+            local.runtime.log("ok", "desktop exit requested from tray")
+            return None
+        cfg = load_config()
+        choice = _close_choice(cfg)
         local.runtime.log("run", "desktop close requested", {"choice": choice})
-        if choice == "minimize":
+        if choice == "minimize_to_tray":
             try:
-                window.minimize()
+                if tray and tray.available:
+                    window.hide()
+                else:
+                    window.minimize()
             except Exception as exc:  # noqa: BLE001 - close prompt should not crash the app
                 local.runtime.log("error", "failed to minimize window", {"error": str(exc)})
             return False
@@ -1073,6 +1427,7 @@ def _attach_close_prompt(window: Any, local: LocalDesktopServer) -> None:
 
 def open_desktop_window(local: LocalDesktopServer) -> None:
     local.start()
+    tray: WindowsTrayIcon | None = None
     try:
         import webview
     except Exception as exc:  # noqa: BLE001 - desktop should remain usable without WebView runtime
@@ -1096,13 +1451,20 @@ def open_desktop_window(local: LocalDesktopServer) -> None:
             background_color="#0f172a",
         )
         if window is not None:
-            _attach_close_prompt(window, local)
+            tray = WindowsTrayIcon(window, local)
+            if tray.start():
+                local.runtime.log("ok", "tray icon started")
+            else:
+                local.runtime.log("warn", "tray icon unavailable")
+            _attach_close_prompt(window, local, tray)
         webview.start(gui="edgechromium", debug=False, private_mode=True, icon=_desktop_icon_path())
     except Exception as exc:  # noqa: BLE001 - fall back to browser if WebView2 is missing/broken
         local.runtime.log("error", "desktop window failed; falling back to browser", {"error": str(exc)})
         webbrowser.open(local.url)
         _wait_for_background_server(local)
     finally:
+        if tray is not None:
+            tray.stop()
         local.stop()
 
 

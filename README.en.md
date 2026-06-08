@@ -21,7 +21,7 @@ The desktop app is the main entry point:
 
 - Overview shows local, remote, and other-device sync state.
 - Conversations & Backups handles full backups, cloud backup lists, import, browsing, and channel merging.
-- Project Backup lets you choose any project directory and upload a project snapshot.
+- Project Backup lets you choose any project directory, upload snapshots, and restore a selected cloud project/version into a local target directory.
 - Settings manages server connection, one-click deployment, backup policy, scheduled tasks, and diagnostics.
 
 The local web desktop binds only to `127.0.0.1` and generates a per-process session token. Do not expose it through a reverse proxy.
@@ -34,7 +34,9 @@ If you downloaded a release package, run:
 CodexSync.exe
 ```
 
-By default it opens the standalone Codex Sync desktop window. When closing the window, Codex Sync asks whether to minimize to the taskbar or exit completely and stop the local service. Launching it again focuses the existing window instead of starting a second instance.
+By default it opens the standalone Codex Sync desktop window. The first close action asks whether to minimize to the tray or exit completely and stop the local service, with an option to remember the choice. Launching it again focuses the existing window instead of starting a second instance.
+
+Release packages can be used as portable ZIPs, or installed from `Settings -> Scheduled Tasks & Hooks -> Desktop App Installation` to `%LOCALAPPDATA%\CodexSync\CodexSync.exe`. Installation creates Desktop/Start Menu shortcuts and can enable startup on login, so startup does not depend on a temporary unzip location.
 
 From source:
 
