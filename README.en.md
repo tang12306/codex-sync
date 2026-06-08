@@ -28,15 +28,15 @@ The local web desktop binds only to `127.0.0.1` and generates a per-process sess
 
 ## Quick Start
 
-If you downloaded a release package, run:
+If you downloaded a release build, run the Windows installer:
 
 ```text
-CodexSync.exe
+CodexSyncSetup-vX.Y.Z-windows-x64.exe
 ```
 
-By default it opens the standalone Codex Sync desktop window. The first close action asks whether to minimize to the tray or exit completely and stop the local service, with an option to remember the choice. Launching it again focuses the existing window instead of starting a second instance.
+The installer copies the app to `%LOCALAPPDATA%\CodexSync\CodexSync.exe`, creates Desktop/Start Menu shortcuts, and starts the installed desktop app. Launching it again focuses the existing window instead of starting a second instance.
 
-Release packages can be used as portable ZIPs, or installed from `Settings -> Scheduled Tasks & Hooks -> Desktop App Installation` to `%LOCALAPPDATA%\CodexSync\CodexSync.exe`. Installation creates Desktop/Start Menu shortcuts and can enable startup on login, so startup does not depend on a temporary unzip location.
+Closing the window shows a native Windows confirmation: Yes minimizes to tray and keeps the local service running, No exits and stops the service, and Cancel returns to the app. Startup on login can be enabled from `Settings -> Scheduled Tasks & Hooks -> Desktop App Installation`.
 
 From source:
 

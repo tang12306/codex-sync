@@ -14,6 +14,18 @@ def sample_release(tag: str = "v0.1.4") -> dict[str, Any]:
         "published_at": "2026-06-07T00:00:00Z",
         "assets": [
             {
+                "name": f"CodexSyncSetup-{tag}-windows-x64.exe",
+                "browser_download_url": f"https://github.com/tang12306/codex-sync/releases/download/{tag}/CodexSyncSetup-{tag}-windows-x64.exe",
+                "size": 5678,
+                "content_type": "application/vnd.microsoft.portable-executable",
+            },
+            {
+                "name": f"CodexSyncSetup-{tag}-windows-x64.exe.sha256",
+                "browser_download_url": f"https://github.com/tang12306/codex-sync/releases/download/{tag}/CodexSyncSetup-{tag}-windows-x64.exe.sha256",
+                "size": 80,
+                "content_type": "text/plain",
+            },
+            {
                 "name": f"CodexSync-{tag}-windows-x64.zip",
                 "browser_download_url": f"https://github.com/tang12306/codex-sync/releases/download/{tag}/CodexSync-{tag}-windows-x64.zip",
                 "size": 1234,
@@ -54,8 +66,8 @@ class AppUpdateTests(unittest.TestCase):
         self.assertTrue(result["success"])
         self.assertTrue(result["update_available"])
         self.assertEqual(result["latest_version"], "0.1.4")
-        self.assertEqual(result["windows_asset"]["name"], "CodexSync-v0.1.4-windows-x64.zip")
-        self.assertTrue(result["checksum_asset"]["name"].endswith(".sha256"))
+        self.assertEqual(result["windows_asset"]["name"], "CodexSyncSetup-v0.1.4-windows-x64.exe")
+        self.assertEqual(result["checksum_asset"]["name"], "CodexSyncSetup-v0.1.4-windows-x64.exe.sha256")
 
     def test_check_app_update_uses_fresh_cache(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

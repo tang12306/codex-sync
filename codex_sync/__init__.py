@@ -1,3 +1,3 @@
 """Codex Sync Windows-side agent core."""
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"

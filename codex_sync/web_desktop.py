@@ -180,84 +180,23 @@ def _show_close_dialog() -> tuple[str, bool]:
     if os.name != "nt":
         return "exit", False
     import ctypes
-    from ctypes import wintypes
 
-    ID_MINIMIZE = 1001
-    ID_EXIT = 1002
-    ID_CANCEL = 2
-
-    try:
-        class TASKDIALOG_BUTTON(ctypes.Structure):
-            _fields_ = [
-                ("nButtonID", ctypes.c_int),
-                ("pszButtonText", wintypes.LPCWSTR),
-            ]
-
-        class TASKDIALOGCONFIG(ctypes.Structure):
-            _fields_ = [
-                ("cbSize", wintypes.UINT),
-                ("hwndParent", wintypes.HWND),
-                ("hInstance", wintypes.HINSTANCE),
-                ("dwFlags", wintypes.UINT),
-                ("dwCommonButtons", wintypes.UINT),
-                ("pszWindowTitle", wintypes.LPCWSTR),
-                ("hMainIcon", ctypes.c_void_p),
-                ("pszMainInstruction", wintypes.LPCWSTR),
-                ("pszContent", wintypes.LPCWSTR),
-                ("cButtons", wintypes.UINT),
-                ("pButtons", ctypes.POINTER(TASKDIALOG_BUTTON)),
-                ("nDefaultButton", ctypes.c_int),
-                ("cRadioButtons", wintypes.UINT),
-                ("pRadioButtons", ctypes.c_void_p),
-                ("nDefaultRadioButton", ctypes.c_int),
-                ("pszVerificationText", wintypes.LPCWSTR),
-                ("pszExpandedInformation", wintypes.LPCWSTR),
-                ("pszExpandedControlText", wintypes.LPCWSTR),
-                ("pszCollapsedControlText", wintypes.LPCWSTR),
-                ("hFooterIcon", ctypes.c_void_p),
-                ("pszFooter", wintypes.LPCWSTR),
-                ("pfCallback", ctypes.c_void_p),
-                ("lpCallbackData", ctypes.c_ssize_t),
-                ("cxWidth", wintypes.UINT),
-            ]
-
-        buttons = (TASKDIALOG_BUTTON * 3)(
-            TASKDIALOG_BUTTON(ID_MINIMIZE, "最小化到托盘"),
-            TASKDIALOG_BUTTON(ID_EXIT, "直接退出"),
-            TASKDIALOG_BUTTON(ID_CANCEL, "取消"),
-        )
-        config = TASKDIALOGCONFIG()
-        config.cbSize = ctypes.sizeof(TASKDIALOGCONFIG)
-        config.dwFlags = 0x0008  # TDF_ALLOW_DIALOG_CANCELLATION
-        config.pszWindowTitle = "关闭 Codex Sync"
-        config.pszMainInstruction = "关闭窗口时要怎么处理？"
-        config.pszContent = "最小化到托盘会让同步服务继续运行；直接退出会停止本地桌面服务。"
-        config.cButtons = len(buttons)
-        config.pButtons = buttons
-        config.nDefaultButton = ID_MINIMIZE
-        config.pszVerificationText = "以后不再提示，记住我的选择"
-        config.cxWidth = 220
-
-        selected = ctypes.c_int()
-        verified = wintypes.BOOL()
-        result = ctypes.windll.comctl32.TaskDialogIndirect(ctypes.byref(config), ctypes.byref(selected), None, ctypes.byref(verified))
-        if result != 0:
-            raise OSError(f"TaskDialogIndirect failed: {result}")
-        if selected.value == ID_MINIMIZE:
-            return "minimize_to_tray", bool(verified.value)
-        if selected.value == ID_EXIT:
-            return "exit", bool(verified.value)
-        return "cancel", False
-    except Exception:
-        message = "关闭窗口时要怎么处理？\n\n是：最小化到托盘/任务栏，后台继续运行。\n否：直接退出，停止本地服务。\n取消：返回应用。"
-        MB_YESNOCANCEL = 0x00000003
-        MB_ICONQUESTION = 0x00000020
-        result = ctypes.windll.user32.MessageBoxW(None, message, "关闭 Codex Sync", MB_YESNOCANCEL | MB_ICONQUESTION)
-        if result == 6:  # IDYES
-            return "minimize_to_tray", False
-        if result == 7:  # IDNO
-            return "exit", False
-        return "cancel", False
+    message = "关闭窗口时要怎么处理？\n\n是：最小化到托盘/任务栏，后台继续运行。\n否：直接退出，停止本地服务。\n取消：返回应用。"
+    MB_YESNOCANCEL = 0x00000003
+    MB_ICONQUESTION = 0x00000020
+    MB_DEFBUTTON1 = 0x00000000
+    MB_SETFOREGROUND = 0x00010000
+    result = ctypes.windll.user32.MessageBoxW(
+        None,
+        message,
+        "关闭 Codex Sync",
+        MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1 | MB_SETFOREGROUND,
+    )
+    if result == 6:  # IDYES
+        return "minimize_to_tray", False
+    if result == 7:  # IDNO
+        return "exit", False
+    return "cancel", False
 
 
 def _close_choice(config: AppConfig) -> str:

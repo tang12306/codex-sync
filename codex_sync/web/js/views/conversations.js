@@ -15,6 +15,7 @@ const CONFIRM_MSG =
 const browseCache = {
   homes: null,
   channelsByHome: new Map(),
+  conversationsByHome: new Map(),
 };
 
 function fmtTime(sec) {
@@ -147,7 +148,7 @@ function mountBrowse(container, run, store, setOutput) {
       searchInput,
       cwdSel,
       provSel,
-      h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: refreshConversations }, "刷新对话"),
+      h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: () => refreshConversations(true) }, "刷新对话"),
       h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: refreshEnvironment }, "刷新环境")
     )
   );
@@ -200,7 +201,10 @@ function mountBrowse(container, run, store, setOutput) {
       renderHomeOptions(false);
       return;
     }
-    if (force) browseCache.channelsByHome.clear();
+    if (force) {
+      browseCache.channelsByHome.clear();
+      browseCache.conversationsByHome.clear();
+    }
     renderHomeOptions(true);
     try {
       const result = await runAction("list-codex-homes");
@@ -230,7 +234,7 @@ function mountBrowse(container, run, store, setOutput) {
   }
 
   async function refreshAll(force = false) {
-    await Promise.all([loadChannelsData(force), refreshConversations()]);
+    await Promise.all([loadChannelsData(force), refreshConversations(force)]);
   }
 
   async function refreshEnvironment() {
@@ -264,22 +268,52 @@ function mountBrowse(container, run, store, setOutput) {
     fillTargetProviderOptions();
   }
 
-  async function refreshConversations() {
+  async function refreshConversations(force = false) {
+    const cacheKey = sourceHome || "windows";
+    if (!force && browseCache.conversationsByHome.has(cacheKey)) {
+      conversationsData = filterConversations(browseCache.conversationsByHome.get(cacheKey));
+      syncConversationFilters();
+      fillTargetProviderOptions();
+      renderList();
+      renderBatch();
+      return;
+    }
+
     busy = true;
     renderBatch();
     try {
-      conversationsData = await runAction("list-conversations", { source_home: sourceHome, search, cwd: fcwd, provider: fprovider });
+      const raw = await runAction("list-conversations", { source_home: sourceHome, search: "", cwd: "", provider: "" });
+      browseCache.conversationsByHome.set(cacheKey, raw);
+      conversationsData = filterConversations(raw);
     } catch (e) {
       conversationsData = { success: false, error: String(e.message || e) };
     }
     busy = false;
-    if (conversationsData && conversationsData.success) {
-      fillSelect(cwdSel, conversationsData.cwds, fcwd, "全部项目", shortCwd);
-      fillSelect(provSel, conversationsData.providers, fprovider, "全部渠道");
-    }
+    syncConversationFilters();
     fillTargetProviderOptions();
     renderList();
     renderBatch();
+  }
+
+  function filterConversations(data) {
+    if (!data || !data.success) return data;
+    const needle = search.trim().toLowerCase();
+    const filtered = (data.conversations || []).filter(c => {
+      if (fcwd && c.cwd !== fcwd) return false;
+      if (fprovider && c.model_provider !== fprovider) return false;
+      if (!needle) return true;
+      const haystack = [c.title, c.preview, c.first_user_message, c.cwd, c.model_provider, c.home_label]
+        .map(v => String(v || "").toLowerCase())
+        .join("\n");
+      return haystack.includes(needle);
+    });
+    return { ...data, conversations: filtered, count: filtered.length };
+  }
+
+  function syncConversationFilters() {
+    if (!conversationsData || !conversationsData.success) return;
+    fillSelect(cwdSel, conversationsData.cwds, fcwd, "全部项目", shortCwd);
+    fillSelect(provSel, conversationsData.providers, fprovider, "全部渠道");
   }
 
   function fillTargetProviderOptions() {
@@ -533,7 +567,10 @@ function mountChannels(container, run, store, setOutput) {
       renderHomeOptions(false);
       return;
     }
-    if (force) browseCache.channelsByHome.clear();
+    if (force) {
+      browseCache.channelsByHome.clear();
+      browseCache.conversationsByHome.clear();
+    }
     renderHomeOptions(true);
     try {
       const result = await runAction("list-codex-homes");

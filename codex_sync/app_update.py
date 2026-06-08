@@ -105,10 +105,12 @@ def _pick_windows_asset(assets: list[Any]) -> dict[str, Any] | None:
         if lower.endswith((".sha256", ".sig", ".asc")):
             continue
         score = 0
-        if lower.endswith(".zip"):
-            score += 40
         if lower.endswith(".exe"):
-            score += 35
+            score += 60
+        if lower.endswith(".zip"):
+            score += 25
+        if "setup" in lower or "install" in lower:
+            score += 25
         if "windows" in lower or "win" in lower:
             score += 35
         if "x64" in lower or "amd64" in lower:
@@ -287,7 +289,7 @@ def download_latest_update(*, force: bool = False, timeout: int = 60, target_dir
         return update
     asset = update.get("windows_asset") if isinstance(update.get("windows_asset"), dict) else None
     url = str((asset or {}).get("url") or "")
-    name = safe_filename(str((asset or {}).get("name") or "CodexSync-update.zip"))
+    name = safe_filename(str((asset or {}).get("name") or "CodexSyncSetup-update.exe"))
     if not asset or not url:
         return {**update, "success": False, "error": "Latest release does not include a Windows download asset."}
     if not _validate_github_download_url(url):
