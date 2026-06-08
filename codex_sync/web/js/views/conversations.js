@@ -3,7 +3,7 @@ import { h, asObject, shortId } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
 import { refreshStatus } from "../poller.js";
-import { consoleCard, makeRun, actionButton } from "../ui.js";
+import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
 
 const ROLE_LABEL = { user: "用户", assistant: "助手", developer: "系统注入", reasoning: "思考", tool_call: "工具调用", tool_output: "工具输出" };
 const ROW_STYLE = { display: "flex", gap: "10px", padding: "10px 0", borderBottom: "1px solid var(--border)" };
@@ -63,7 +63,7 @@ export function mount(root, store) {
       unmountCurrent = null;
     }
     viewContainer.replaceChildren();
-    
+
     if (tabId === "backups") {
       unmountCurrent = mountBackups(viewContainer, run, store, setOutput);
     } else if (tabId === "browse") {
@@ -287,7 +287,7 @@ function mountBackups(container, run, store, setOutput) {
                 { class: "table" },
                 h("thead", {}, h("tr", {},
                   h("th", {}, "环境"),
-                  h("th", {}, "时间"),
+                  h("th", {}, "本机时间"),
                   h("th", {}, "大小"),
                   h("th", {}, "状态"),
                   h("th", {}, "ID")
@@ -312,6 +312,7 @@ function mountBackups(container, run, store, setOutput) {
 function cloudBackupRow(item) {
   const backup = asObject(item);
   const state = backup.sync_state || (backup.parent_backup_id ? "incremental" : "root");
+  const time = backup.received_at || backup.created_at || "";
   return h(
     "tr",
     {},
@@ -321,7 +322,7 @@ function cloudBackupRow(item) {
       h("div", {}, fullBackupEnvLabel(backup)),
       h("div", { class: "muted", style: { fontSize: "12px" } }, backup.branch_id || backup.device_id || "-")
     ),
-    h("td", {}, backup.received_at || backup.created_at || "-"),
+    h("td", { title: time ? `UTC: ${time}` : "" }, formatDateTime(time)),
     h("td", {}, formatBytes(backup.size_bytes)),
     h(
       "td",
@@ -364,7 +365,7 @@ function mountBrowse(container, run, store, setOutput) {
   const searchInput = h("input", { class: "input", type: "search", style: { flex: "1 1 200px" }, placeholder: "搜索标题、预览、对话历史…" });
   const cwdSel = h("select", { class: "input", style: { flex: "1 1 150px" } });
   const provSel = h("select", { class: "input", style: { flex: "1 1 150px" } });
-  
+
   const listWrap = h("div", { class: "card", style: { maxHeight: "60vh", overflow: "auto" } });
   const detailWrap = h("div", { class: "card", style: { maxHeight: "60vh", overflow: "auto" } });
   const batchWrap = h("div", { class: "card-actions" });
@@ -872,7 +873,7 @@ function mountImport(container, run, store, setOutput) {
     backupSel.replaceChildren(
       h("option", { value: "" }, items.length ? `-- 选择备份包（共 ${items.length} 个）--` : "-- 无可用备份包 --"),
       ...items.map(b =>
-        h("option", { value: b.backup_id }, `${sourceLabel(b.source)} · ${b.device_id || "?"} · ${(b.created_at || "").slice(0, 16)}${b.downloaded ? " ✓本地就绪" : ""}`)
+        h("option", { value: b.backup_id }, `${sourceLabel(b.source)} · ${b.device_id || "?"} · ${formatDateTime(b.created_at)}${b.downloaded ? " ✓本地就绪" : ""}`)
       )
     );
     if (curBackupId && ids.has(curBackupId)) {

@@ -2,7 +2,7 @@
 import { h, asObject, shortId } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
-import { consoleCard, makeRun, actionButton } from "../ui.js";
+import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
 
 export function mount(root, store) {
   const run = makeRun(store);
@@ -114,6 +114,51 @@ export function mount(root, store) {
     }
   };
 
+  const previewProjectRestore = async (backup) => {
+    const backupId = backup.id || "";
+    const target = currentProjectPath();
+    if (!backupId) {
+      showToast("备份 ID 缺失", "warning");
+      return;
+    }
+    if (!target) {
+      showToast("请先填写恢复目标目录", "warning");
+      return;
+    }
+    await run("preview-project-restore", {
+      payload: { backup_id: backupId, project_path: target },
+      refresh: false,
+      okMsg: "项目恢复预览已生成",
+      errMsg: "项目恢复预览失败",
+      label: "项目恢复预览",
+    });
+  };
+
+  const restoreProjectBackup = async (backup) => {
+    const backupId = backup.id || "";
+    const target = currentProjectPath();
+    if (!backupId) {
+      showToast("备份 ID 缺失", "warning");
+      return;
+    }
+    if (!target) {
+      showToast("请先填写恢复目标目录", "warning");
+      return;
+    }
+    const kind = projectBackupKindLabel(backup);
+    if (!window.confirm(`将把服务器项目备份「${kind} / ${shortId(backupId)}」恢复到：\n${target}\n\n如果目标目录已有文件，会先创建本地预飞备份，再覆盖同名文件。继续吗？`)) return;
+    const result = await run("restore-project-backup", {
+      payload: { backup_id: backupId, confirm_backup_id: backupId, project_path: target, overwrite: true },
+      refresh: false,
+      okMsg: "项目备份已恢复",
+      errMsg: "项目备份恢复失败",
+      label: "项目恢复",
+    });
+    if (result?.success) {
+      await refreshProjectStatus(false);
+    }
+  };
+
   const chooseProjectDir = async () => {
     try {
       const result = await runAction("choose-project-dir", { project_path: currentProjectPath() });
@@ -146,7 +191,7 @@ export function mount(root, store) {
       h(
         "p",
         {},
-        "选择一个项目目录。Git 项目上传补丁快照；非 Git 目录按安全排除规则打包文件。"
+        "选择一个项目目录。手动上传会生成完整安全基线；自动备份会生成轻量补丁，用于跨设备接手开发。"
       )
     ),
     h(
@@ -155,7 +200,7 @@ export function mount(root, store) {
       projectPathInput,
       actionButton("选择文件夹", "btn-ghost", chooseProjectDir),
       actionButton("使用当前目录", "btn-ghost", useCurrentDir),
-      actionButton("上传到服务器", "btn-primary", uploadProject),
+      actionButton("上传完整基线", "btn-primary", uploadProject),
       actionButton("刷新服务器备份", "btn-ghost", refreshServerBackups),
       actionButton("检测项目状态", "btn-ghost", refreshProjectStatus)
     )
@@ -169,7 +214,7 @@ export function mount(root, store) {
       { class: "card" },
       h("div", { class: "card-title" }, "备份内容"),
       h("div", { class: "concept-hidden-list" },
-        item("Git 项目", "保存 git diff、状态信息，以及允许范围内的小型未跟踪文件。"),
+        item("Git 项目", "手动上传保存完整安全文件快照；自动备份保存提交或工作区补丁。"),
         item("非 Git 项目", "直接打包当前目录中的普通项目文件，使用同一套安全排除规则。"),
         item("本地副本", "上传前会在 ~/.codex-sync/project-backups 保留一份 zip。")
       )
@@ -209,7 +254,7 @@ export function mount(root, store) {
       h(
         "div",
         { class: "result-facts" },
-        fact("模式", valid ? (isRepo ? "Git 补丁快照" : "文件快照") : "-"),
+        fact("模式", valid ? (isRepo ? "完整基线 + 增量补丁" : "完整目录快照") : "-"),
         fact("分支", state.branch || "-"),
         fact("提交", state.commit ? shortId(state.commit) : "-"),
         fact("未跟踪", Array.isArray(state.untracked) ? `${state.untracked.length} 个` : "-")
@@ -247,7 +292,7 @@ export function mount(root, store) {
         fact("Git 提交触发", enabled ? "已安装" : "未安装"),
         fact("待处理队列", state.queue_count != null ? `${state.queue_count} 个` : "-"),
         fact("Codex 关闭触发", state.codex_stop_enabled ? "已在设置中开启" : "未开启"),
-        fact("最近备份", last.last_backup_at || "-")
+        fact("最近备份", formatDateTime(last.last_backup_at))
       ),
       !isRepo ? h("div", { class: "status-line warn" }, "自动项目备份当前只支持 Git 仓库。非 Git 目录请使用手动上传。") : null,
       h(
@@ -279,8 +324,8 @@ export function mount(root, store) {
               h(
                 "table",
                 { class: "table" },
-                h("thead", {}, h("tr", {}, h("th", {}, "项目"), h("th", {}, "时间"), h("th", {}, "大小"), h("th", {}, "ID"))),
-                h("tbody", {}, ...backups.slice(0, 8).map(backupRow))
+                h("thead", {}, h("tr", {}, h("th", {}, "项目"), h("th", {}, "类型"), h("th", {}, "本机时间"), h("th", {}, "大小"), h("th", {}, "ID"), h("th", {}, "操作"))),
+                h("tbody", {}, ...backups.slice(0, 8).map((backup) => backupRow(backup, previewProjectRestore, restoreProjectBackup)))
               )
             )
           : h("div", { class: "empty compact" }, loadingBackups ? "正在读取服务器备份…" : "还没有加载服务器备份，点击“刷新服务器备份”。")
@@ -315,15 +360,32 @@ function fact(label, value) {
   return h("div", { class: "result-fact" }, h("span", {}, label), h("b", {}, value || "-"));
 }
 
-function backupRow(item) {
+function projectBackupKindLabel(item) {
   const backup = asObject(item);
+  const mode = backup.source_mode || "";
+  if (mode === "git_full") return "完整基线";
+  if (mode === "filesystem") return "完整目录";
+  if (mode === "git_patch") return "未提交改动";
+  if (mode === "git_commit") return "提交补丁";
+  return backup.backup_kind === "full" ? "完整备份" : backup.backup_kind === "patch" ? "增量补丁" : "-";
+}
+
+function backupRow(item, onPreview, onRestore) {
+  const backup = asObject(item);
+  const time = backup.received_at || backup.created_at || "";
+  const previewBtn = h("button", { class: "btn btn-ghost btn-sm", type: "button" }, "预览");
+  const restoreBtn = h("button", { class: "btn btn-primary btn-sm", type: "button" }, "恢复");
+  previewBtn.addEventListener("click", () => onPreview(backup));
+  restoreBtn.addEventListener("click", () => onRestore(backup));
   return h(
     "tr",
     {},
     h("td", { class: "cell-ellipsis", title: backup.repo_root || backup.repo_name || "" }, backup.repo_name || "-"),
-    h("td", {}, backup.received_at || backup.created_at || "-"),
+    h("td", {}, h("span", { class: `badge ${backup.backup_kind === "full" ? "ok" : ""}` }, projectBackupKindLabel(backup))),
+    h("td", { title: time ? `UTC: ${time}` : "" }, formatDateTime(time)),
     h("td", {}, formatBytes(backup.size_bytes)),
-    h("td", { class: "mono", title: backup.id || "" }, shortId(backup.id))
+    h("td", { class: "mono", title: backup.id || "" }, shortId(backup.id)),
+    h("td", {}, h("div", { class: "row-actions" }, previewBtn, restoreBtn))
   );
 }
 

@@ -23,7 +23,14 @@ from .conversations import export_conversation, list_conversations, read_convers
 from .deploy import DeployConfig, deploy_config_path, deploy_status, install_server, load_deploy_config, save_deploy_config, update_server
 from .disaster_backup import create_disaster_backup
 from .app_update import check_app_update, download_latest_update, open_update_page
-from .git_backup import backup_project_to_server, create_patch_snapshot, git_state, list_project_backups
+from .git_backup import (
+    backup_project_to_server,
+    create_patch_snapshot,
+    git_state,
+    list_project_backups,
+    preview_project_backup_from_server,
+    restore_project_backup_from_server,
+)
 from .full_backup import full_backup_now, get_remote_device_state, list_full_backups, list_remote_devices, notify_codex_changed, scan_full_backup_changes, summarize_sync_health
 from .hooks import hook_status, install_hooks
 from .project_auto_backup import (
@@ -535,6 +542,16 @@ class DesktopRuntime:
             result = backup_project_to_server(_project_path_from_payload(payload), cfg)
         elif name == "list-project-backups":
             result = list_project_backups(cfg)
+        elif name == "preview-project-restore":
+            result = preview_project_backup_from_server(cfg, str(payload.get("backup_id") or ""), _project_path_from_payload(payload) or str(Path.cwd()))
+        elif name == "restore-project-backup":
+            result = restore_project_backup_from_server(
+                cfg,
+                str(payload.get("backup_id") or ""),
+                _project_path_from_payload(payload) or str(Path.cwd()),
+                confirm_backup_id=str(payload.get("confirm_backup_id") or ""),
+                overwrite=bool(payload.get("overwrite", True)),
+            )
         elif name == "project-auto-backup-status":
             result = project_auto_backup_status(_project_path_from_payload(payload), cfg)
         elif name == "project-auto-backup-install-git-hook":

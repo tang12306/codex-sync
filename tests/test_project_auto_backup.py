@@ -87,6 +87,23 @@ class ProjectAutoBackupTests(unittest.TestCase):
                 else:
                     os.environ["CODEX_SYNC_HOME"] = old_sync
 
+    def test_codex_stop_auto_backup_queues_full_project(self) -> None:
+        with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                repo = Path(repo_dir)
+                init_repo(repo)
+                cfg = AppConfig(device_id="auto-device")
+                queued = enqueue_project_auto_backup(repo, cfg, reason="codex-stop")
+                self.assertTrue(queued["queued"])
+                self.assertEqual(queued["item"]["mode"], "full")
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
     def test_process_auto_backup_queue_uploads_project_backup(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as data_dir:
             old_sync = os.environ.get("CODEX_SYNC_HOME")
@@ -110,7 +127,7 @@ class ProjectAutoBackupTests(unittest.TestCase):
                 thread = threading.Thread(target=httpd.serve_forever, daemon=True)
                 thread.start()
                 try:
-                    cfg = AppConfig(server_url=f"http://127.0.0.1:{httpd.server_port}", api_token=token, device_id="auto-device")
+                    cfg = AppConfig(server_url=f"http://127.0.0.1:{httpd.server_port}", api_token=token, device_id="auto-device", project_auto_backup_min_interval_seconds=0)
                     queued = enqueue_project_auto_backup(repo, cfg, reason="git-post-commit")
                     self.assertTrue(queued["queued"])
 
@@ -118,10 +135,22 @@ class ProjectAutoBackupTests(unittest.TestCase):
                     self.assertEqual(processed["remaining_count"], 0)
                     self.assertEqual(processed["processed_count"], 1)
                     self.assertTrue(processed["processed"][0]["result"]["success"])
+                    self.assertEqual(processed["processed"][0]["result"]["package"]["manifest"]["source_mode"], "git_full")
 
                     listed = list_project_backups(cfg)
                     self.assertTrue(listed["success"])
                     self.assertEqual(len(listed["project_backups"]), 1)
+                    self.assertEqual(listed["project_backups"][0]["backup_kind"], "full")
+
+                    (repo / "tracked.txt").write_text("again\n", encoding="utf-8")
+                    run_cmd(["git", "add", "tracked.txt"], cwd=repo)
+                    code, _, err = run_cmd(["git", "commit", "-m", "again"], cwd=repo)
+                    self.assertEqual(code, 0, err)
+                    queued = enqueue_project_auto_backup(repo, cfg, reason="git-post-commit")
+                    self.assertTrue(queued["queued"])
+                    processed = process_project_auto_backup_queue(cfg)
+                    self.assertTrue(processed["processed"][0]["result"]["success"])
+                    self.assertEqual(processed["processed"][0]["result"]["package"]["manifest"]["source_mode"], "git_commit")
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

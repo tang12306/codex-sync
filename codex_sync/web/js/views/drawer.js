@@ -4,6 +4,7 @@ import { h, asObject, shortId, formatDiff } from "../dom.js";
 import { runAction } from "../api.js";
 import { refreshStatus } from "../poller.js";
 import { showToast } from "../toast.js";
+import { formatDateTime } from "../ui.js";
 
 function patch(store, p) {
   store.setState({ drawer: { ...store.getState().drawer, ...p } });
@@ -168,10 +169,9 @@ export function mount(root, store) {
     const d = store.getState().drawer;
     const snap = currentSnapshot(d);
     const id = currentId(d);
+    const createdAt = snap.created_at || d.summary?.created_at || "";
     title.textContent = id ? `快照 ${shortId(id)}` : "快照详情";
-    subtitle.textContent = `${snap.device_id || d.summary?.device_id || "-"} · ${
-      snap.created_at || d.summary?.created_at || "-"
-    }`;
+    subtitle.textContent = `${snap.device_id || d.summary?.device_id || "-"} · ${formatDateTime(createdAt)}`;
     statusLine.textContent = d.status || "等待加载";
     statusLine.className = `status-line ${d.statusType === "error" ? "error" : ""}`;
     body.replaceChildren(
@@ -212,7 +212,7 @@ function summarySection(snap) {
   const items = [
     ["Snapshot ID", snap.id || "-", true],
     ["Device", snap.device_id || "-", false],
-    ["Created", snap.created_at || "-", true],
+    ["Created", formatDateTime(snap.created_at), true],
     ["CWD", snap.cwd || "-", false],
     ["Git", git.is_repo ? `${git.branch || "detached"} · ${git.dirty ? "dirty" : "clean"}` : "非 Git 仓库", false],
     ["Commit", git.commit ? shortId(git.commit) : "-", true],
@@ -264,7 +264,7 @@ function eventsSection(snap) {
             "div",
             { class: "list-item-head" },
             h("span", { class: "list-item-name" }, ev.event || ev.type || "-"),
-            h("span", { class: "list-item-meta" }, ev.created_at || "-")
+            h("span", { class: "list-item-meta", title: ev.created_at ? `UTC: ${ev.created_at}` : "" }, formatDateTime(ev.created_at))
           ),
           h("div", { class: "list-item-meta" }, ev.cwd ? `cwd=${ev.cwd}` : "cwd=-")
         );

@@ -10,7 +10,13 @@ from pathlib import Path
 import sync_server
 from codex_sync.config import AppConfig
 from codex_sync.full_backup import list_remote_devices, summarize_sync_health, _write_state
-from codex_sync.git_backup import backup_project_to_server, list_project_backups
+from codex_sync.git_backup import (
+    backup_project_to_server,
+    download_project_backup,
+    list_project_backups,
+    preview_project_backup_restore,
+    restore_project_backup,
+)
 from codex_sync.util import run_cmd
 from codex_sync.server import (
     check_server_compatibility,
@@ -178,8 +184,8 @@ class HttpIntegrationTests(unittest.TestCase):
                 else:
                     os.environ["CODEX_SYNC_HOME"] = old_sync
 
-    def test_project_backup_upload_and_list(self) -> None:
-        with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as data_dir:
+    def test_project_backup_upload_list_download_and_restore(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as data_dir, tempfile.TemporaryDirectory() as restore_parent:
             old_sync = os.environ.get("CODEX_SYNC_HOME")
             old_data_dir = sync_server.DATA_DIR
             old_db_path = sync_server.DB_PATH
@@ -214,6 +220,21 @@ class HttpIntegrationTests(unittest.TestCase):
                     self.assertTrue(listed["success"])
                     self.assertEqual(listed["project_backups"][0]["id"], backup_id)
                     self.assertEqual(listed["project_backups"][0]["repo_name"], repo.name)
+                    self.assertEqual(listed["project_backups"][0]["source_mode"], "git_full")
+                    self.assertEqual(listed["project_backups"][0]["backup_kind"], "full")
+
+                    downloaded = download_project_backup(cfg, backup_id)
+                    self.assertTrue(downloaded["success"])
+                    target = Path(restore_parent) / "restored-project"
+                    preview = preview_project_backup_restore(downloaded["path"], target)
+                    self.assertTrue(preview["success"])
+                    self.assertEqual(preview["restore_type"], "full")
+
+                    restored = restore_project_backup(cfg, downloaded["path"], target, confirm_backup_id=backup_id)
+                    self.assertTrue(restored["success"])
+                    self.assertEqual((target / "tracked.txt").read_text(encoding="utf-8"), "changed\n")
+                    self.assertEqual((target / "note.txt").read_text(encoding="utf-8"), "untracked\n")
+                    self.assertFalse((target / ".git").exists())
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

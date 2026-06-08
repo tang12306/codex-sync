@@ -74,6 +74,16 @@ function valueText(value) {
   return "查看详情";
 }
 
+export function formatDateTime(value) {
+  if (value == null || value === "") return "-";
+  const raw = String(value).trim();
+  if (!raw) return "-";
+  const normalized = /^\d{4}-\d{2}-\d{2}T/.test(raw) && !/(Z|[+-]\d{2}:\d{2})$/.test(raw) ? `${raw}Z` : raw;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return raw;
+  return date.toLocaleString();
+}
+
 function toneFor(value) {
   if (!isObject(value)) return "";
   if (value.error || value.success === false) return "danger";

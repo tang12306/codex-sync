@@ -10,6 +10,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from .config import AppConfig
 from .paths import app_dir, ensure_app_dirs
@@ -105,7 +106,7 @@ def _project_root(cwd: str | Path | None) -> Path:
     return path.resolve()
 
 
-def create_filesystem_project_snapshot(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
+def create_filesystem_project_snapshot(cwd: str | Path | None, config: AppConfig, project: dict[str, Any] | None = None) -> dict[str, Any]:
     ensure_app_dirs()
     root = _project_root(cwd)
     if not root.exists() or not root.is_dir():
@@ -138,7 +139,7 @@ def create_filesystem_project_snapshot(cwd: str | Path | None, config: AppConfig
         shutil.copy2(src, dst)
         copied.append(rel_posix)
 
-    project = {
+    project = project or {
         "is_repo": False,
         "root": str(root),
         "name": project_name,
@@ -146,6 +147,8 @@ def create_filesystem_project_snapshot(cwd: str | Path | None, config: AppConfig
         "branch": None,
         "commit": None,
     }
+    project.setdefault("root", str(root))
+    project.setdefault("name", project_name)
     write_json(snapshot_dir / "metadata.json", {"created_at": utc_now(), "project": project})
     write_json(snapshot_dir / "files_manifest.json", {"copied": copied, "skipped": skipped})
     return {"snapshot_dir": str(snapshot_dir), "metadata": {"project": project, "copied_files": copied, "skipped_files": skipped}}
@@ -213,6 +216,14 @@ def create_commit_patch_snapshot(cwd: str | Path | None, config: AppConfig, comm
     return {"snapshot_dir": str(snapshot_dir), "metadata": {"repo": state, "commit": commit}}
 
 
+def create_full_project_snapshot(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
+    root = _project_root(cwd)
+    project = git_state(root)
+    if project.get("is_repo"):
+        return create_filesystem_project_snapshot(root, config, project=project)
+    return create_filesystem_project_snapshot(root, config)
+
+
 def project_backup_dir() -> Path:
     ensure_app_dirs()
     path = app_dir() / "project-backups"
@@ -243,7 +254,11 @@ def create_project_backup_package(
 ) -> dict[str, Any]:
     root = git_root(cwd)
     if root:
-        if mode == "git_commit":
+        if mode in {"full", "git_full", "baseline"}:
+            snapshot = create_full_project_snapshot(root, config)
+            project = snapshot.get("metadata", {}).get("project", {})
+            source_mode = "git_full"
+        elif mode == "git_commit":
             snapshot = create_commit_patch_snapshot(root, config, commit_ref=commit_ref)
             project = dict(snapshot.get("metadata", {}).get("repo", {}))
             project["commit"] = snapshot.get("metadata", {}).get("commit") or project.get("commit")
@@ -266,6 +281,7 @@ def create_project_backup_package(
         "type": "project_backup",
         "format_version": 1,
         "source_mode": source_mode,
+        "backup_kind": "full" if source_mode in {"git_full", "filesystem"} else "patch",
         "created_at": created_at,
         "device_id": config.device_id,
         "repo_name": repo_name,
@@ -309,6 +325,7 @@ def upload_project_backup(config: AppConfig, archive: str | Path, manifest: dict
         "type": manifest.get("type") or "project_backup",
         "format_version": manifest.get("format_version", 1),
         "source_mode": manifest.get("source_mode"),
+        "backup_kind": manifest.get("backup_kind"),
         "device_id": manifest.get("device_id"),
         "repo_name": manifest.get("repo_name"),
         "repo_root": manifest.get("repo_root"),
@@ -349,7 +366,7 @@ def upload_project_backup(config: AppConfig, archive: str | Path, manifest: dict
 
 
 def backup_project_to_server(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
-    package = create_project_backup_package(cwd, config)
+    package = create_project_backup_package(cwd, config, mode="full", trigger_reason="manual_full")
     uploaded = upload_project_backup(config, package["archive"], package["manifest"])
     result = {"success": bool(uploaded.get("success")), "package": package, "upload": uploaded}
     if not result["success"]:
@@ -371,3 +388,327 @@ def list_project_backups(config: AppConfig) -> dict[str, Any]:
         return {"success": False, "error": _server_unsupported_message(exc), "status": exc.code}
     except Exception as exc:
         return {"success": False, "error": str(exc)}
+
+
+def project_backup_download_dir() -> Path:
+    path = project_backup_dir() / "downloads"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _project_headers(config: AppConfig) -> dict[str, str]:
+    headers = {"User-Agent": "codex-sync/0.1"}
+    if config.api_token:
+        headers["Authorization"] = f"Bearer {config.api_token}"
+    return headers
+
+
+def download_project_backup(config: AppConfig, backup_id: str, output: str | Path | None = None) -> dict[str, Any]:
+    if not backup_id:
+        return {"success": False, "error": "backup_id is required"}
+    if not config.server_url:
+        return {"success": False, "error": "server_url is empty", "backup_id": backup_id}
+    output_path = Path(output) if output else project_backup_download_dir() / f"{safe_filename(backup_id)}.zip"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    request = urllib.request.Request(
+        config.server_url.rstrip("/") + f"/api/project-backups/{quote(backup_id, safe='')}/download",
+        headers=_project_headers(config),
+        method="GET",
+    )
+    try:
+        digest = hashlib.sha256()
+        total = 0
+        expected = ""
+        with DIRECT_OPENER.open(request, timeout=120) as response, output_path.open("wb") as fh:
+            expected = response.headers.get("X-Codex-Project-Backup-Sha256", "")
+            for chunk in iter(lambda: response.read(1024 * 1024), b""):
+                fh.write(chunk)
+                digest.update(chunk)
+                total += len(chunk)
+        actual = digest.hexdigest()
+        if expected and actual != expected:
+            output_path.unlink(missing_ok=True)
+            return {"success": False, "error": "downloaded project backup sha256 mismatch", "backup_id": backup_id}
+        return {"success": True, "backup_id": backup_id, "path": str(output_path), "bytes": total, "sha256": actual}
+    except urllib.error.HTTPError as exc:
+        return {"success": False, "error": _server_unsupported_message(exc), "status": exc.code, "backup_id": backup_id}
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "backup_id": backup_id}
+
+
+def _safe_restore_target(root: Path, relative: str) -> Path | None:
+    rel = Path(relative)
+    if rel.is_absolute() or any(part == ".." for part in rel.parts):
+        return None
+    target = root / rel
+    try:
+        root_resolved = root.resolve()
+        parent = target.parent.resolve()
+        if parent == root_resolved or root_resolved in parent.parents:
+            return target
+    except OSError:
+        return None
+    return None
+
+
+def _project_restore_root(target_dir: str | Path) -> Path:
+    root = Path(target_dir).expanduser()
+    if root.exists() and not root.is_dir():
+        raise RuntimeError(f"Restore target is not a directory: {root}")
+    return root.resolve()
+
+
+def _read_project_manifest(zf: zipfile.ZipFile) -> dict[str, Any]:
+    return json.loads(zf.read("manifest.json").decode("utf-8"))
+
+
+def _project_file_members(zf: zipfile.ZipFile) -> list[str]:
+    return [name for name in zf.namelist() if name.startswith("snapshot/files/") and not name.endswith("/")]
+
+
+def _project_untracked_members(zf: zipfile.ZipFile) -> list[str]:
+    return [name for name in zf.namelist() if name.startswith("snapshot/untracked/") and not name.endswith("/")]
+
+
+def _project_patch_member(zf: zipfile.ZipFile, source_mode: str) -> str | None:
+    candidates = ["snapshot/diff.patch"] if source_mode == "git_patch" else ["snapshot/commit.patch", "snapshot/diff.patch"]
+    names = set(zf.namelist())
+    for name in candidates:
+        if name in names:
+            return name
+    return None
+
+
+def _write_temp_patch(backup_id: str, patch_bytes: bytes) -> Path:
+    temp_dir = project_backup_dir() / "restore-temp"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    path = temp_dir / f"{safe_filename(backup_id)}.patch"
+    path.write_bytes(patch_bytes)
+    return path
+
+
+def preview_project_backup_restore(archive: str | Path, target_dir: str | Path) -> dict[str, Any]:
+    archive_path = Path(archive)
+    if not archive_path.exists():
+        return {"success": False, "error": f"archive not found: {archive_path}"}
+    try:
+        target_root = _project_restore_root(target_dir)
+    except RuntimeError as exc:
+        return {"success": False, "error": str(exc)}
+    with zipfile.ZipFile(archive_path) as zf:
+        manifest = _read_project_manifest(zf)
+        backup_id = str(manifest.get("id") or "")
+        source_mode = str(manifest.get("source_mode") or "")
+        if source_mode in {"filesystem", "git_full"}:
+            planned: list[dict[str, Any]] = []
+            skipped: list[dict[str, Any]] = []
+            for name in _project_file_members(zf):
+                rel = name[len("snapshot/files/") :]
+                target = _safe_restore_target(target_root, rel)
+                if target is None:
+                    skipped.append({"path": rel, "reason": "unsafe path"})
+                    continue
+                info = zf.getinfo(name)
+                status = "create"
+                if target.exists():
+                    status = "same_size" if target.stat().st_size == info.file_size else "overwrite"
+                planned.append({"path": rel, "status": status, "bytes": info.file_size})
+            return {
+                "success": True,
+                "backup_id": backup_id,
+                "source_mode": source_mode,
+                "target_dir": str(target_root),
+                "restore_type": "full",
+                "file_count": len(planned),
+                "overwrite_count": sum(1 for item in planned if item["status"] in {"overwrite", "same_size"}),
+                "planned": planned[:100],
+                "skipped": skipped,
+            }
+        if source_mode in {"git_patch", "git_commit"}:
+            patch_member = _project_patch_member(zf, source_mode)
+            if patch_member is None:
+                return {"success": False, "error": "project patch file not found in backup", "backup_id": backup_id}
+            patch_bytes = zf.read(patch_member)
+            if patch_bytes.strip():
+                patch_path = _write_temp_patch(backup_id, patch_bytes)
+                code, out, err = run_cmd(["git", "apply", "--check", "--whitespace=nowarn", str(patch_path)], cwd=target_root, timeout=120)
+                patch_ok = code == 0
+            else:
+                out = err = ""
+                patch_ok = True
+            untracked = [name[len("snapshot/untracked/") :] for name in _project_untracked_members(zf)]
+            return {
+                "success": patch_ok,
+                "backup_id": backup_id,
+                "source_mode": source_mode,
+                "target_dir": str(target_root),
+                "restore_type": "patch",
+                "patch_ok": patch_ok,
+                "patch_stdout": out,
+                "patch_stderr": err,
+                "untracked_count": len(untracked),
+                "untracked": untracked[:100],
+                "error": None if patch_ok else (err or out or "git apply --check failed"),
+            }
+        return {"success": False, "error": f"unsupported project backup source_mode: {source_mode}", "backup_id": backup_id}
+
+
+def restore_project_backup(config: AppConfig, archive: str | Path, target_dir: str | Path, confirm_backup_id: str, overwrite: bool = True) -> dict[str, Any]:
+    archive_path = Path(archive)
+    if not archive_path.exists():
+        return {"success": False, "error": f"archive not found: {archive_path}"}
+    try:
+        target_root = _project_restore_root(target_dir)
+    except RuntimeError as exc:
+        return {"success": False, "error": str(exc)}
+    with zipfile.ZipFile(archive_path) as zf:
+        manifest = _read_project_manifest(zf)
+        backup_id = str(manifest.get("id") or "")
+        if confirm_backup_id != backup_id:
+            return {"success": False, "error": "Refusing restore without exact confirm_backup_id match", "backup_id": backup_id}
+        source_mode = str(manifest.get("source_mode") or "")
+        preflight = None
+        if target_root.exists() and any(target_root.iterdir()):
+            try:
+                preflight = create_project_backup_package(target_root, config, mode="full", trigger_reason=f"before_project_restore_{backup_id[:8]}")
+            except Exception as exc:
+                return {"success": False, "error": f"Failed to create preflight project backup: {exc}", "backup_id": backup_id}
+        target_root.mkdir(parents=True, exist_ok=True)
+        restored: list[str] = []
+        skipped: list[dict[str, Any]] = []
+        if source_mode in {"filesystem", "git_full"}:
+            for name in _project_file_members(zf):
+                rel = name[len("snapshot/files/") :]
+                target = _safe_restore_target(target_root, rel)
+                if target is None:
+                    skipped.append({"path": rel, "reason": "unsafe path"})
+                    continue
+                if target.exists() and not overwrite:
+                    skipped.append({"path": rel, "reason": "exists"})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as src, target.open("wb") as dst:
+                    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                        dst.write(chunk)
+                restored.append(rel)
+            return {
+                "success": True,
+                "backup_id": backup_id,
+                "source_mode": source_mode,
+                "target_dir": str(target_root),
+                "restored_count": len(restored),
+                "restored": restored[:200],
+                "skipped": skipped,
+                "preflight_backup": preflight,
+            }
+        if source_mode in {"git_patch", "git_commit"}:
+            patch_member = _project_patch_member(zf, source_mode)
+            if patch_member is None:
+                return {"success": False, "error": "project patch file not found in backup", "backup_id": backup_id, "preflight_backup": preflight}
+            patch_bytes = zf.read(patch_member)
+            if patch_bytes.strip():
+                patch_path = _write_temp_patch(backup_id, patch_bytes)
+                code, out, err = run_cmd(["git", "apply", "--whitespace=nowarn", str(patch_path)], cwd=target_root, timeout=120)
+                if code != 0:
+                    return {"success": False, "error": err or out or "git apply failed", "backup_id": backup_id, "preflight_backup": preflight}
+                restored.append(str(Path(patch_member).name))
+            for name in _project_untracked_members(zf):
+                rel = name[len("snapshot/untracked/") :]
+                target = _safe_restore_target(target_root, rel)
+                if target is None:
+                    skipped.append({"path": rel, "reason": "unsafe path"})
+                    continue
+                if target.exists() and not overwrite:
+                    skipped.append({"path": rel, "reason": "exists"})
+                    continue
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(name) as src, target.open("wb") as dst:
+                    for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                        dst.write(chunk)
+                restored.append(rel)
+            return {
+                "success": True,
+                "backup_id": backup_id,
+                "source_mode": source_mode,
+                "target_dir": str(target_root),
+                "restored_count": len(restored),
+                "restored": restored[:200],
+                "skipped": skipped,
+                "preflight_backup": preflight,
+            }
+        return {"success": False, "error": f"unsupported project backup source_mode: {source_mode}", "backup_id": backup_id, "preflight_backup": preflight}
+
+
+def preview_project_backup_from_server(config: AppConfig, backup_id: str, target_dir: str | Path) -> dict[str, Any]:
+    downloaded = download_project_backup(config, backup_id)
+    if not downloaded.get("success"):
+        return {"success": False, "download": downloaded, "error": downloaded.get("error") or "project backup download failed"}
+    preview = preview_project_backup_restore(str(downloaded["path"]), target_dir)
+    return {"success": bool(preview.get("success")), "download": downloaded, "preview": preview, "error": preview.get("error")}
+
+
+def restore_project_backup_from_server(
+    config: AppConfig,
+    backup_id: str,
+    target_dir: str | Path,
+    *,
+    confirm_backup_id: str,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    downloaded = download_project_backup(config, backup_id)
+    if not downloaded.get("success"):
+        return {"success": False, "download": downloaded, "error": downloaded.get("error") or "project backup download failed"}
+    restored = restore_project_backup(config, str(downloaded["path"]), target_dir, confirm_backup_id=confirm_backup_id, overwrite=overwrite)
+    return {"success": bool(restored.get("success")), "download": downloaded, "restore": restored, "error": restored.get("error")}
+
+
+def backup_to_github(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
+    snapshot = create_patch_snapshot(cwd, config)
+    source_root = git_root(cwd)
+    if not source_root:
+        raise RuntimeError("Current directory is not inside a Git repository.")
+
+    remote_name = config.github_remote or "origin"
+    code, remote_url, err = run_cmd(["git", "remote", "get-url", remote_name], cwd=source_root)
+    if code != 0 or not remote_url:
+        raise RuntimeError(f"Cannot read Git remote '{remote_name}': {err}")
+
+    repo_name = safe_filename(source_root.name)
+    mirror_dir = app_dir() / "git-backups" / repo_name
+    branch = f"{config.backup_branch_prefix}/{safe_filename(config.device_id)}"
+
+    if not mirror_dir.exists():
+        code, _, err = run_cmd(["git", "clone", remote_url, str(mirror_dir)], timeout=300)
+        if code != 0:
+            raise RuntimeError(f"git clone failed: {err}")
+    else:
+        code, _, err = run_cmd(["git", "fetch", remote_name], cwd=mirror_dir, timeout=120)
+        if code != 0:
+            raise RuntimeError(f"git fetch failed: {err}")
+
+    code, _, _ = run_cmd(["git", "checkout", branch], cwd=mirror_dir)
+    if code != 0:
+        code, _, _ = run_cmd(["git", "checkout", "--orphan", branch], cwd=mirror_dir)
+        if code != 0:
+            raise RuntimeError(f"Cannot create backup branch '{branch}'.")
+        for child in mirror_dir.iterdir():
+            if child.name == ".git":
+                continue
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+
+    dest = mirror_dir / "snapshots" / repo_name / Path(snapshot["snapshot_dir"]).name
+    shutil.copytree(snapshot["snapshot_dir"], dest, dirs_exist_ok=True)
+    write_json(mirror_dir / "latest.json", {"repo": repo_name, "latest_snapshot": str(dest), "updated_at": utc_now()})
+
+    run_cmd(["git", "add", "snapshots", "latest.json"], cwd=mirror_dir, timeout=60)
+    code, _, err = run_cmd(["git", "commit", "-m", f"codex autosave artifact: {repo_name} {config.device_id}"], cwd=mirror_dir, timeout=120)
+    if code != 0 and "nothing to commit" not in err.lower():
+        raise RuntimeError(f"git commit failed: {err}")
+    code, _, err = run_cmd(["git", "push", "-u", remote_name, branch], cwd=mirror_dir, timeout=300)
+    if code != 0:
+        raise RuntimeError(f"git push failed: {err}")
+
+    return {"branch": branch, "mirror_dir": str(mirror_dir), "snapshot": snapshot}

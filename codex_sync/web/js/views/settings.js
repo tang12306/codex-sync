@@ -4,7 +4,7 @@ import { h, asObject, shortId } from "../dom.js";
 import { saveConfig, runAction } from "../api.js";
 import { refreshStatus, fetchSnapshots } from "../poller.js";
 import { showToast } from "../toast.js";
-import { consoleCard, makeRun, actionButton } from "../ui.js";
+import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
 import { openSnapshot } from "./drawer.js";
 
 function loadingSpinner(text = "加载中…") {
@@ -47,7 +47,7 @@ function fromUnit(value, multiplier, fallback) {
 export function mount(root, store) {
   const run = makeRun(store);
   const { card: outCard, setOutput } = consoleCard("系统设置详情输出");
-  
+
   let currentTab = "server"; // server | policy | automation | diagnosis
   let dirty = false; // 用户是否修改了表单
   const markDirty = () => { dirty = true; };
@@ -406,7 +406,7 @@ export function mount(root, store) {
     retentionBody
   );
 
-  const panelServer = h("div", { class: "tab-panel" }, 
+  const panelServer = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, connCard, deployCard),
     h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appUpdateCard, retentionCard)
   );
@@ -437,7 +437,7 @@ export function mount(root, store) {
     field("full_backup_retention_max_gb", "本地备份留存容量限制（GB）", "本地 full_backups 最大允许占用的磁盘空间，0 表示不限制", { type: "number", min: "0", step: "0.5" })
   );
 
-  const panelPolicy = h("div", { class: "tab-panel" }, 
+  const panelPolicy = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, policyCard, advancedCard)
   );
 
@@ -509,7 +509,7 @@ export function mount(root, store) {
     )
   );
 
-  const panelAutomation = h("div", { class: "tab-panel" }, 
+  const panelAutomation = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, daemonCard, hooksCard),
     h("div", { class: "section", style: { marginTop: "20px" } }, taskCard)
   );
@@ -551,7 +551,7 @@ export function mount(root, store) {
             {},
             h("th", {}, "发送设备"),
             h("th", {}, "项目路径"),
-            h("th", {}, "上传时间"),
+            h("th", {}, "上传时间（本机）"),
             h("th", {}, "快照 ID"),
             h("th", {}, "诊断操作")
           )
@@ -561,7 +561,7 @@ export function mount(root, store) {
     )
   );
 
-  const panelDiagnosis = h("div", { class: "tab-panel" }, 
+  const panelDiagnosis = h("div", { class: "tab-panel" },
     h("div", { class: "section" }, diagCard),
     h("div", { class: "section" }, snapCard)
   );
@@ -738,6 +738,49 @@ export function mount(root, store) {
     );
   }
 
+  function renderCompatibility() {
+    if (compatLoading) {
+      compatBody.replaceChildren(loadingSpinner("正在检查远程服务器 API 版本…"));
+      return;
+    }
+    if (!compatData) {
+      compatBody.replaceChildren(h("div", { class: "empty compact" }, "尚未检查远程服务器版本。"));
+      return;
+    }
+    const server = asObject(compatData.server);
+    const expected = asObject(compatData.expected);
+    const features = Array.isArray(expected.required_features) ? expected.required_features : [];
+    const missing = Array.isArray(compatData.missing_features) ? compatData.missing_features : [];
+    const tone = compatData.compatible ? "ok" : compatData.needs_update ? "warn" : "danger";
+    compatBody.replaceChildren(
+      h(
+        "div",
+        { class: "result-section" },
+        h(
+          "div",
+          { class: "result-section-head" },
+          h("strong", {}, "远程服务器版本"),
+          h("span", { class: `badge ${tone}` }, compatData.compatible ? "兼容" : compatData.needs_update ? "需要更新" : "检查失败")
+        ),
+        h(
+          "div",
+          { class: "result-facts" },
+          fact("远程 API", server.api_version != null ? server.api_version : "-"),
+          fact("本地期望 API", expected.api_version != null ? expected.api_version : "-"),
+          fact("远程版本", server.server_version || "-"),
+          fact("启动时间", server.started_at || "-"),
+          fact("必需功能", `${features.length} 项`),
+          fact("缺失功能", missing.length ? missing.join(", ") : "无")
+        ),
+        compatData.needs_update
+          ? h("div", { class: "status-line warn" }, "本地桌面功能比远程服务器更新。请执行“一键更新部署”后再使用服务器留存、项目备份或 WSL 云备份等新功能。")
+          : compatData.error
+            ? h("div", { class: "status-line error" }, compatData.error)
+            : null
+      )
+    );
+  }
+
   function renderAppUpdate() {
     if (appUpdateLoading) {
       appUpdateBody.replaceChildren(loadingSpinner("正在检查 GitHub Release…"));
@@ -789,49 +832,6 @@ export function mount(root, store) {
     );
   }
 
-  function renderCompatibility() {
-    if (compatLoading) {
-      compatBody.replaceChildren(loadingSpinner("正在检查远程服务器 API 版本…"));
-      return;
-    }
-    if (!compatData) {
-      compatBody.replaceChildren(h("div", { class: "empty compact" }, "尚未检查远程服务器版本。"));
-      return;
-    }
-    const server = asObject(compatData.server);
-    const expected = asObject(compatData.expected);
-    const features = Array.isArray(expected.required_features) ? expected.required_features : [];
-    const missing = Array.isArray(compatData.missing_features) ? compatData.missing_features : [];
-    const tone = compatData.compatible ? "ok" : compatData.needs_update ? "warn" : "danger";
-    compatBody.replaceChildren(
-      h(
-        "div",
-        { class: "result-section" },
-        h(
-          "div",
-          { class: "result-section-head" },
-          h("strong", {}, "远程服务器版本"),
-          h("span", { class: `badge ${tone}` }, compatData.compatible ? "兼容" : compatData.needs_update ? "需要更新" : "检查失败")
-        ),
-        h(
-          "div",
-          { class: "result-facts" },
-          fact("远程 API", server.api_version != null ? server.api_version : "-"),
-          fact("本地期望 API", expected.api_version != null ? expected.api_version : "-"),
-          fact("远程版本", server.server_version || "-"),
-          fact("启动时间", server.started_at || "-"),
-          fact("必需功能", `${features.length} 项`),
-          fact("缺失功能", missing.length ? missing.join(", ") : "无")
-        ),
-        compatData.needs_update
-          ? h("div", { class: "status-line warn" }, "本地桌面功能比远程服务器更新。请执行“一键更新部署”后再使用服务器留存、项目备份或 WSL 云备份等新功能。")
-          : compatData.error
-            ? h("div", { class: "status-line error" }, compatData.error)
-            : null
-      )
-    );
-  }
-
   const renderTable = () => {
     const { items, loading, error } = store.getState().snapshots;
     if (loading && !items.length) {
@@ -856,7 +856,7 @@ export function mount(root, store) {
       return h("tr", {},
         h("td", {}, snapObj.device_id || "-"),
         h("td", { class: "mono cell-ellipsis", title: snapObj.cwd || "" }, snapObj.cwd || "-"),
-        h("td", {}, snapObj.created_at || "-"),
+        h("td", { title: snapObj.created_at ? `UTC: ${snapObj.created_at}` : "" }, formatDateTime(snapObj.created_at)),
         h("td", { class: "mono", title: snapObj.id || "" }, snapObj.id ? shortId(snapObj.id) : "-"),
         h("td", {}, h("div", { class: "row-actions" }, mini("详情", "detail"), mini("接续", "resume"), mini("还原", "restore")))
       );
@@ -867,8 +867,8 @@ export function mount(root, store) {
   syncBadges();
   loadDeployConfig();
   renderRetention();
-  renderAppUpdate();
   renderCompatibility();
+  renderAppUpdate();
   renderTabs();
   switchTab(currentTab);
 

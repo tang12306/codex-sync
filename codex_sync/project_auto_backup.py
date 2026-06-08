@@ -83,6 +83,8 @@ def _content_id(root: Path, mode: str, commit_ref: str | None = None) -> str:
 
 
 def _mode_for_reason(reason: str) -> str:
+    if reason == "codex-stop":
+        return "full"
     return "git_commit" if reason == "git-post-commit" else "worktree"
 
 
@@ -142,13 +144,17 @@ def _should_skip(root: Path, item: dict[str, Any], config: AppConfig) -> dict[st
 def _record_success(root: Path, item: dict[str, Any], result: dict[str, Any]) -> None:
     state = _read_state()
     projects = state.setdefault("projects", {})
+    previous = projects.get(_project_key(root), {})
     package = result.get("package") if isinstance(result.get("package"), dict) else {}
+    manifest = package.get("manifest") if isinstance(package.get("manifest"), dict) else {}
+    full_backup_id = package.get("backup_id") if manifest.get("backup_kind") == "full" else previous.get("last_full_backup_id")
     projects[_project_key(root)] = {
         "root": str(root),
         "last_backup_at": utc_now(),
         "last_content_id": str(item.get("content_id") or ""),
         "last_reason": item.get("reason"),
         "last_backup_id": package.get("backup_id"),
+        "last_full_backup_id": full_backup_id,
         "last_result": {
             "success": result.get("success"),
             "archive": package.get("archive"),
@@ -191,6 +197,9 @@ def run_project_auto_backup_item(config: AppConfig, item: dict[str, Any]) -> dic
     if existing is not None:
         return existing
     mode = str(item.get("mode") or _mode_for_reason(str(item.get("reason") or "")))
+    project = _read_state().get("projects", {}).get(_project_key(root), {})
+    if not project.get("last_full_backup_id"):
+        mode = "full"
     result = backup_project_to_server_for_auto(root, config, mode=mode, reason=str(item.get("reason") or "auto"), commit_ref=item.get("commit"))
     return result
 

@@ -30,7 +30,7 @@ RETENTION_PROJECT_BACKUP_DAYS = int(os.environ.get("CODEX_SYNC_RETENTION_PROJECT
 RETENTION_SNAPSHOT_KEEP = int(os.environ.get("CODEX_SYNC_RETENTION_SNAPSHOT_KEEP", "100"))
 RETENTION_SNAPSHOT_DAYS = int(os.environ.get("CODEX_SYNC_RETENTION_SNAPSHOT_DAYS", "14"))
 RETENTION_MAX_BYTES = int(os.environ.get("CODEX_SYNC_RETENTION_MAX_BYTES", str(20 * 1024 * 1024 * 1024)))
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.0"
 SERVER_API_VERSION = 4
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 SERVER_FEATURES = {
@@ -1065,7 +1065,7 @@ def list_project_backups(limit: int = 50, offset: int = 0, repo_name: str | None
         rows = conn.execute(
             f"""
             SELECT id, device_id, repo_name, repo_root, branch, commit_sha, created_at,
-                   received_at, artifact_sha256, size_bytes
+                   received_at, artifact_sha256, size_bytes, metadata_json
             FROM project_backups
             {where}
             ORDER BY received_at DESC
@@ -1075,7 +1075,18 @@ def list_project_backups(limit: int = 50, offset: int = 0, repo_name: str | None
         ).fetchall()
     finally:
         conn.close()
-    return [dict(row) for row in rows]
+    items: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        try:
+            metadata = json.loads(str(item.pop("metadata_json", "") or "{}"))
+        except json.JSONDecodeError:
+            metadata = {}
+        item["source_mode"] = metadata.get("source_mode") or ""
+        item["backup_kind"] = metadata.get("backup_kind") or ("full" if item["source_mode"] in {"filesystem", "git_full"} else "patch")
+        item["trigger_reason"] = metadata.get("trigger_reason") or ""
+        items.append(item)
+    return items
 
 
 def get_project_backup(backup_id: str) -> dict[str, Any] | None:
