@@ -31,7 +31,7 @@ export function mount(root, store) {
   const restorePathInput = h("input", {
     class: "input project-path-input",
     type: "text",
-    placeholder: "输入要恢复到的本机目录；新目录可直接手动填写",
+    placeholder: "选择本机文件夹后自动填入；也可粘贴或输入新目录",
     value: selectedPath,
   });
   const projectSearchInput = h("input", {
@@ -216,7 +216,7 @@ export function mount(root, store) {
 
   const chooseProjectDir = async () => {
     try {
-      const result = await runAction("choose-project-dir", { project_path: currentProjectPath() });
+      const result = await runAction("choose-project-dir", { project_path: currentProjectPath(), purpose: "project" });
       setOutput(result);
       if (result?.success && result.path) {
         projectPathInput.value = result.path;
@@ -232,7 +232,7 @@ export function mount(root, store) {
 
   const chooseRestoreDir = async () => {
     try {
-      const result = await runAction("choose-project-dir", { project_path: restoreTargetPath() });
+      const result = await runAction("choose-project-dir", { project_path: restoreTargetPath(), purpose: "restore" });
       setOutput(result);
       if (result?.success && result.path) {
         restorePathInput.value = result.path;
@@ -351,6 +351,7 @@ export function mount(root, store) {
   function renderAutoBackupStatus() {
     const state = asObject(autoBackupStatus);
     const isRepo = Boolean(state.is_repo);
+    const autoSupported = state.auto_supported !== false;
     const enabled = Boolean(state.enabled_for_git_commit);
     const last = asObject(state.last);
     const nodes = [
@@ -358,9 +359,9 @@ export function mount(root, store) {
         "div",
         { class: "card-title" },
         h("span", {}, "自动备份"),
-        h("span", { class: `badge ${loadingAutoBackup ? "" : !isRepo ? "warn" : enabled ? "ok" : ""}` }, loadingAutoBackup ? "检查中" : !isRepo ? "仅 Git 项目" : enabled ? "已开启" : "未开启")
+        h("span", { class: `badge ${loadingAutoBackup ? "" : !autoSupported ? "warn" : enabled || (!isRepo && state.codex_stop_enabled) ? "ok" : ""}` }, loadingAutoBackup ? "检查中" : !autoSupported ? "路径不可用" : isRepo ? (enabled ? "已开启" : "未开启") : "非 Git 可入队")
       ),
-      h("p", { class: "card-desc" }, "为当前 Git 项目安装 post-commit hook：每次提交后入队并后台上传提交补丁，不阻塞提交。"),
+      h("p", { class: "card-desc" }, "Git 项目可安装 post-commit hook；非 Git 目录可由 Codex Stop 或手动入队生成完整目录快照。"),
       h(
         "div",
         { class: "result-facts" },
@@ -369,7 +370,7 @@ export function mount(root, store) {
         fact("Codex 关闭触发", state.codex_stop_enabled ? "已在设置中开启" : "未开启"),
         fact("最近备份", formatDateTime(last.last_backup_at))
       ),
-      !isRepo ? h("div", { class: "status-line warn" }, "自动项目备份当前只支持 Git 仓库。非 Git 目录请使用手动上传。") : null,
+      !isRepo && autoSupported ? h("div", { class: "status-line warn" }, "非 Git 目录不支持提交后 hook，但支持 Codex 关闭触发和手动入队。") : null,
       h(
         "div",
         { class: "card-actions" },
@@ -405,13 +406,13 @@ export function mount(root, store) {
         h(
           "div",
           { class: "field project-restore-field" },
-          h("label", { class: "field-label" }, h("span", {}, "恢复目标目录"), h("span", { class: "field-hint" }, "可手动输入新目录")),
+          h("label", { class: "field-label" }, h("span", {}, "恢复目标目录"), h("span", { class: "field-hint" }, "优先从本机选择，可粘贴新目录")),
           restorePathInput
         ),
         h("div", { class: "card-actions" },
-          actionButton("选择目标文件夹", "btn-ghost", chooseRestoreDir),
+          actionButton("选择本机文件夹", "btn-primary", chooseRestoreDir),
           actionButton("使用当前项目目录", "btn-ghost", useCurrentAsRestoreTarget),
-          actionButton("刷新项目库", "btn-primary", refreshServerBackups),
+          actionButton("刷新项目库", "btn-ghost", refreshServerBackups),
           serverBackupsHasMore ? actionButton(loadingMoreBackups ? "加载中…" : "加载更多", "btn-ghost", loadMoreServerBackups) : null
         )
       ),

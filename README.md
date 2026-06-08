@@ -95,7 +95,7 @@ codex-sync-server
 - `config.toml`、`hooks.json`
 - 浏览器、缓存、临时目录和运行时进程目录
 
-当前版本还没有客户端加密。完整对话备份包含真实上下文，所以默认只生成本地包；只有你显式开启 `--allow-plaintext-upload` 或在设置中允许明文上传时，才会上传完整对话包。
+完整对话备份包含真实上下文。Codex Sync 默认会在客户端加密完整备份包后再上传；加密密钥优先来自 `CODEX_SYNC_FULL_BACKUP_PASSPHRASE`，其次来自设置中保存的完整备份口令，最后会使用 `~/.codex-sync/` 下自动生成的本机私有 key 文件。跨设备恢复加密云端备份时，请在其它设备设置相同口令。只有你显式开启 `--allow-plaintext-upload` 或在设置中允许明文上传时，才会上传未加密完整对话包。
 
 项目备份会跳过 `.env`、密钥、证书、`node_modules`、`dist`、`build`、缓存目录和超出大小限制的文件。
 

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import json
 import os
+import secrets
+import tempfile
 import urllib.request
 import uuid
 import zipfile
@@ -17,6 +20,15 @@ from .disaster_backup import create_disaster_backup
 from .paths import app_dir, codex_home, ensure_app_dirs
 from .server import DIRECT_OPENER
 from .util import safe_filename, utc_now, write_json
+
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+except ImportError:  # pragma: no cover - exercised only in incomplete installs
+    AESGCM = None  # type: ignore[assignment]
+    PBKDF2HMAC = None  # type: ignore[assignment]
+    hashes = None  # type: ignore[assignment]
 
 
 EXACT_FILES = {
@@ -83,6 +95,12 @@ DENY_PARTS = {
     "vendor_imports",
 }
 
+ENCRYPTED_ARCHIVE_MAGIC = b"CSFBENC1"
+ENCRYPTION_AAD = b"codex-sync-full-backup-v1"
+ENCRYPTION_KDF_ITERATIONS = 390_000
+ENCRYPTION_ENV_VAR = "CODEX_SYNC_FULL_BACKUP_PASSPHRASE"
+ENCRYPTION_KEY_FILE = "full-backup-encryption.key"
+
 
 def full_backup_dir() -> Path:
     ensure_app_dirs()
@@ -101,6 +119,11 @@ def state_path() -> Path:
     return full_backup_dir() / "state.json"
 
 
+def encryption_key_path() -> Path:
+    ensure_app_dirs()
+    return app_dir() / ENCRYPTION_KEY_FILE
+
+
 def _read_state() -> dict[str, Any]:
     path = state_path()
     if not path.exists():
@@ -114,6 +137,183 @@ def _read_state() -> dict[str, Any]:
 
 def _write_state(data: dict[str, Any]) -> None:
     write_json(state_path(), data)
+
+
+def _read_encryption_key_file() -> str:
+    path = encryption_key_path()
+    if not path.exists():
+        return ""
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    if isinstance(data, dict):
+        return str(data.get("secret") or "").strip()
+    return ""
+
+
+def _write_encryption_key_file(secret: str) -> None:
+    path = encryption_key_path()
+    payload = {"version": 1, "created_at": utc_now(), "secret": secret}
+    write_json(path, payload)
+    try:
+        path.chmod(0o600)
+    except OSError:
+        pass
+
+
+def _encryption_secret(config: AppConfig, *, create: bool) -> tuple[bytes | None, str]:
+    env_secret = os.environ.get(ENCRYPTION_ENV_VAR, "").strip()
+    if env_secret:
+        return env_secret.encode("utf-8"), "env"
+    cfg_secret = str(getattr(config, "full_backup_encryption_passphrase", "") or "").strip()
+    if cfg_secret:
+        return cfg_secret.encode("utf-8"), "config"
+    file_secret = _read_encryption_key_file()
+    if file_secret:
+        return file_secret.encode("utf-8"), "key_file"
+    if not create:
+        return None, "missing"
+    generated = secrets.token_urlsafe(48)
+    _write_encryption_key_file(generated)
+    return generated.encode("utf-8"), "generated_key_file"
+
+
+def encryption_status(config: AppConfig) -> dict[str, Any]:
+    secret, source = _encryption_secret(config, create=False)
+    return {
+        "enabled": bool(getattr(config, "full_backup_encryption_enabled", True)),
+        "configured": bool(secret),
+        "source": source if secret else "",
+        "key_file": str(encryption_key_path()),
+        "env_var": ENCRYPTION_ENV_VAR,
+    }
+
+
+def _require_crypto() -> None:
+    if AESGCM is None or PBKDF2HMAC is None or hashes is None:
+        raise RuntimeError("cryptography is required for encrypted full backups. Install codex-sync with its dependencies.")
+
+
+def _b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii")
+
+
+def _unb64(text: str) -> bytes:
+    return base64.urlsafe_b64decode(text.encode("ascii"))
+
+
+def _derive_encryption_key(secret: bytes, salt: bytes, iterations: int) -> bytes:
+    _require_crypto()
+    kdf = PBKDF2HMAC(algorithm=hashes.SHA256(), length=32, salt=salt, iterations=iterations)
+    return kdf.derive(secret)
+
+
+def _encryption_key_id(secret: bytes) -> str:
+    return hashlib.sha256(secret).hexdigest()[:16]
+
+
+def _is_encrypted_archive(path: Path) -> bool:
+    try:
+        with path.open("rb") as fh:
+            return fh.read(len(ENCRYPTED_ARCHIVE_MAGIC)) == ENCRYPTED_ARCHIVE_MAGIC
+    except OSError:
+        return False
+
+
+def _write_encrypted_archive(plain_archive: Path, encrypted_archive: Path, config: AppConfig, manifest: dict[str, Any]) -> dict[str, Any]:
+    secret, source = _encryption_secret(config, create=True)
+    if not secret:
+        raise RuntimeError("full backup encryption is enabled but no encryption secret is available")
+    salt = secrets.token_bytes(16)
+    nonce = secrets.token_bytes(12)
+    iterations = ENCRYPTION_KDF_ITERATIONS
+    key = _derive_encryption_key(secret, salt, iterations)
+    encrypted = AESGCM(key).encrypt(nonce, plain_archive.read_bytes(), ENCRYPTION_AAD)
+    header = {
+        "version": 1,
+        "algorithm": "AES-256-GCM",
+        "kdf": "PBKDF2-HMAC-SHA256",
+        "iterations": iterations,
+        "salt": _b64(salt),
+        "nonce": _b64(nonce),
+        "key_id": _encryption_key_id(secret),
+    }
+    header_bytes = json.dumps(header, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    encrypted_archive.write_bytes(ENCRYPTED_ARCHIVE_MAGIC + len(header_bytes).to_bytes(4, "big") + header_bytes + encrypted)
+    return {**header, "secret_source": source}
+
+
+def _read_encrypted_archive(path: Path) -> tuple[dict[str, Any], bytes]:
+    raw = path.read_bytes()
+    if not raw.startswith(ENCRYPTED_ARCHIVE_MAGIC) or len(raw) < len(ENCRYPTED_ARCHIVE_MAGIC) + 4:
+        raise ValueError("not an encrypted Codex Sync full backup")
+    pos = len(ENCRYPTED_ARCHIVE_MAGIC)
+    header_len = int.from_bytes(raw[pos:pos + 4], "big")
+    pos += 4
+    header = json.loads(raw[pos:pos + header_len].decode("utf-8"))
+    return header, raw[pos + header_len:]
+
+
+def _decrypt_archive_to_temp(config: AppConfig, archive: Path) -> Path:
+    header, ciphertext = _read_encrypted_archive(archive)
+    secret, source = _encryption_secret(config, create=False)
+    if not secret:
+        raise RuntimeError(
+            f"Encrypted backup requires {ENCRYPTION_ENV_VAR}, full_backup_encryption_passphrase, or {encryption_key_path()}."
+        )
+    if header.get("key_id") and header.get("key_id") != _encryption_key_id(secret):
+        raise RuntimeError(f"Encrypted backup key mismatch; current key source is {source}.")
+    salt = _unb64(str(header["salt"]))
+    nonce = _unb64(str(header["nonce"]))
+    iterations = int(header.get("iterations") or ENCRYPTION_KDF_ITERATIONS)
+    key = _derive_encryption_key(secret, salt, iterations)
+    plaintext = AESGCM(key).decrypt(nonce, ciphertext, ENCRYPTION_AAD)
+    tmp = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    try:
+        tmp.write(plaintext)
+        tmp.close()
+        return Path(tmp.name)
+    except Exception:
+        tmp.close()
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
+
+
+@contextmanager
+def open_full_backup_zip(config: AppConfig, archive: str | Path):
+    archive_path = Path(archive)
+    tmp_path: Path | None = None
+    try:
+        if _is_encrypted_archive(archive_path):
+            tmp_path = _decrypt_archive_to_temp(config, archive_path)
+            with zipfile.ZipFile(tmp_path) as zf:
+                yield zf
+        else:
+            with zipfile.ZipFile(archive_path) as zf:
+                yield zf
+    finally:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+
+
+def read_full_backup_manifest(config: AppConfig, archive: str | Path) -> dict[str, Any]:
+    archive_path = Path(archive)
+    sidecar = _manifest_path_for_archive(archive_path)
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+            if isinstance(data, dict) and data.get("id"):
+                return data
+        except (OSError, json.JSONDecodeError):
+            pass
+    with open_full_backup_zip(config, archive_path) as zf:
+        data = json.loads(zf.read("manifest.json").decode("utf-8"))
+    return data if isinstance(data, dict) else {}
 
 
 def _parse_utc(value: Any) -> datetime | None:
@@ -295,6 +495,7 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
 
     digest = _manifest_digest(included)
     backup_id = str(uuid.uuid4())
+    encrypted = bool(getattr(config, "full_backup_encryption_enabled", True))
     return {
         "id": backup_id,
         "type": "codex_full_backup",
@@ -304,8 +505,8 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
         "branch_id": _branch_id(config, state),
         "parent_backup_id": str(state.get("last_uploaded_backup_id") or ""),
         "codex_home": str(root),
-        "encrypted": False,
-        "encryption": "none",
+        "encrypted": encrypted,
+        "encryption": "AES-256-GCM" if encrypted else "none",
         "content_digest": digest,
         "included_count": len(included),
         "included_bytes": total,
@@ -330,12 +531,19 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
             "manifest": manifest,
         }
 
-    archive_name = f"{manifest['created_at'].replace(':', '').replace('+', 'Z')}-{safe_filename(manifest['device_id'])}-{manifest['id']}.zip"
+    encrypted = bool(manifest.get("encrypted"))
+    suffix = ".zip.enc" if encrypted else ".zip"
+    archive_name = f"{manifest['created_at'].replace(':', '').replace('+', 'Z')}-{safe_filename(manifest['device_id'])}-{manifest['id']}{suffix}"
     archive = full_backup_dir() / archive_name
+    plain_archive = archive
+    if encrypted:
+        tmp = tempfile.NamedTemporaryFile(prefix=f"{safe_filename(str(manifest['id']))}-", suffix=".zip", dir=full_backup_dir(), delete=False)
+        tmp.close()
+        plain_archive = Path(tmp.name)
     root = codex_home()
     manifest["archive_name"] = archive.name
 
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(plain_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for item in manifest["files"]:
             rel = str(item["path"])
@@ -343,6 +551,14 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
             if not source.exists() or not _safe_file(source, root):
                 continue
             zf.write(source, arcname=f"codex/{rel}")
+
+    if encrypted:
+        try:
+            encryption_header = _write_encrypted_archive(plain_archive, archive, config, manifest)
+            manifest["encryption_header"] = {key: value for key, value in encryption_header.items() if key != "secret_source"}
+            manifest["encryption_key_source"] = encryption_header.get("secret_source")
+        finally:
+            plain_archive.unlink(missing_ok=True)
 
     archive_sha256 = _hash_path(archive)
     archive_bytes = archive.stat().st_size
@@ -373,7 +589,8 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
         "included_count": manifest["included_count"],
         "included_bytes": manifest["included_bytes"],
         "skipped": manifest["skipped"],
-        "encrypted": False,
+        "encrypted": encrypted,
+        "encryption": manifest.get("encryption", "none"),
         "retention": retention,
     }
 
@@ -469,6 +686,9 @@ def summarize_sync_health(config: AppConfig) -> dict[str, Any]:
     local = {
         "device_id": config.device_id,
         "needs_upload": bool(last_digest and last_digest != uploaded_digest),
+        "last_content_digest": last_digest,
+        "last_uploaded_content_digest": uploaded_digest,
+        "last_created_at": state.get("last_created_at"),
         "last_uploaded_at": state.get("last_uploaded_at"),
         "last_dirty_at": state.get("last_dirty_at"),
         "diverged": bool(state.get("diverged_from_remote_head")),
@@ -652,7 +872,7 @@ def upload_full_backup(
     archive_path = Path(archive)
     if not archive_path.exists():
         return {"success": False, "error": f"archive not found: {archive_path}"}
-    manifest = manifest or json.loads(_manifest_path_for_archive(archive_path).read_text(encoding="utf-8"))
+    manifest = manifest or read_full_backup_manifest(config, archive_path)
     if not manifest.get("encrypted") and not (allow_plaintext_upload or config.full_backup_allow_plaintext_upload):
         return {
             "success": False,
@@ -678,6 +898,8 @@ def upload_full_backup(
         "encrypted": bool(manifest.get("encrypted")),
         "encryption": manifest.get("encryption", "none"),
     }
+    if manifest.get("encryption_header"):
+        metadata["encryption_header"] = manifest.get("encryption_header")
     headers = _headers(config)
     headers.update(
         {
@@ -752,10 +974,25 @@ def list_full_backups(config: AppConfig) -> dict[str, Any]:
         return {"success": False, "error": str(exc)}
 
 
+def get_full_backup_metadata(config: AppConfig, backup_id: str) -> dict[str, Any]:
+    if not backup_id:
+        return {"success": False, "error": "backup_id is required"}
+    try:
+        request = urllib.request.Request(_server_url(config, f"/api/full-backups/{quote(backup_id, safe='')}"), headers=_headers(config), method="GET")
+        with DIRECT_OPENER.open(request, timeout=15) as response:
+            return json.loads(response.read().decode("utf-8", errors="replace"))
+    except Exception as exc:
+        return {"success": False, "error": str(exc), "backup_id": backup_id}
+
+
 def download_full_backup(config: AppConfig, backup_id: str, output: str | Path | None = None) -> dict[str, Any]:
     if not backup_id:
         return {"success": False, "error": "backup_id is required"}
-    output_path = Path(output) if output else downloads_dir() / f"{safe_filename(backup_id)}.zip"
+    metadata_result = get_full_backup_metadata(config, backup_id)
+    metadata = metadata_result.get("full_backup") if metadata_result.get("success") else None
+    encrypted = bool(metadata.get("encrypted")) if isinstance(metadata, dict) else False
+    suffix = ".zip.enc" if encrypted else ".zip"
+    output_path = Path(output) if output else downloads_dir() / f"{safe_filename(backup_id)}{suffix}"
     output_path.parent.mkdir(parents=True, exist_ok=True)
     request = urllib.request.Request(
         _server_url(config, f"/api/full-backups/{quote(backup_id, safe='')}/download"),
@@ -770,7 +1007,17 @@ def download_full_backup(config: AppConfig, backup_id: str, output: str | Path |
                 fh.write(chunk)
                 digest.update(chunk)
                 total += len(chunk)
-        return {"success": True, "backup_id": backup_id, "path": str(output_path), "bytes": total, "sha256": digest.hexdigest()}
+        if isinstance(metadata, dict):
+            write_json(_manifest_path_for_archive(output_path), metadata)
+        return {
+            "success": True,
+            "backup_id": backup_id,
+            "path": str(output_path),
+            "bytes": total,
+            "sha256": digest.hexdigest(),
+            "encrypted": encrypted,
+            "metadata": metadata if isinstance(metadata, dict) else None,
+        }
     except Exception as exc:
         return {"success": False, "error": str(exc), "backup_id": backup_id}
 
@@ -789,7 +1036,12 @@ def restore_full_backup(config: AppConfig, archive: str | Path, confirm_backup_i
     archive_path = Path(archive)
     if not archive_path.exists():
         return {"success": False, "error": f"archive not found: {archive_path}"}
-    with zipfile.ZipFile(archive_path) as zf:
+    try:
+        zip_ctx = open_full_backup_zip(config, archive_path)
+        zf = zip_ctx.__enter__()
+    except Exception as exc:  # noqa: BLE001 - return CLI-friendly decrypt/open errors
+        return {"success": False, "error": str(exc), "archive": str(archive_path)}
+    try:
         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
         backup_id = str(manifest.get("id", ""))
         if confirm_backup_id != backup_id:
@@ -818,6 +1070,8 @@ def restore_full_backup(config: AppConfig, archive: str | Path, confirm_backup_i
                 for chunk in iter(lambda: src.read(1024 * 1024), b""):
                     dst.write(chunk)
             restored.append(rel)
+    finally:
+        zip_ctx.__exit__(None, None, None)
     return {
         "success": True,
         "backup_id": backup_id,

@@ -229,6 +229,10 @@ function mountBrowse(container, run, store, setOutput) {
     return (row.home_id || "windows") === "windows";
   }
 
+  function isRowInSourceHome(row) {
+    return sourceHome !== "all" && (row.home_id || "windows") === sourceHome;
+  }
+
   function disabledButton(label, cls, title) {
     return h("button", { class: `btn ${cls}`, type: "button", disabled: true, title }, label);
   }
@@ -428,8 +432,8 @@ function mountBrowse(container, run, store, setOutput) {
 
   function renderBatch() {
     const rows = selectedRows();
-    const canWrite = sourceHome === "windows" && rows.every(isWindowsRow);
-    const writeTip = "并入/还原只支持 Windows 单环境，请先在本机环境里选择 Windows。";
+    const canWrite = sourceHome !== "all" && rows.every(isRowInSourceHome);
+    const writeTip = "并入/还原需要先选择单个 Windows 或 WSL 环境。";
     const batchNodes = [
       h("span", { class: "muted" }, busy ? "加载中…" : `已选 ${selected.size} 项`),
       actionButton("全选本页", "btn-ghost btn-sm", async () => {
@@ -467,8 +471,8 @@ function mountBrowse(container, run, store, setOutput) {
   async function writeOp(action, label, target = "") {
     if (!selected.size) { showToast("请先勾选对话", "warning"); return; }
     const rows = selectedRows();
-    if (sourceHome !== "windows" || rows.some(row => !isWindowsRow(row))) {
-      showToast("并入/还原只支持 Windows 单环境，请先选择 Windows。", "warning");
+    if (sourceHome === "all" || rows.some(row => !isRowInSourceHome(row))) {
+      showToast("请先选择单个 Windows 或 WSL 环境。", "warning");
       return;
     }
     if (action === "merge-threads" && !target) {
@@ -607,8 +611,8 @@ function mountChannels(container, run, store, setOutput) {
 
   async function submitChannelOp(action, opts, label) {
     if (busy) return;
-    if (sourceHome !== "windows") {
-      showToast("渠道并入/还原只支持 Windows 单环境，请先选择 Windows 环。", "warning");
+    if (sourceHome === "all" || (channelsData && channelsData.write_supported === false)) {
+      showToast("渠道并入/还原需要先选择单个 Windows 或 WSL 环境。", "warning");
       return;
     }
     let closeCodex = false;
@@ -661,14 +665,14 @@ function mountChannels(container, run, store, setOutput) {
           h("span", {}, "查看范围：", h("strong", {}, "全部本机环境")),
           h("span", { class: "badge warn" }, "只读")
         ),
-        h("p", { class: "card-desc" }, "跨环境查看按 Windows/WSL 分组展示；并入或还原请先切换到 Windows 单环境。"),
+        h("p", { class: "card-desc" }, "跨环境查看按 Windows/WSL 分组展示；并入或还原请先切换到单个环境。"),
         ...groups.map(group => renderChannelGroup(group))
       ];
       channelsCardBody.replaceChildren(...nodes.filter(Boolean));
       return;
     }
 
-    const writable = channelsData.write_supported !== false && sourceHome === "windows";
+    const writable = channelsData.write_supported !== false && sourceHome !== "all";
     const cur = channelsData.current_provider || "(未知)";
     const running = Boolean(channelsData.codex_running);
     const merged = channelsData.merged || {};
@@ -706,7 +710,7 @@ function mountChannels(container, run, store, setOutput) {
       ),
       writable
         ? h("p", { class: "card-desc" }, "「并入当前」会修改被合并渠道的 provider，将它们显示在你的当前对话列表里。这只是软链接，不会破坏会话内容，随时能一键还原。")
-        : h("p", { class: "card-desc" }, "WSL 渠道当前以查看为主；需要写入并入/还原时请切换到 Windows。"),
+        : h("p", { class: "card-desc" }, "全部环境视图为只读；并入或还原请切换到单个 Windows 或 WSL 环境。"),
       rows.length ? h("div", { style: { margin: "10px 0" } }, ...rows) : h("div", { class: "empty" }, "暂无渠道数据"),
       writable && merged.total
         ? h("div", { style: { borderTop: "1px dashed var(--border)", paddingTop: "10px", marginTop: "10px" } },

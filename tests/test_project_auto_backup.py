@@ -104,6 +104,58 @@ class ProjectAutoBackupTests(unittest.TestCase):
                 else:
                     os.environ["CODEX_SYNC_HOME"] = old_sync
 
+    def test_non_git_project_auto_backup_queues_and_uploads_filesystem_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as project_dir, tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as data_dir:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            old_data_dir = sync_server.DATA_DIR
+            old_db_path = sync_server.DB_PATH
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                project = Path(project_dir)
+                (project / "notes.txt").write_text("non git content\n", encoding="utf-8")
+
+                sync_server.DATA_DIR = Path(data_dir).resolve()
+                sync_server.DB_PATH = sync_server.DATA_DIR / "snapshots.sqlite3"
+                sync_server.init_db()
+                token = "project-auto-non-git-token"
+                sync_server.SyncHandler.token = token
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), sync_server.SyncHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                try:
+                    cfg = AppConfig(
+                        server_url=f"http://127.0.0.1:{httpd.server_port}",
+                        api_token=token,
+                        device_id="auto-device",
+                        project_auto_backup_min_interval_seconds=0,
+                    )
+                    queued = enqueue_project_auto_backup(project, cfg, reason="codex-stop")
+                    self.assertTrue(queued["queued"])
+                    self.assertFalse(queued["item"]["is_repo"])
+                    self.assertEqual(queued["item"]["mode"], "full")
+                    self.assertTrue(str(queued["item"]["content_id"]).startswith("filesystem:"))
+
+                    processed = process_project_auto_backup_queue(cfg)
+                    self.assertEqual(processed["processed_count"], 1)
+                    result = processed["processed"][0]["result"]
+                    self.assertTrue(result["success"])
+                    self.assertEqual(result["package"]["manifest"]["source_mode"], "filesystem")
+
+                    listed = list_project_backups(cfg)
+                    self.assertTrue(listed["success"])
+                    self.assertEqual(listed["project_backups"][0]["backup_kind"], "full")
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+            finally:
+                sync_server.DATA_DIR = old_data_dir
+                sync_server.DB_PATH = old_db_path
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
     def test_process_auto_backup_queue_uploads_project_backup(self) -> None:
         with tempfile.TemporaryDirectory() as repo_dir, tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as data_dir:
             old_sync = os.environ.get("CODEX_SYNC_HOME")

@@ -17,8 +17,9 @@ issue.
 
 ## Security Notes
 
-- Full conversation backups contain real conversation content. Cloud upload is
-  blocked by default unless plaintext upload is explicitly enabled.
+- Full conversation backups contain real conversation content. Archives are
+  encrypted on the client by default before cloud upload; plaintext upload is
+  blocked unless explicitly enabled.
 - The local web desktop binds to `127.0.0.1` and uses a per-process session
   token for API requests. Do not expose it through a proxy.
 - `deploy.json`, API tokens, SSH passwords, private keys, `.env` files, and

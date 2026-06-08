@@ -28,6 +28,8 @@ class AppConfig:
     full_backup_enabled: bool = True
     full_backup_include_config: bool = False
     full_backup_include_memories: bool = False
+    full_backup_encryption_enabled: bool = True
+    full_backup_encryption_passphrase: str = ""
     full_backup_allow_plaintext_upload: bool = False
     full_backup_max_file_bytes: int = 256 * 1024 * 1024
     full_backup_max_total_bytes: int = 2 * 1024 * 1024 * 1024
@@ -53,6 +55,8 @@ class AppConfig:
     def to_public_dict(self) -> dict[str, Any]:
         data = self.to_dict()
         data["api_token"] = "<configured>" if self.api_token else ""
+        data["full_backup_encryption_passphrase"] = "<configured>" if self.full_backup_encryption_passphrase else ""
+        data["full_backup_encryption_passphrase_configured"] = bool(self.full_backup_encryption_passphrase)
         return data
 
 

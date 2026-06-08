@@ -8,6 +8,7 @@ import urllib.error
 import urllib.request
 import uuid
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 
 from codex_sync import __version__
 from codex_sync.web_desktop import DesktopRuntime, SingleInstance, create_local_server, make_handler
@@ -92,6 +93,23 @@ class WebDesktopTests(unittest.TestCase):
             finally:
                 if local is not None:
                     local.stop()
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_restore_directory_picker_uses_restore_purpose(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                with patch("codex_sync.web_desktop._choose_project_directory", return_value={"success": True, "path": "C:\\restore-target"}) as choose:
+                    result = runtime.run_action("choose-project-dir", {"project_path": "C:\\base", "purpose": "restore"})
+                self.assertTrue(result["success"])
+                self.assertEqual(result["path"], "C:\\restore-target")
+                choose.assert_called_once_with("C:\\base", purpose="restore")
+            finally:
                 if old_sync is None:
                     os.environ.pop("CODEX_SYNC_HOME", None)
                 else:

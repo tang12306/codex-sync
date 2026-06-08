@@ -116,6 +116,13 @@ class ConversationTests(unittest.TestCase):
         finally:
             con.close()
 
+    def _wsl_provider(self, tid: str) -> str:
+        con = sqlite3.connect(self.wsl_db)
+        try:
+            return con.execute("SELECT model_provider FROM threads WHERE id=?", (tid,)).fetchone()[0]
+        finally:
+            con.close()
+
     def test_list_basic(self) -> None:
         res = conversations.list_conversations()
         self.assertTrue(res["success"])
@@ -202,6 +209,18 @@ class ConversationTests(unittest.TestCase):
             return b'model_provider = "openai"\n', None
         return None, f"missing {rel}"
 
+    def _mock_wsl_sh_write(self, distro: str, script: str, input_bytes: bytes | None = None, timeout: int = 120):
+        if distro != "Ubuntu":
+            return 1, b"", f"unexpected distro {distro}"
+        data = input_bytes or b""
+        if "state_9.sqlite" in script:
+            self.wsl_db.write_bytes(data)
+            return 0, b"", ""
+        if "sessions/rollout-w1.jsonl" in script:
+            self.wsl_rollout.write_bytes(data)
+            return 0, b"", ""
+        return 0, b"", ""
+
     def test_list_wsl_conversations_marks_home(self) -> None:
         with (
             mock.patch.object(wsl, "_wsl_state_db_rel", return_value="state_9.sqlite"),
@@ -229,6 +248,33 @@ class ConversationTests(unittest.TestCase):
         self.assertEqual([m["role"] for m in res["messages"]], ["user", "assistant"])
         self.assertEqual(res["messages"][0]["text"], "WSL 里的问题")
         self.assertEqual(res["messages"][1]["text"], "WSL 里的回复")
+
+    def test_merge_and_restore_wsl_threads(self) -> None:
+        with (
+            mock.patch.object(wsl, "_wsl_state_db_rel", return_value="state_9.sqlite"),
+            mock.patch.object(wsl, "_wsl_codex_home", return_value="/home/me/.codex"),
+            mock.patch.object(wsl, "_wsl_current_provider", return_value="custom"),
+            mock.patch.object(wsl, "_wsl_codex_running", return_value=False),
+            mock.patch.object(wsl, "_read_wsl_file", side_effect=self._mock_wsl_read_file),
+            mock.patch.object(wsl, "_wsl_sh", side_effect=self._mock_wsl_sh_write),
+            mock.patch.object(wsl, "create_wsl_full_backup", return_value={"success": True, "backup_id": "preflight"}),
+        ):
+            merged = wsl.merge_wsl_threads(self.cfg, "Ubuntu", ["w1"], target="custom")
+            self.assertTrue(merged["success"])
+            self.assertEqual(merged["moved"], 1)
+            self.assertEqual(self._wsl_provider("w1"), "custom")
+            first = json.loads(self.wsl_rollout.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first["payload"]["model_provider"], "custom")
+
+            listed = wsl.list_wsl_conversations("Ubuntu")
+            self.assertTrue(listed["conversations"][0]["merged"])
+            self.assertEqual(listed["conversations"][0]["original_provider"], "openai")
+
+            restored = wsl.restore_wsl_threads(self.cfg, "Ubuntu", ["w1"])
+            self.assertTrue(restored["success"])
+            self.assertEqual(self._wsl_provider("w1"), "openai")
+            first = json.loads(self.wsl_rollout.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first["payload"]["model_provider"], "openai")
 
 
 if __name__ == "__main__":

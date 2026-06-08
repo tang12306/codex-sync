@@ -32,7 +32,7 @@ from .git_backup import (
     preview_project_backup_from_server,
     restore_project_backup_from_server,
 )
-from .full_backup import full_backup_now, get_remote_device_state, list_full_backups, list_remote_devices, notify_codex_changed, scan_full_backup_changes, summarize_sync_health
+from .full_backup import encryption_status, full_backup_now, get_remote_device_state, list_full_backups, list_remote_devices, notify_codex_changed, scan_full_backup_changes, summarize_sync_health
 from .hooks import hook_status, install_hooks
 from .project_auto_backup import (
     enqueue_project_auto_backup,
@@ -47,6 +47,7 @@ from .server import (
     get_server_retention,
     outbox_count,
     prune_server_retention,
+    snapshot_state_path,
     sync_once,
     list_remote_snapshots,
     get_remote_snapshot_detail,
@@ -62,11 +63,16 @@ from .wsl import (
     list_codex_homes,
     list_wsl_conversations,
     list_wsl_channels,
+    merge_wsl_channels,
+    merge_wsl_threads,
     pull_wsl_config,
     read_wsl_conversation,
     restore_latest_wsl_full_backup,
+    restore_wsl_channels,
     restore_wsl_full_backup,
+    restore_wsl_threads,
     wsl_full_backup_now,
+    wsl_full_backup_status,
     wsl_threads_index,
     wsl_status,
 )
@@ -161,18 +167,43 @@ def _rewrite_index_assets(html: str) -> str:
     )
 
 
-def _focus_existing_window() -> bool:
+def _desktop_hwnd() -> int | None:
     if os.name != "nt":
-        return False
+        return None
     import ctypes
 
     user32 = ctypes.WinDLL("user32", use_last_error=True)
     hwnd = user32.FindWindowW(None, WINDOW_TITLE)
     if not hwnd:
+        return None
+    return int(hwnd)
+
+
+def _restore_desktop_window() -> bool:
+    hwnd = _desktop_hwnd()
+    if not hwnd:
         return False
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
     user32.ShowWindow(hwnd, 9)  # SW_RESTORE
     user32.SetForegroundWindow(hwnd)
     return True
+
+
+def _hide_desktop_window() -> bool:
+    hwnd = _desktop_hwnd()
+    if not hwnd:
+        return False
+    import ctypes
+
+    user32 = ctypes.WinDLL("user32", use_last_error=True)
+    user32.ShowWindow(hwnd, 0)  # SW_HIDE: remove from taskbar and keep process alive.
+    return True
+
+
+def _focus_existing_window() -> bool:
+    return _restore_desktop_window()
 
 
 def _show_close_dialog() -> tuple[str, bool]:
@@ -181,7 +212,7 @@ def _show_close_dialog() -> tuple[str, bool]:
         return "exit", False
     import ctypes
 
-    message = "关闭窗口时要怎么处理？\n\n是：最小化到托盘/任务栏，后台继续运行。\n否：直接退出，停止本地服务。\n取消：返回应用。"
+    message = "关闭窗口时要怎么处理？\n\n是：隐藏到通知区域图标，后台继续运行。\n否：直接退出，停止本地服务。\n取消：返回应用。"
     MB_YESNOCANCEL = 0x00000003
     MB_ICONQUESTION = 0x00000020
     MB_DEFBUTTON1 = 0x00000000
@@ -222,10 +253,11 @@ class WindowsTrayIcon:
         self._shell32: Any | None = None
         self._user32: Any | None = None
         self._icon_handle: int | None = None
+        self._icon_added = False
 
     @property
     def available(self) -> bool:
-        return os.name == "nt" and bool(self.hwnd)
+        return os.name == "nt" and bool(self.hwnd) and self._icon_added
 
     def start(self) -> bool:
         if os.name != "nt":
@@ -251,6 +283,7 @@ class WindowsTrayIcon:
         try:
             self.window.show()
             self.window.restore()
+            _restore_desktop_window()
         except Exception as exc:  # noqa: BLE001
             self.local.runtime.log("error", "failed to restore tray window", {"error": str(exc)})
 
@@ -361,7 +394,9 @@ class WindowsTrayIcon:
                 self._ready.set()
                 return
             self.hwnd = int(hwnd)
-            self._add_icon()
+            self._icon_added = self._add_icon()
+            if not self._icon_added:
+                self.local.runtime.log("error", "failed to add tray notification icon", {"error": ctypes.get_last_error()})
             self._ready.set()
             msg = wintypes.MSG()
             while user32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
@@ -406,14 +441,15 @@ class WindowsTrayIcon:
         data.szTip = "Codex Sync"
         return data
 
-    def _add_icon(self) -> None:
+    def _add_icon(self) -> bool:
         import ctypes
 
         if self._shell32 is None:
-            return
+            return False
         data = self._icon_data()
         if data is not None:
-            self._shell32.Shell_NotifyIconW(0x00000000, ctypes.byref(data))  # NIM_ADD
+            return bool(self._shell32.Shell_NotifyIconW(0x00000000, ctypes.byref(data)))  # NIM_ADD
+        return False
 
     def _delete_icon(self) -> None:
         import ctypes
@@ -425,6 +461,7 @@ class WindowsTrayIcon:
         data.hWnd = self.hwnd
         data.uID = 1
         self._shell32.Shell_NotifyIconW(0x00000002, ctypes.byref(data))  # NIM_DELETE
+        self._icon_added = False
 
     def _show_menu(self, hwnd: int) -> None:
         import ctypes
@@ -505,25 +542,356 @@ def _project_state(project_path: str | None = None) -> dict[str, Any]:
     return state
 
 
-def _choose_project_directory(initial: str | None = None) -> dict[str, Any]:
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _status_item(
+    item_id: str,
+    group: str,
+    name: str,
+    status: str,
+    tone: str = "",
+    detail: str = "",
+    **extra: Any,
+) -> dict[str, Any]:
+    item = {"id": item_id, "group": group, "name": name, "status": status, "tone": tone, "detail": detail}
+    item.update({key: value for key, value in extra.items() if value not in (None, "")})
+    return item
+
+
+def _auto_scan_summary(config: AppConfig, task: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(task.get("installed"))
+    return {
+        "enabled": enabled,
+        "interval_seconds": int(config.sync_interval_seconds or 0),
+        "task_name": task.get("task_name"),
+        "last_run": task.get("last_run"),
+        "next_run": task.get("next_run"),
+        "next_run_in_seconds": task.get("next_run_in_seconds"),
+        "last_result": task.get("last_result"),
+        "status": "已开启" if enabled else "未开启",
+        "tone": "ok" if enabled else "warn",
+        "error": task.get("error") if not enabled else None,
+    }
+
+
+def _snapshot_resume_status(outbox: int) -> dict[str, Any]:
+    state = _read_json_file(snapshot_state_path())
+    return {
+        "outbox_count": outbox,
+        "last_snapshot_id": state.get("last_snapshot_id"),
+        "last_snapshot_at": state.get("last_snapshot_at"),
+        "last_snapshot_signature": state.get("last_snapshot_signature"),
+    }
+
+
+def _sync_health_summary(items: list[dict[str, Any]], auto_scan: dict[str, Any]) -> dict[str, Any]:
+    danger = sum(1 for item in items if item.get("tone") == "danger")
+    warn = sum(1 for item in items if item.get("tone") == "warn")
+    ok = sum(1 for item in items if item.get("tone") == "ok")
+    next_seconds = auto_scan.get("next_run_in_seconds")
+    if auto_scan.get("enabled") and isinstance(next_seconds, int):
+        scan_text = f"自动扫描约 {max(1, (next_seconds + 59) // 60)} 分钟后"
+    elif auto_scan.get("enabled"):
+        scan_text = "自动扫描已开启"
+    else:
+        scan_text = "自动扫描未开启"
+    if danger:
+        text = f"{danger} 项异常 · {warn} 项待处理 · {scan_text}"
+        tone = "danger"
+    elif warn:
+        text = f"{warn} 项待处理 · {ok} 项正常 · {scan_text}"
+        tone = "warn"
+    else:
+        text = f"全部正常 · {ok} 项已检查 · {scan_text}"
+        tone = "ok"
+    return {"text": text, "tone": tone, "ok": ok, "warn": warn, "danger": danger, "scan_text": scan_text}
+
+
+def _decorate_sync_health(config: AppConfig, health: dict[str, Any]) -> dict[str, Any]:
+    checked_at = utc_now()
+    task = windows_task_status()
+    auto_scan = _auto_scan_summary(config, task)
+    outbox = outbox_count()
+    hooks = hook_status()
+    git = _project_state()
+    project_auto = project_auto_backup_status(Path.cwd(), config)
+    snapshot = _snapshot_resume_status(outbox)
+    homes_result: dict[str, Any]
+    try:
+        homes_result = list_codex_homes()
+    except Exception as exc:  # noqa: BLE001 - health panel should degrade gracefully
+        homes_result = {"success": False, "homes": [], "error": str(exc)}
+
+    items: list[dict[str, Any]] = []
+    local = _as_dict(health.get("local"))
+    devices = health.get("devices") if isinstance(health.get("devices"), list) else []
+    pending = health.get("pending_devices") if isinstance(health.get("pending_devices"), list) else []
+
+    if not config.server_url:
+        server_status, server_tone, server_detail = "未配置", "warn", "请在系统设置中配置同步服务器。"
+    elif health.get("success"):
+        server_status, server_tone, server_detail = "正常", "ok", f"已读取 {len(devices)} 台设备状态。"
+    else:
+        server_status, server_tone, server_detail = "检查失败", "danger", str(health.get("error") or "无法连接同步服务器。")
+    items.append(
+        _status_item(
+            "server",
+            "基础连接",
+            "同步服务器",
+            server_status,
+            server_tone,
+            server_detail,
+            scope=config.server_url or "未配置",
+            last_checked_at=checked_at,
+            href="#/settings",
+            action_label="配置服务器" if not config.server_url else "检查设置",
+        )
+    )
+
+    if not config.full_backup_enabled:
+        win_status, win_tone = "未开启", "warn"
+    elif local.get("diverged"):
+        win_status, win_tone = "远端有分歧", "warn"
+    elif local.get("needs_upload"):
+        win_status, win_tone = "有未上传变更", "warn"
+    elif not local.get("last_content_digest"):
+        win_status, win_tone = "尚未扫描", "warn"
+    elif not local.get("last_uploaded_content_digest"):
+        win_status, win_tone = "尚未上传", "warn"
+    else:
+        win_status, win_tone = "已上传最新变更", "ok"
+    items.append(
+        _status_item(
+            "windows-conversations",
+            "对话备份",
+            "Windows 对话",
+            win_status,
+            win_tone,
+            "Windows %USERPROFILE%\\.codex 的完整对话备份状态。",
+            scope=config.device_id,
+            last_checked_at=checked_at,
+            last_change_at=local.get("last_dirty_at") or local.get("last_created_at"),
+            last_uploaded_at=local.get("last_uploaded_at"),
+            action="full-backup-now",
+            action_label="扫描并上传",
+        )
+    )
+
+    homes = homes_result.get("homes") if isinstance(homes_result.get("homes"), list) else []
+    for home in homes:
+        if not isinstance(home, dict) or home.get("kind") != "wsl":
+            continue
+        label = str(home.get("label") or home.get("id") or "WSL")
+        distro = str(home.get("distro") or "")
+        if not home.get("ok"):
+            status, tone, detail = "不可访问", "danger", str(home.get("error") or homes_result.get("error") or "WSL 发行版不可访问。")
+            extra: dict[str, Any] = {}
+        elif not home.get("has_codex"):
+            status, tone, detail = "未检测到 Codex", "warn", "该发行版中没有 ~/.codex 目录。"
+            extra = {}
+        else:
+            wsl_state = wsl_full_backup_status(distro)
+            if wsl_state.get("needs_upload"):
+                status, tone = "有未上传变更", "warn"
+            elif not wsl_state.get("last_content_digest"):
+                status, tone = "尚未备份", "warn"
+            elif not wsl_state.get("last_uploaded_content_digest"):
+                status, tone = "尚未上传", "warn"
+            else:
+                status, tone = "已上传最新备份", "ok"
+            detail = f"{label} 的 ~/.codex 完整对话备份状态。"
+            extra = {
+                "last_change_at": wsl_state.get("last_created_at"),
+                "last_uploaded_at": wsl_state.get("last_uploaded_at"),
+                "action": "wsl-full-backup",
+                "action_label": "备份并上传",
+                "payload": {"distro": distro, "include_config": True, "include_memories": True, "upload": True},
+            }
+        items.append(
+            _status_item(
+                f"wsl-{distro}",
+                "对话备份",
+                label,
+                status,
+                tone,
+                detail,
+                scope=distro,
+                last_checked_at=checked_at,
+                href="#/backups",
+                **extra,
+            )
+        )
+    if homes_result.get("success") is False and not any(item.get("group") == "对话备份" and str(item.get("id", "")).startswith("wsl-") for item in items):
+        items.append(
+            _status_item(
+                "wsl-detect",
+                "对话备份",
+                "WSL 环境",
+                "检查失败",
+                "danger",
+                str(homes_result.get("error") or homes_result.get("wsl_error") or "无法读取 WSL 环境。"),
+                last_checked_at=checked_at,
+                href="#/backups",
+                action_label="查看备份",
+            )
+        )
+
+    if health.get("success"):
+        remote_status = f"{len(pending)} 台待处理" if pending else "正常"
+        remote_tone = "warn" if pending else "ok"
+        pending_names = ", ".join(str(item.get("device_id") or "-") for item in pending[:3] if isinstance(item, dict))
+        remote_detail = f"远端待处理设备：{pending_names}" if pending_names else "其它设备没有 dirty/diverged 状态。"
+    else:
+        remote_status, remote_tone, remote_detail = "未检查", "warn", "服务器不可用时无法读取其它设备。"
+    items.append(
+        _status_item(
+            "remote-devices",
+            "远端状态",
+            "其它设备",
+            remote_status,
+            remote_tone,
+            remote_detail,
+            last_checked_at=checked_at,
+            href="#/backups",
+            action_label="查看云端备份",
+        )
+    )
+
+    queue_count = int(project_auto.get("queue_count") or 0)
+    project_last = _as_dict(project_auto.get("last"))
+    if queue_count:
+        project_status, project_tone = f"{queue_count} 个待上传", "warn"
+    elif not config.server_url:
+        project_status, project_tone = "服务器未配置", "warn"
+    elif not git.get("exists", True) or git.get("is_dir") is False:
+        project_status, project_tone = "路径不可用", "danger"
+    elif not git.get("is_repo"):
+        if project_auto.get("codex_stop_enabled"):
+            project_status, project_tone = "Codex Stop 自动入队", "ok"
+        else:
+            project_status, project_tone = "可手动或 Stop 入队", "warn"
+    elif git.get("dirty"):
+        project_status, project_tone = "有本地改动", "warn"
+    elif project_auto.get("enabled_for_git_commit") or project_auto.get("codex_stop_enabled"):
+        project_status, project_tone = "自动备份已开启", "ok"
+    else:
+        project_status, project_tone = "自动备份未开启", "warn"
+    items.append(
+        _status_item(
+            "project-backup",
+            "项目备份",
+            "当前项目",
+            project_status,
+            project_tone,
+            "当前工作目录的项目备份与自动备份状态。",
+            scope=git.get("root") or git.get("selected_path") or str(Path.cwd()),
+            last_checked_at=checked_at,
+            last_uploaded_at=project_last.get("last_backup_at"),
+            href="#/project",
+            action_label="查看项目备份",
+        )
+    )
+
+    if snapshot["outbox_count"]:
+        snap_status, snap_tone = f"{snapshot['outbox_count']} 条待发送", "warn"
+    elif not config.server_url:
+        snap_status, snap_tone = "服务器未配置", "warn"
+    elif not snapshot.get("last_snapshot_at"):
+        snap_status, snap_tone = "尚未生成", "warn"
+    else:
+        snap_status, snap_tone = "最近无待发送", "ok"
+    items.append(
+        _status_item(
+            "resume-snapshot",
+            "接力快照",
+            "轻量接力状态",
+            snap_status,
+            snap_tone,
+            "保存 cwd、repo 状态、Codex 配置元数据和最近 hook 事件，用于 remote-resume。",
+            last_checked_at=checked_at,
+            last_uploaded_at=snapshot.get("last_snapshot_at"),
+            action="sync-now",
+            action_label="立即同步",
+        )
+    )
+
+    hook_events = hooks.get("events") if isinstance(hooks.get("events"), list) else []
+    items.append(
+        _status_item(
+            "hooks",
+            "自动化",
+            "Codex Hooks",
+            f"{len(hook_events)} 个事件" if hook_events else "未安装",
+            "ok" if hook_events else "warn",
+            "用于在 Codex 启动、提交提示、压缩和停止时捕获轻量状态。",
+            scope=", ".join(hook_events) if hook_events else hooks.get("path"),
+            last_checked_at=checked_at,
+            href="#/settings",
+            action_label="管理 Hooks",
+        )
+    )
+
+    items.append(
+        _status_item(
+            "auto-scan",
+            "自动化",
+            "自动扫描任务",
+            auto_scan["status"],
+            auto_scan["tone"],
+            "Windows 定时任务会静默运行 sync-now，并处理项目自动备份队列。",
+            last_checked_at=checked_at,
+            last_change_at=auto_scan.get("last_run"),
+            next_run_at=auto_scan.get("next_run"),
+            next_run_in_seconds=auto_scan.get("next_run_in_seconds"),
+            href="#/settings",
+            action_label="设置自动扫描",
+        )
+    )
+
+    health["checked_at"] = checked_at
+    health["task_status"] = task
+    health["auto_scan"] = auto_scan
+    health["snapshot_resume"] = snapshot
+    health["project_auto_backup"] = project_auto
+    health["codex_homes"] = homes_result
+    health["status_items"] = items
+    health["summary"] = _sync_health_summary(items, auto_scan)
+    return health
+
+
+def _choose_project_directory(initial: str | None = None, *, purpose: str = "project") -> dict[str, Any]:
     try:
         import tkinter as tk
         from tkinter import filedialog
     except Exception as exc:
         return {"success": False, "error": f"无法打开目录选择器：{exc}"}
+    title = "选择恢复目标文件夹" if purpose == "restore" else "选择项目文件夹"
+    cancel_message = "未选择恢复目标文件夹" if purpose == "restore" else "未选择项目文件夹"
     root = tk.Tk()
     root.withdraw()
     root.attributes("-topmost", True)
     try:
         selected = filedialog.askdirectory(
-            title="选择要备份的项目文件夹",
+            title=title,
             initialdir=initial or str(Path.cwd()),
             mustexist=True,
         )
     finally:
         root.destroy()
     if not selected:
-        return {"success": False, "cancelled": True, "error": "未选择项目文件夹"}
+        return {"success": False, "cancelled": True, "error": cancel_message}
     return {"success": True, "path": selected}
 
 
@@ -626,7 +994,7 @@ def _channels_for_home(home: dict[str, Any]) -> dict[str, Any]:
         result = list_wsl_channels(home_id.split(":", 1)[1])
         result.setdefault("merged", {"total": 0, "by_target": {}, "origin_breakdown": {}})
         result.setdefault("codex_running", False)
-        result["write_supported"] = False
+        result["write_supported"] = True
     else:
         result = list_channels()
         result["write_supported"] = True
@@ -717,6 +1085,9 @@ class DesktopRuntime:
                 "full_backup_enabled": cfg.full_backup_enabled,
                 "full_backup_include_config": cfg.full_backup_include_config,
                 "full_backup_include_memories": cfg.full_backup_include_memories,
+                "full_backup_encryption_enabled": cfg.full_backup_encryption_enabled,
+                "full_backup_encryption_passphrase_configured": bool(cfg.full_backup_encryption_passphrase),
+                "full_backup_encryption": encryption_status(cfg),
                 "full_backup_allow_plaintext_upload": cfg.full_backup_allow_plaintext_upload,
                 "full_backup_quiet_seconds": cfg.full_backup_quiet_seconds,
                 "full_backup_retention_count": cfg.full_backup_retention_count,
@@ -746,6 +1117,8 @@ class DesktopRuntime:
             "full_backup_enabled",
             "full_backup_include_config",
             "full_backup_include_memories",
+            "full_backup_encryption_enabled",
+            "full_backup_encryption_passphrase",
             "full_backup_allow_plaintext_upload",
             "full_backup_quiet_seconds",
             "full_backup_retention_count",
@@ -771,6 +1144,7 @@ class DesktopRuntime:
                     "full_backup_enabled",
                     "full_backup_include_config",
                     "full_backup_include_memories",
+                    "full_backup_encryption_enabled",
                     "full_backup_allow_plaintext_upload",
                     "project_auto_backup_on_codex_stop",
                 ):
@@ -838,7 +1212,8 @@ class DesktopRuntime:
         elif name == "project-auto-backup-process":
             result = process_project_auto_backup_queue(cfg, limit=int(payload.get("limit") or 5))
         elif name == "choose-project-dir":
-            result = _choose_project_directory(_project_path_from_payload(payload))
+            purpose = str(payload.get("purpose") or "project")
+            result = _choose_project_directory(_project_path_from_payload(payload), purpose=purpose)
         elif name == "full-backup-now":
             result = full_backup_now(
                 cfg,
@@ -849,7 +1224,7 @@ class DesktopRuntime:
         elif name == "full-backup-status":
             result = {"local": scan_full_backup_changes(cfg, create_package=False), "remote": get_remote_device_state(cfg)}
         elif name == "sync-health":
-            result = summarize_sync_health(cfg)
+            result = _decorate_sync_health(cfg, summarize_sync_health(cfg))
         elif name == "list-devices":
             result = list_remote_devices(cfg)
         elif name in {"server-compatibility", "server-version"}:
@@ -958,13 +1333,14 @@ class DesktopRuntime:
                     str(archive),
                     confirm_backup_id=str(confirm),
                     restore_config=bool(payload.get("restore_config", False)),
+                    config=cfg,
                 )
         elif name == "wsl-restore-latest":
             distro = payload.get("distro")
             if not distro:
                 result = {"success": False, "error": "Missing 'distro' parameter"}
             else:
-                result = restore_latest_wsl_full_backup(str(distro), restore_config=bool(payload.get("restore_config", False)))
+                result = restore_latest_wsl_full_backup(str(distro), restore_config=bool(payload.get("restore_config", False)), config=cfg)
         elif name == "start-daemon":
             result = self.start_daemon()
         elif name == "stop-daemon":
@@ -1006,8 +1382,17 @@ class DesktopRuntime:
             result = _channels_for_scope(str(payload.get("source_home") or "windows"))
         elif name == "merge-channels":
             source_home = str(payload.get("source_home") or "windows")
-            if source_home != "windows":
-                result = {"success": False, "write_supported": False, "error": "渠道并入当前只支持 Windows 单环境，请先选择 Windows。"}
+            if source_home.startswith("wsl:"):
+                result = merge_wsl_channels(
+                    cfg,
+                    source_home.split(":", 1)[1],
+                    sources=payload.get("sources") or None,
+                    target=payload.get("target") or None,
+                    all_others=bool(payload.get("all", False)),
+                    close_running=bool(payload.get("close_codex", False)),
+                )
+            elif source_home != "windows":
+                result = {"success": False, "write_supported": False, "error": "Unsupported source_home"}
             else:
                 result = merge_channels(
                     cfg,
@@ -1018,8 +1403,16 @@ class DesktopRuntime:
                 )
         elif name == "restore-channels":
             source_home = str(payload.get("source_home") or "windows")
-            if source_home != "windows":
-                result = {"success": False, "write_supported": False, "error": "渠道还原当前只支持 Windows 单环境，请先选择 Windows。"}
+            if source_home.startswith("wsl:"):
+                result = restore_wsl_channels(
+                    cfg,
+                    source_home.split(":", 1)[1],
+                    sources=payload.get("sources") or None,
+                    all_merged=bool(payload.get("all", False)),
+                    close_running=bool(payload.get("close_codex", False)),
+                )
+            elif source_home != "windows":
+                result = {"success": False, "write_supported": False, "error": "Unsupported source_home"}
             else:
                 result = restore_channels(
                     cfg,
@@ -1077,8 +1470,16 @@ class DesktopRuntime:
                 )
         elif name == "merge-threads":
             source_home = str(payload.get("source_home") or "windows")
-            if source_home != "windows":
-                result = {"success": False, "write_supported": False, "error": "对话并入当前只支持 Windows 单环境，请先选择 Windows。"}
+            if source_home.startswith("wsl:"):
+                result = merge_wsl_threads(
+                    cfg,
+                    source_home.split(":", 1)[1],
+                    thread_ids=payload.get("thread_ids") or [],
+                    target=payload.get("target") or None,
+                    close_running=bool(payload.get("close_codex", False)),
+                )
+            elif source_home != "windows":
+                result = {"success": False, "write_supported": False, "error": "Unsupported source_home"}
             else:
                 result = merge_threads(
                     cfg,
@@ -1088,8 +1489,15 @@ class DesktopRuntime:
                 )
         elif name == "restore-threads":
             source_home = str(payload.get("source_home") or "windows")
-            if source_home != "windows":
-                result = {"success": False, "write_supported": False, "error": "对话还原当前只支持 Windows 单环境，请先选择 Windows。"}
+            if source_home.startswith("wsl:"):
+                result = restore_wsl_threads(
+                    cfg,
+                    source_home.split(":", 1)[1],
+                    thread_ids=payload.get("thread_ids") or [],
+                    close_running=bool(payload.get("close_codex", False)),
+                )
+            elif source_home != "windows":
+                result = {"success": False, "write_supported": False, "error": "Unsupported source_home"}
             else:
                 result = restore_threads(
                     cfg,
@@ -1139,6 +1547,7 @@ class DesktopRuntime:
                         thread_ids=payload.get("thread_ids") or [],
                         target_provider=payload.get("target") or None,
                         close_running=bool(payload.get("close_codex", False)),
+                        config=cfg,
                     )
                 else:
                     result = import_conversations(
@@ -1348,13 +1757,16 @@ def _attach_close_prompt(window: Any, local: LocalDesktopServer, tray: WindowsTr
         choice = _close_choice(cfg)
         local.runtime.log("run", "desktop close requested", {"choice": choice})
         if choice == "minimize_to_tray":
+            errors: list[str] = []
             try:
-                if tray and tray.available:
-                    window.hide()
-                else:
-                    window.minimize()
+                window.hide()
             except Exception as exc:  # noqa: BLE001 - close prompt should not crash the app
-                local.runtime.log("error", "failed to minimize window", {"error": str(exc)})
+                errors.append(str(exc))
+            native_hidden = _hide_desktop_window()
+            if errors or not native_hidden:
+                local.runtime.log("warn", "window hide requested; native hide fallback status", {"native_hidden": native_hidden, "errors": errors})
+            if not (tray and tray.available):
+                local.runtime.log("warn", "window hidden without a confirmed tray icon; relaunching the app will restore it")
             return False
         if choice == "cancel":
             return False

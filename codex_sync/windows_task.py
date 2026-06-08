@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -97,16 +98,50 @@ def _pick(fields: dict[str, str], *names: str) -> str | None:
     return None
 
 
+def _parse_task_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw or raw.upper() in {"N/A", "无", "不适用"}:
+        return None
+    normalized = raw.replace("上午", "AM").replace("下午", "PM")
+    formats = (
+        "%Y/%m/%d %H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+        "%m/%d/%Y %I:%M:%S %p",
+        "%m/%d/%Y %H:%M:%S",
+        "%Y/%m/%d %I:%M:%S %p",
+        "%Y-%m-%d %I:%M:%S %p",
+    )
+    for fmt in formats:
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+
+
+def _seconds_until(value: str | None) -> int | None:
+    parsed = _parse_task_datetime(value)
+    if parsed is None:
+        return None
+    return max(0, int((parsed - datetime.now()).total_seconds()))
+
+
 def windows_task_status() -> dict[str, Any]:
     code, out, err = run_cmd(["schtasks.exe", "/Query", "/TN", TASK_NAME, "/FO", "LIST", "/V"], timeout=60)
     fields = _parse_schtasks_list(out) if code == 0 else {}
+    next_run = _pick(fields, "下次运行时间", "Next Run Time")
+    last_run = _pick(fields, "上次运行时间", "Last Run Time")
     return {
         "installed": code == 0,
         "task_name": TASK_NAME,
         "status": _pick(fields, "模式", "状态", "Status"),
         "state": _pick(fields, "计划任务状态", "Scheduled Task State"),
-        "next_run": _pick(fields, "下次运行时间", "Next Run Time"),
-        "last_run": _pick(fields, "上次运行时间", "Last Run Time"),
+        "next_run": next_run,
+        "next_run_in_seconds": _seconds_until(next_run),
+        "last_run": last_run,
         "last_result": _pick(fields, "上次结果", "Last Result"),
         "schedule": " ".join((_pick(fields, "重复", "Repeat") or "").split()) or None,
         "task_to_run": _pick(fields, "要运行的任务", "Task To Run"),

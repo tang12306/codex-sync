@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -87,6 +88,29 @@ def _create_shortcut(shortcut: Path, target: Path) -> dict[str, Any]:
     )
     code, out, err = run_cmd(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], timeout=30)
     return {"success": code == 0, "code": code, "stdout": out, "stderr": err, "path": str(shortcut)}
+
+
+def _stop_processes_for_executable(target: Path) -> dict[str, Any]:
+    if not _is_windows() or not target.exists():
+        return {"success": True, "stopped": []}
+    command = (
+        "$target="
+        + _ps_quote(target)
+        + ";$self="
+        + str(os.getpid())
+        + ";$stopped=@();"
+        + "Get-Process -ErrorAction SilentlyContinue | ForEach-Object {"
+        + "$path=$null;try{$path=$_.Path}catch{};"
+        + "if($path -and $_.Id -ne $self -and [string]::Equals($path,$target,[System.StringComparison]::OrdinalIgnoreCase)){"
+        + "$stopped += $_.Id; Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue"
+        + "}};"
+        + "$stopped -join ','"
+    )
+    code, out, err = run_cmd(["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", command], timeout=30)
+    stopped = [int(item) for item in out.split(",") if item.strip().isdigit()]
+    if stopped:
+        time.sleep(0.8)
+    return {"success": code == 0, "stopped": stopped, "stderr": err}
 
 
 def _startup_command(target: Path) -> str:
@@ -184,11 +208,26 @@ def install_app(create_shortcuts: bool = True, enable_startup: bool = False) -> 
     source = _current_executable()
     target = installed_executable()
     target.parent.mkdir(parents=True, exist_ok=True)
+    stopped = {"success": True, "stopped": []}
     copied = False
     if not _same_path(source, target):
+        stopped = _stop_processes_for_executable(target)
         temp_target = target.with_suffix(".exe.new")
         shutil.copy2(source, temp_target)
-        temp_target.replace(target)
+        last_error: Exception | None = None
+        for _ in range(5):
+            try:
+                temp_target.replace(target)
+                last_error = None
+                break
+            except OSError as exc:
+                last_error = exc
+                time.sleep(0.4)
+        if last_error is not None:
+            try:
+                temp_target.unlink(missing_ok=True)
+            finally:
+                raise last_error
         copied = True
 
     shortcuts: list[dict[str, Any]] = []
@@ -207,6 +246,7 @@ def install_app(create_shortcuts: bool = True, enable_startup: bool = False) -> 
         "copied": copied,
         "source": str(source),
         "target": str(target),
+        "stopped_processes": stopped,
         "shortcuts": shortcuts,
         "startup": startup,
         "warnings": warnings,

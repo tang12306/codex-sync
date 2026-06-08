@@ -72,6 +72,8 @@ def cmd_config(args: argparse.Namespace) -> None:
         "full_backup_enabled",
         "full_backup_include_config",
         "full_backup_include_memories",
+        "full_backup_encryption_enabled",
+        "full_backup_encryption_passphrase",
         "full_backup_allow_plaintext_upload",
         "full_backup_quiet_seconds",
         "full_backup_retention_count",
@@ -288,6 +290,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--full-backup-enabled", action=argparse.BooleanOptionalAction)
     p.add_argument("--full-backup-include-config", action=argparse.BooleanOptionalAction)
     p.add_argument("--full-backup-include-memories", action=argparse.BooleanOptionalAction)
+    p.add_argument("--full-backup-encryption-enabled", action=argparse.BooleanOptionalAction)
+    p.add_argument("--full-backup-encryption-passphrase")
     p.add_argument("--full-backup-allow-plaintext-upload", action=argparse.BooleanOptionalAction)
     p.add_argument("--full-backup-quiet-seconds", type=int)
     p.add_argument("--full-backup-retention-count", type=int)
@@ -405,12 +409,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("archive")
     p.add_argument("--confirm-backup-id", required=True)
     p.add_argument("--restore-config", action="store_true")
-    p.set_defaults(func=lambda args: print_json(restore_wsl_full_backup(args.distro, args.archive, confirm_backup_id=args.confirm_backup_id, restore_config=args.restore_config)))
+    p.set_defaults(func=lambda args: print_json(restore_wsl_full_backup(args.distro, args.archive, confirm_backup_id=args.confirm_backup_id, restore_config=args.restore_config, config=load_config())))
 
     p = sub.add_parser("wsl-restore-latest", help="Restore the latest local WSL full backup into a WSL distro.")
     p.add_argument("distro")
     p.add_argument("--restore-config", action="store_true")
-    p.set_defaults(func=lambda args: print_json(restore_latest_wsl_full_backup(args.distro, restore_config=args.restore_config)))
+    p.set_defaults(func=lambda args: print_json(restore_latest_wsl_full_backup(args.distro, restore_config=args.restore_config, config=load_config())))
 
     p = sub.add_parser("list-snapshots", help="List remote snapshots on the sync server.")
     p.set_defaults(func=lambda _args: print_json(list_remote_snapshots(load_config())))

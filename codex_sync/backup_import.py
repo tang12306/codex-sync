@@ -16,10 +16,10 @@ from pathlib import Path
 from typing import Any
 
 from .codex_channels import _backup_state_db, _ensure_codex_closed, codex_state_db, current_codex_provider
-from .config import AppConfig
+from .config import AppConfig, load_config
 from .conversations import _any_text, _content_text, _reasoning_text
 from .disaster_backup import create_disaster_backup
-from .full_backup import download_full_backup, downloads_dir, full_backup_dir, list_full_backups
+from .full_backup import download_full_backup, downloads_dir, full_backup_dir, list_full_backups, open_full_backup_zip, read_full_backup_manifest
 from .paths import app_dir, codex_home
 from .util import safe_filename
 
@@ -55,7 +55,7 @@ def _local_backup_roots() -> list[Path]:
 
 def list_importable_backups(config: AppConfig) -> dict[str, Any]:
     remote = list_full_backups(config)
-    local_zips = sorted({z for root in _local_backup_roots() for z in root.rglob("*.zip")})
+    local_zips = sorted({z for root in _local_backup_roots() for pattern in ("*.zip", "*.zip.enc") for z in root.rglob(pattern)})
     local_names = [z.name for z in local_zips]
     backups: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -76,8 +76,7 @@ def list_importable_backups(config: AppConfig) -> dict[str, Any]:
             )
     for archive in sorted(local_zips, key=lambda p: p.stat().st_mtime, reverse=True):
         try:
-            with zipfile.ZipFile(archive) as zf:
-                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+            manifest = read_full_backup_manifest(config, archive)
         except (OSError, KeyError, ValueError, zipfile.BadZipFile):
             continue
         bid = str(manifest.get("id") or "")
@@ -104,20 +103,20 @@ def list_importable_backups(config: AppConfig) -> dict[str, Any]:
 
 
 def _find_local_archive(backup_id: str) -> Path | None:
-    cand = downloads_dir() / f"{safe_filename(backup_id)}.zip"
-    if cand.exists():
-        return cand
+    for cand in (downloads_dir() / f"{safe_filename(backup_id)}.zip.enc", downloads_dir() / f"{safe_filename(backup_id)}.zip"):
+        if cand.exists():
+            return cand
     for folder in _local_backup_roots():
-        for z in folder.rglob("*.zip"):
-            if str(backup_id) in z.name:
-                return z
-            try:
-                with zipfile.ZipFile(z) as zf:
-                    manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-                if str(manifest.get("id") or "") == str(backup_id):
+        for pattern in ("*.zip", "*.zip.enc"):
+            for z in folder.rglob(pattern):
+                if str(backup_id) in z.name:
                     return z
-            except (OSError, KeyError, ValueError, zipfile.BadZipFile):
-                continue
+                try:
+                    manifest = read_full_backup_manifest(load_config(), z)
+                    if str(manifest.get("id") or "") == str(backup_id):
+                        return z
+                except (OSError, KeyError, ValueError, zipfile.BadZipFile):
+                    continue
     return None
 
 
@@ -145,12 +144,17 @@ def _local_threads_index() -> dict[str, int]:
         con.close()
 
 
-def list_backup_conversations(archive: str | Path, local_index: dict[str, int] | None = None, current_provider: str | None = None) -> dict[str, Any]:
+def list_backup_conversations(
+    archive: str | Path,
+    local_index: dict[str, int] | None = None,
+    current_provider: str | None = None,
+    config: AppConfig | None = None,
+) -> dict[str, Any]:
     archive = Path(archive)
     if not archive.exists():
         return {"success": False, "error": f"备份包不存在：{archive}"}
     local = local_index if local_index is not None else _local_threads_index()
-    with zipfile.ZipFile(archive) as zf:
+    with open_full_backup_zip(config or load_config(), archive) as zf:
         entry = _zip_state_entry(zf)
         if not entry:
             return {"success": False, "error": "备份包内未找到 state_*.sqlite"}
@@ -225,11 +229,12 @@ def read_backup_conversation(
     include_reasoning: bool = False,
     include_developer: bool = False,
     max_chars: int = 200000,
+    config: AppConfig | None = None,
 ) -> dict[str, Any]:
     archive = Path(archive)
     if not archive.exists():
         return {"success": False, "error": f"备份包不存在：{archive}"}
-    with zipfile.ZipFile(archive) as zf:
+    with open_full_backup_zip(config or load_config(), archive) as zf:
         entry = _zip_state_entry(zf)
         if not entry:
             return {"success": False, "error": "备份包内无 state db"}
@@ -309,7 +314,7 @@ def import_conversations(
     imported: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
 
-    with zipfile.ZipFile(archive) as zf:
+    with open_full_backup_zip(config, archive) as zf:
         entry = _zip_state_entry(zf)
         if not entry:
             return {"success": False, "error": "备份包内无 state db"}

@@ -169,6 +169,93 @@
   line-height: 1.55;
   overflow-wrap: anywhere;
 }
+.inline-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---------- 首页同步状态数据板 ---------- */
+.sync-summary {
+  appearance: none;
+  width: 100%;
+  margin-top: 12px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elev-2);
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.sync-summary-main {
+  min-width: 0;
+  font-size: 15px;
+  font-weight: 650;
+  overflow-wrap: anywhere;
+}
+.sync-summary.ok {
+  border-color: rgba(16, 185, 129, 0.28);
+  background: var(--ok-soft);
+}
+.sync-summary.warn {
+  border-color: rgba(245, 158, 11, 0.28);
+  background: var(--warn-soft);
+}
+.sync-summary.danger {
+  border-color: rgba(239, 68, 68, 0.32);
+  background: var(--danger-bg);
+}
+.sync-board {
+  margin-top: 14px;
+}
+.sync-board-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.sync-board-head span {
+  color: var(--text-muted);
+}
+.sync-table th,
+.sync-table td {
+  vertical-align: top;
+}
+.sync-group {
+  display: inline-block;
+  min-width: 72px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.sync-object {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 210px;
+}
+.sync-object strong {
+  font-size: 13px;
+}
+.sync-object span {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.muted {
+  color: var(--text-muted);
+}
 
 /* ---------- 指标卡 ---------- */
 .metric {

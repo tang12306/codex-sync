@@ -95,7 +95,7 @@ Full conversation backups include Codex conversation text, thread indexes, and r
 - `config.toml`, `hooks.json`
 - browser state, caches, temp folders, and runtime process folders
 
-Client-side encryption is not implemented yet. Full conversation archives contain real context, so cloud upload is disabled by default and requires explicit plaintext-upload approval.
+Full conversation archives contain real context. Codex Sync encrypts full backup archives on the client before upload by default. The encryption key is taken from `CODEX_SYNC_FULL_BACKUP_PASSPHRASE`, the saved full-backup passphrase, or an auto-generated local key file under `~/.codex-sync/`. Use the same passphrase on other devices to restore encrypted cloud backups. Plaintext upload remains blocked unless `--allow-plaintext-upload` or the matching setting is explicitly enabled.
 
 Project backups skip `.env`, keys, certificates, `node_modules`, `dist`, `build`, cache folders, and files exceeding the configured size limit.
 

@@ -16,6 +16,7 @@ from codex_sync.full_backup import (
     get_remote_device_state,
     list_full_backups,
     notify_codex_changed,
+    open_full_backup_zip,
     restore_full_backup,
     scan_full_backup_changes,
     state_path,
@@ -39,7 +40,9 @@ class FullBackupTests(unittest.TestCase):
 
                 first = create_full_backup_package(AppConfig(device_id="full-test"), force=False)
                 self.assertTrue(first["created"])
-                with zipfile.ZipFile(first["archive"]) as zf:
+                self.assertTrue(first["encrypted"])
+                self.assertTrue(str(first["archive"]).endswith(".zip.enc"))
+                with open_full_backup_zip(AppConfig(device_id="full-test"), first["archive"]) as zf:
                     names = set(zf.namelist())
                 self.assertIn("codex/sessions/session.jsonl", names)
                 self.assertIn("codex/session_index.jsonl", names)

@@ -389,7 +389,8 @@ export function mount(root, store) {
     toggle("full_backup_enabled", "完整对话备份开关", "允许把包含正文的完整对话打包（用于迁移接力）"),
     toggle("full_backup_include_config", "完整包包含配置", "把本地 Agent 的预设和全局系统配置打包归档"),
     toggle("full_backup_include_memories", "完整包包含记忆库", "把本地 Agent 的 memories 长期记忆目录一并打包"),
-    toggle("full_backup_allow_plaintext_upload", "允许云端明文上传", "⚠ 安全警告：在客户端加密未就绪时，允许将包含正文的完整 zip 包直接上传云端"),
+    toggle("full_backup_encryption_enabled", "完整包客户端加密", "默认开启；跨设备恢复时请在其它设备设置相同口令，或复制本机私有 key 文件"),
+    toggle("full_backup_allow_plaintext_upload", "允许云端明文上传", "仅用于兼容旧明文包；关闭客户端加密后仍需显式允许才能上传完整正文 zip"),
     toggle("project_auto_backup_on_codex_stop", "Codex 关闭时入队项目备份", "可选：Stop hook 只记录待备份任务，后台再上传当前 Git 项目")
   );
 
@@ -417,6 +418,7 @@ export function mount(root, store) {
     field("sync_interval_minutes", "Daemon 同步轮询周期（分钟）", "守护进程的后台事件上传周期", { type: "number", min: "1", step: "1" }),
     field("max_untracked_copy_mb", "项目文件单体大小上限（MB）", "项目备份中，超过此大小的未跟踪文件将被跳过", { type: "number", min: "0", step: "1" }),
     field("disaster_backup_min_interval_hours", "灾难备份冷冻周期（小时）", "多长时间内仅允许自动创建一次灾难备份，防止 IO 开销", { type: "number", min: "0", step: "1" }),
+    field("full_backup_encryption_passphrase", "完整备份加密口令", "留空保持不变；多设备使用同一口令即可解密彼此的云端完整包", { type: "password", autocomplete: "new-password" }),
     field("full_backup_quiet_minutes", "完整备份安静期时长（分钟）", "会话内容停止变化后，等待多久再生成本地大包", { type: "number", min: "0", step: "1" }),
     field("project_auto_backup_min_interval_minutes", "项目自动备份最短间隔（分钟）", "用于 Git 提交和 Codex Stop 触发，避免频繁上传", { type: "number", min: "0", step: "1" }),
     field("full_backup_retention_count", "本地备份留存数量限制", "本地 full_backups 最大保留包数，0表示不限制", { type: "number", min: "0" }),
@@ -644,6 +646,7 @@ export function mount(root, store) {
       full_backup_enabled: f.full_backup_enabled.checked,
       full_backup_include_config: f.full_backup_include_config.checked,
       full_backup_include_memories: f.full_backup_include_memories.checked,
+      full_backup_encryption_enabled: f.full_backup_encryption_enabled.checked,
       full_backup_allow_plaintext_upload: f.full_backup_allow_plaintext_upload.checked,
       project_auto_backup_on_codex_stop: f.project_auto_backup_on_codex_stop.checked,
       full_backup_quiet_seconds: fromUnit(f.full_backup_quiet_minutes.value, 60, 60),
@@ -655,11 +658,14 @@ export function mount(root, store) {
 
     const token = f.api_token.value.trim();
     if (token || !existing.api_token_configured) payload.api_token = token;
+    const fullBackupPassphrase = f.full_backup_encryption_passphrase.value;
+    if (fullBackupPassphrase) payload.full_backup_encryption_passphrase = fullBackupPassphrase;
 
     saveBtn.disabled = true;
     try {
       await saveConfig(payload);
       f.api_token.value = "";
+      f.full_backup_encryption_passphrase.value = "";
       dirty = false; // 重置 dirty
       await refreshStatus(store);
       showToast("系统配置已成功保存", "success");
@@ -694,6 +700,7 @@ export function mount(root, store) {
     setIfUnfocused(f.full_backup_enabled, cfg.full_backup_enabled);
     setIfUnfocused(f.full_backup_include_config, cfg.full_backup_include_config);
     setIfUnfocused(f.full_backup_include_memories, cfg.full_backup_include_memories);
+    setIfUnfocused(f.full_backup_encryption_enabled, cfg.full_backup_encryption_enabled !== false);
     setIfUnfocused(f.full_backup_allow_plaintext_upload, cfg.full_backup_allow_plaintext_upload);
     setIfUnfocused(f.project_auto_backup_on_codex_stop, cfg.project_auto_backup_on_codex_stop);
     setIfUnfocused(f.full_backup_quiet_minutes, toUnit(cfg.full_backup_quiet_seconds, 60));
@@ -703,6 +710,9 @@ export function mount(root, store) {
     setIfUnfocused(f.desktop_close_behavior, cfg.desktop_close_behavior || "ask");
     if (document.activeElement !== apiToken) {
       apiToken.placeholder = cfg.api_token_configured ? "已保存 Token，留空保持不变" : "请输入 API Token 进行认证";
+    }
+    if (document.activeElement !== f.full_backup_encryption_passphrase) {
+      f.full_backup_encryption_passphrase.placeholder = cfg.full_backup_encryption_passphrase_configured ? "已保存加密口令，留空保持不变" : "留空则使用本机自动生成的私有 key";
     }
   };
 

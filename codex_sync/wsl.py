@@ -23,7 +23,11 @@ from .full_backup import (
     FILE_SUFFIXES,
     OPTIONAL_CONFIG_FILES,
     OPTIONAL_DIRECTORIES,
+    open_full_backup_zip,
+    read_full_backup_manifest,
     upload_full_backup,
+    _manifest_path_for_archive,
+    _write_encrypted_archive,
 )
 from .paths import app_dir, ensure_app_dirs
 from .redact import redact_text
@@ -160,6 +164,26 @@ def _read_wsl_backup_state(distro: str) -> dict[str, Any]:
 
 def _write_wsl_backup_state(distro: str, data: dict[str, Any]) -> None:
     write_json(wsl_backup_state_path(distro), data)
+
+
+def wsl_full_backup_status(distro: str) -> dict[str, Any]:
+    state = _read_wsl_backup_state(distro)
+    last_digest = str(state.get("last_content_digest") or "")
+    uploaded_digest = str(state.get("last_uploaded_content_digest") or "")
+    return {
+        "success": True,
+        "distro": distro,
+        "device_id": _wsl_device_id(distro),
+        "branch_id": _wsl_branch_id(distro, state),
+        "needs_upload": bool(last_digest and last_digest != uploaded_digest),
+        "last_content_digest": last_digest,
+        "last_uploaded_content_digest": uploaded_digest,
+        "last_backup_id": state.get("last_backup_id"),
+        "last_uploaded_backup_id": state.get("last_uploaded_backup_id"),
+        "last_created_at": state.get("last_created_at"),
+        "last_uploaded_at": state.get("last_uploaded_at"),
+        "last_archive": state.get("last_archive"),
+    }
 
 
 def _wsl_device_id(distro: str) -> str:
@@ -317,6 +341,7 @@ def list_wsl_channels(distro: str) -> dict[str, Any]:
         "db": rel,
         "current_provider": _wsl_current_provider(distro),
         "channels": channels,
+        "merged": _wsl_merge_summary(distro),
     }
 
 
@@ -364,17 +389,19 @@ def list_wsl_conversations(
             [*params, max(1, min(int(limit or 500), 2000))],
         ).fetchall()
         home_id = f"wsl:{distro}"
+        merge_state = _read_wsl_merge_state(distro)
         conversations: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
+            merge_info = merge_state.get(str(row["id"])) or {}
             item.update(
                 {
                     "home_id": home_id,
                     "home_kind": "wsl",
                     "home_label": f"WSL {distro}",
                     "distro": distro,
-                    "merged": False,
-                    "original_provider": None,
+                    "merged": bool(merge_info),
+                    "original_provider": merge_info.get("original_provider"),
                 }
             )
             conversations.append(item)
@@ -584,6 +611,371 @@ def _ensure_wsl_codex_closed(distro: str, close_running: bool) -> dict[str, Any]
     return None
 
 
+def wsl_merge_state_path(distro: str) -> Path:
+    ensure_app_dirs()
+    path = app_dir() / "wsl" / safe_filename(distro)
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "channel-merge-state.json"
+
+
+def _read_wsl_merge_state(distro: str) -> dict[str, Any]:
+    path = wsl_merge_state_path(distro)
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _write_wsl_merge_state(distro: str, data: dict[str, Any]) -> None:
+    write_json(wsl_merge_state_path(distro), data)
+
+
+def _wsl_db_backup_dir(distro: str) -> Path:
+    path = app_dir() / "wsl" / safe_filename(distro) / "codex-db-backups"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _backup_wsl_state_db(distro: str, state_rel: str, data: bytes) -> dict[str, Any]:
+    stamp = utc_now().replace(":", "").replace("+", "Z")
+    dest = _wsl_db_backup_dir(distro) / stamp
+    dest.mkdir(parents=True, exist_ok=True)
+    name = safe_filename(Path(state_rel).name or "state.sqlite")
+    target = dest / name
+    target.write_bytes(data)
+    return {"dir": str(dest), "files": [name]}
+
+
+def _wsl_write_file(distro: str, rel: str, data: bytes, timeout: int = 120) -> tuple[bool, str | None]:
+    safe = _wsl_safe_rel(rel)
+    if not safe:
+        return False, "unsafe path"
+    dirname = shlex.quote(str(Path(safe).parent).replace("\\", "/"))
+    target_name = shlex.quote(safe)
+    mkdir = "" if dirname == "'.'" else f"mkdir -p {dirname} && "
+    code, _, err = _wsl_sh(distro, f"mkdir -p ~/.codex && cd ~/.codex && {mkdir}cat > {target_name}", input_bytes=data, timeout=timeout)
+    return code == 0, err or None
+
+
+def _write_wsl_state_db(distro: str, state_rel: str, data: bytes) -> tuple[bool, str | None]:
+    safe = _wsl_safe_rel(state_rel)
+    if not safe:
+        return False, "unsafe state db path"
+    quoted = shlex.quote(safe)
+    code, _, err = _wsl_sh(
+        distro,
+        f"mkdir -p ~/.codex && cat > ~/.codex/{quoted} && rm -f ~/.codex/{quoted}-wal ~/.codex/{quoted}-shm",
+        input_bytes=data,
+        timeout=120,
+    )
+    return code == 0, err or None
+
+
+def _wsl_rollout_set_provider(distro: str, rollout_path: str | None, provider: str) -> dict[str, Any]:
+    rel = _wsl_rollout_rel(distro, rollout_path)
+    if not rel:
+        return {"ok": False, "reason": "no_path", "path": rollout_path}
+    raw, err = _read_wsl_file(distro, rel)
+    if err or raw is None:
+        return {"ok": False, "reason": err or "read_failed", "path": rel}
+    lines = raw.splitlines(keepends=True)
+    if not lines:
+        return {"ok": False, "reason": "empty", "path": rel}
+    try:
+        first = json.loads(lines[0].decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return {"ok": False, "reason": "bad_json", "path": rel}
+    payload = first.get("payload")
+    if first.get("type") != "session_meta" or not isinstance(payload, dict):
+        return {"ok": False, "reason": "no_session_meta", "path": rel}
+    old = payload.get("model_provider")
+    if old == provider:
+        return {"ok": True, "changed": False, "old": old, "path": rel}
+    payload["model_provider"] = provider
+    newline = b"\r\n" if lines[0].endswith(b"\r\n") else b"\n"
+    rewritten = (json.dumps(first, ensure_ascii=False).encode("utf-8") + newline) + b"".join(lines[1:])
+    ok, write_err = _wsl_write_file(distro, rel, rewritten, timeout=120)
+    if not ok:
+        return {"ok": False, "reason": write_err or "write_failed", "path": rel}
+    return {"ok": True, "changed": True, "old": old, "new": provider, "path": rel}
+
+
+def _load_wsl_state_tmp(distro: str) -> tuple[str | None, Path | None, bytes | None, dict[str, Any] | None]:
+    state_rel = _wsl_state_db_rel(distro)
+    if not state_rel:
+        return None, None, None, {"success": False, "error": f"未找到 {distro} 的 WSL Codex 状态数据库"}
+    data, err = _read_wsl_file(distro, state_rel)
+    if err or data is None:
+        return None, None, None, {"success": False, "error": err or f"读取 {state_rel} 失败"}
+    tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+    tmp.write(data)
+    tmp.close()
+    return state_rel, Path(tmp.name), data, None
+
+
+def _wsl_merge_summary(distro: str) -> dict[str, Any]:
+    merge_state = _read_wsl_merge_state(distro)
+    by_target: dict[str, int] = {}
+    origin_breakdown: dict[str, dict[str, int]] = {}
+    for info in merge_state.values():
+        target = str(info.get("current_provider") or "")
+        origin = str(info.get("original_provider") or "")
+        if not target:
+            continue
+        by_target[target] = by_target.get(target, 0) + 1
+        if origin:
+            origin_breakdown.setdefault(target, {})
+            origin_breakdown[target][origin] = origin_breakdown[target].get(origin, 0) + 1
+    return {"total": len(merge_state), "by_target": by_target, "origin_breakdown": origin_breakdown}
+
+
+def _merge_wsl_rows(config: AppConfig, distro: str, state_rel: str, tmp_db: Path, original_db: bytes, rows: list[dict[str, Any]], target: str) -> dict[str, Any]:
+    if not rows:
+        return {"success": False, "error": "没有可并入的对话（可能它们已在目标渠道）", "target_home": f"wsl:{distro}"}
+    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True, config=config)
+    db_backup = _backup_wsl_state_db(distro, state_rel, original_db)
+    merge_state = _read_wsl_merge_state(distro)
+    moved: list[dict[str, Any]] = []
+    rollout_results: list[dict[str, Any]] = []
+    con = sqlite3.connect(tmp_db)
+    con.row_factory = sqlite3.Row
+    try:
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" * len(ids))
+        con.execute(f"UPDATE threads SET model_provider=? WHERE id IN ({placeholders})", [target, *ids])
+        con.commit()
+    finally:
+        con.close()
+    for row in rows:
+        tid = str(row["id"])
+        prior = merge_state.get(tid, {})
+        original = prior.get("original_provider", row.get("model_provider"))
+        rollout_results.append({"id": tid, **_wsl_rollout_set_provider(distro, row.get("rollout_path"), target)})
+        merge_state[tid] = {
+            "home": f"wsl:{distro}",
+            "original_provider": original,
+            "current_provider": target,
+            "title": row.get("title"),
+            "cwd": row.get("cwd"),
+            "rollout_path": row.get("rollout_path"),
+            "merged_at": utc_now(),
+        }
+        moved.append({"id": tid, "from": row.get("model_provider"), "to": target, "title": row.get("title")})
+    ok, write_err = _write_wsl_state_db(distro, state_rel, tmp_db.read_bytes())
+    if not ok:
+        return {"success": False, "error": write_err or f"写回 {state_rel} 失败", "preflight_backup": preflight, "db_backup": db_backup}
+    _write_wsl_merge_state(distro, merge_state)
+    return {
+        "success": True,
+        "target_home": f"wsl:{distro}",
+        "distro": distro,
+        "moved": len(moved),
+        "target": target,
+        "items": moved,
+        "rollout": {
+            "changed": sum(1 for item in rollout_results if item.get("changed")),
+            "failed": [item for item in rollout_results if not item.get("ok")],
+        },
+        "preflight_backup": preflight,
+        "db_backup": db_backup,
+    }
+
+
+def merge_wsl_channels(
+    config: AppConfig,
+    distro: str,
+    sources: list[str] | None = None,
+    target: str | None = None,
+    all_others: bool = False,
+    close_running: bool = False,
+) -> dict[str, Any]:
+    if not distro:
+        return {"success": False, "error": "distro is required"}
+    target = target or _wsl_current_provider(distro)
+    if not target:
+        return {"success": False, "error": "无法确定目标渠道，请显式指定", "target_home": f"wsl:{distro}"}
+    guard = _ensure_wsl_codex_closed(distro, close_running)
+    if guard is not None:
+        return guard
+    state_rel, tmp_db, original_db, error = _load_wsl_state_tmp(distro)
+    if error:
+        return error
+    assert state_rel is not None and tmp_db is not None and original_db is not None
+    try:
+        con = sqlite3.connect(tmp_db)
+        con.row_factory = sqlite3.Row
+        try:
+            existing = [row["p"] for row in con.execute("SELECT DISTINCT model_provider AS p FROM threads") if row["p"]]
+            if all_others:
+                sources = [provider for provider in existing if provider != target]
+            sources = sorted({source for source in (sources or []) if source and source != target})
+            if not sources:
+                return {"success": False, "error": "没有要并入的源渠道", "target_home": f"wsl:{distro}"}
+            placeholders = ",".join("?" * len(sources))
+            rows = [
+                dict(row)
+                for row in con.execute(
+                    f"SELECT id, model_provider, title, cwd, rollout_path FROM threads WHERE model_provider IN ({placeholders})",
+                    sources,
+                )
+            ]
+        finally:
+            con.close()
+        result = _merge_wsl_rows(config, distro, state_rel, tmp_db, original_db, rows, target)
+        if result.get("success"):
+            result["sources"] = sources
+        return result
+    finally:
+        tmp_db.unlink(missing_ok=True)
+
+
+def merge_wsl_threads(
+    config: AppConfig,
+    distro: str,
+    thread_ids: list[str] | None,
+    target: str | None = None,
+    close_running: bool = False,
+) -> dict[str, Any]:
+    if not distro:
+        return {"success": False, "error": "distro is required"}
+    target = target or _wsl_current_provider(distro)
+    if not target:
+        return {"success": False, "error": "无法确定目标渠道，请显式指定", "target_home": f"wsl:{distro}"}
+    ids = sorted({tid for tid in (thread_ids or []) if tid})
+    if not ids:
+        return {"success": False, "error": "未指定要并入的对话", "target_home": f"wsl:{distro}"}
+    guard = _ensure_wsl_codex_closed(distro, close_running)
+    if guard is not None:
+        return guard
+    state_rel, tmp_db, original_db, error = _load_wsl_state_tmp(distro)
+    if error:
+        return error
+    assert state_rel is not None and tmp_db is not None and original_db is not None
+    try:
+        con = sqlite3.connect(tmp_db)
+        con.row_factory = sqlite3.Row
+        try:
+            placeholders = ",".join("?" * len(ids))
+            rows = [
+                dict(row)
+                for row in con.execute(
+                    f"SELECT id, model_provider, title, cwd, rollout_path FROM threads WHERE id IN ({placeholders})",
+                    ids,
+                )
+                if row["model_provider"] != target
+            ]
+        finally:
+            con.close()
+        return _merge_wsl_rows(config, distro, state_rel, tmp_db, original_db, rows, target)
+    finally:
+        tmp_db.unlink(missing_ok=True)
+
+
+def _restore_wsl_rows(config: AppConfig, distro: str, state_rel: str, tmp_db: Path, original_db: bytes, to_restore: dict[str, Any]) -> dict[str, Any]:
+    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True, config=config)
+    db_backup = _backup_wsl_state_db(distro, state_rel, original_db)
+    merge_state = _read_wsl_merge_state(distro)
+    restored: list[dict[str, Any]] = []
+    rollout_results: list[dict[str, Any]] = []
+    con = sqlite3.connect(tmp_db)
+    con.row_factory = sqlite3.Row
+    try:
+        for tid, info in to_restore.items():
+            original = str(info.get("original_provider") or "")
+            if not original:
+                continue
+            row = con.execute("SELECT rollout_path FROM threads WHERE id=?", (tid,)).fetchone()
+            if row is None:
+                continue
+            con.execute("UPDATE threads SET model_provider=? WHERE id=?", (original, tid))
+            rollout_path = info.get("rollout_path") or row["rollout_path"]
+            rollout_results.append({"id": tid, **_wsl_rollout_set_provider(distro, rollout_path, original)})
+            restored.append({"id": tid, "to": original})
+        con.commit()
+    finally:
+        con.close()
+    ok, write_err = _write_wsl_state_db(distro, state_rel, tmp_db.read_bytes())
+    if not ok:
+        return {"success": False, "error": write_err or f"写回 {state_rel} 失败", "preflight_backup": preflight, "db_backup": db_backup}
+    for tid in to_restore:
+        merge_state.pop(tid, None)
+    _write_wsl_merge_state(distro, merge_state)
+    return {
+        "success": True,
+        "target_home": f"wsl:{distro}",
+        "distro": distro,
+        "restored": len(restored),
+        "items": restored,
+        "rollout": {
+            "changed": sum(1 for item in rollout_results if item.get("changed")),
+            "failed": [item for item in rollout_results if not item.get("ok")],
+        },
+        "preflight_backup": preflight,
+        "db_backup": db_backup,
+    }
+
+
+def restore_wsl_channels(
+    config: AppConfig,
+    distro: str,
+    sources: list[str] | None = None,
+    all_merged: bool = False,
+    close_running: bool = False,
+) -> dict[str, Any]:
+    if not distro:
+        return {"success": False, "error": "distro is required"}
+    guard = _ensure_wsl_codex_closed(distro, close_running)
+    if guard is not None:
+        return guard
+    merge_state = _read_wsl_merge_state(distro)
+    if not merge_state:
+        return {"success": True, "restored": 0, "message": "没有需要还原的并入记录", "target_home": f"wsl:{distro}"}
+    if all_merged:
+        to_restore = dict(merge_state)
+    else:
+        wanted = {source for source in (sources or []) if source}
+        to_restore = {tid: info for tid, info in merge_state.items() if info.get("original_provider") in wanted}
+    if not to_restore:
+        return {"success": True, "restored": 0, "message": "没有匹配的并入记录可还原", "target_home": f"wsl:{distro}"}
+    state_rel, tmp_db, original_db, error = _load_wsl_state_tmp(distro)
+    if error:
+        return error
+    assert state_rel is not None and tmp_db is not None and original_db is not None
+    try:
+        return _restore_wsl_rows(config, distro, state_rel, tmp_db, original_db, to_restore)
+    finally:
+        tmp_db.unlink(missing_ok=True)
+
+
+def restore_wsl_threads(
+    config: AppConfig,
+    distro: str,
+    thread_ids: list[str] | None,
+    close_running: bool = False,
+) -> dict[str, Any]:
+    if not distro:
+        return {"success": False, "error": "distro is required"}
+    guard = _ensure_wsl_codex_closed(distro, close_running)
+    if guard is not None:
+        return guard
+    wanted = {tid for tid in (thread_ids or []) if tid}
+    merge_state = _read_wsl_merge_state(distro)
+    to_restore = {tid: info for tid, info in merge_state.items() if tid in wanted}
+    if not to_restore:
+        return {"success": True, "restored": 0, "message": "选中的对话没有可还原的并入记录", "target_home": f"wsl:{distro}"}
+    state_rel, tmp_db, original_db, error = _load_wsl_state_tmp(distro)
+    if error:
+        return error
+    assert state_rel is not None and tmp_db is not None and original_db is not None
+    try:
+        return _restore_wsl_rows(config, distro, state_rel, tmp_db, original_db, to_restore)
+    finally:
+        tmp_db.unlink(missing_ok=True)
+
+
 def _digest_items(items: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     for item in items:
@@ -596,7 +988,12 @@ def _digest_items(items: list[dict[str, Any]]) -> str:
     return digest.hexdigest()
 
 
-def create_wsl_full_backup(distro: str, include_config: bool = True, include_memories: bool = True) -> dict[str, Any]:
+def create_wsl_full_backup(
+    distro: str,
+    include_config: bool = True,
+    include_memories: bool = True,
+    config: AppConfig | None = None,
+) -> dict[str, Any]:
     if not distro:
         return {"success": False, "error": "distro is required"}
     files, err = _wsl_candidate_files(distro, include_config=include_config, include_memories=include_memories)
@@ -606,14 +1003,23 @@ def create_wsl_full_backup(distro: str, include_config: bool = True, include_mem
         return {"success": False, "error": "No WSL Codex files found to back up", "distro": distro}
 
     state = _read_wsl_backup_state(distro)
+    config = config or AppConfig()
+    encrypted = bool(getattr(config, "full_backup_encryption_enabled", True))
     device_id = _wsl_device_id(distro)
     backup_id = f"wsl-{safe_filename(distro)}-{uuid.uuid4()}"
     created_at = utc_now()
-    archive = wsl_backup_dir(distro) / f"{created_at.replace(':', '').replace('+', 'Z')}-{backup_id}.zip"
+    suffix = ".zip.enc" if encrypted else ".zip"
+    archive = wsl_backup_dir(distro) / f"{created_at.replace(':', '').replace('+', 'Z')}-{backup_id}{suffix}"
+    plain_archive = archive
+    if encrypted:
+        tmp = tempfile.NamedTemporaryFile(prefix=f"{safe_filename(backup_id)}-", suffix=".zip", dir=wsl_backup_dir(distro), delete=False)
+        tmp.close()
+        plain_archive = Path(tmp.name)
     included: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
     total = 0
-    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+    manifest: dict[str, Any]
+    with zipfile.ZipFile(plain_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for rel in files:
             data, read_err = _read_wsl_file(distro, rel)
             if read_err or data is None:
@@ -633,8 +1039,8 @@ def create_wsl_full_backup(distro: str, include_config: bool = True, include_mem
             "parent_backup_id": str(state.get("last_uploaded_backup_id") or ""),
             "distro": distro,
             "codex_home": "~/.codex",
-            "encrypted": False,
-            "encryption": "none",
+            "encrypted": encrypted,
+            "encryption": "AES-256-GCM" if encrypted else "none",
             "content_digest": _digest_items(included),
             "included_count": len(included),
             "included_bytes": total,
@@ -643,27 +1049,50 @@ def create_wsl_full_backup(distro: str, include_config: bool = True, include_mem
             "source": "wsl",
         }
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+    if encrypted:
+        try:
+            encryption_header = _write_encrypted_archive(plain_archive, archive, config, manifest)
+            manifest["encryption_header"] = {key: value for key, value in encryption_header.items() if key != "secret_source"}
+            manifest["encryption_key_source"] = encryption_header.get("secret_source")
+        finally:
+            plain_archive.unlink(missing_ok=True)
+    manifest["archive_name"] = archive.name
+    manifest["archive"] = str(archive)
+    manifest["archive_bytes"] = archive.stat().st_size
+    manifest["archive_sha256"] = hashlib.sha256(archive.read_bytes()).hexdigest()
+    write_json(_manifest_path_for_archive(archive), manifest)
+    state.update(
+        {
+            "branch_id": manifest["branch_id"],
+            "last_backup_id": backup_id,
+            "last_content_digest": manifest["content_digest"],
+            "last_created_at": created_at,
+            "last_archive": str(archive),
+        }
+    )
+    _write_wsl_backup_state(distro, state)
     return {
         "success": True,
         "distro": distro,
         "backup_id": backup_id,
         "archive": str(archive),
+        "content_digest": manifest["content_digest"],
         "branch_id": manifest["branch_id"],
         "parent_backup_id": manifest["parent_backup_id"],
         "included_count": len(included),
         "included_bytes": total,
         "skipped": skipped,
+        "encrypted": encrypted,
+        "encryption": manifest.get("encryption", "none"),
     }
 
 
-def _read_wsl_archive_manifest(archive: Path) -> dict[str, Any]:
-    with zipfile.ZipFile(archive) as zf:
-        data = json.loads(zf.read("manifest.json").decode("utf-8"))
-    return data if isinstance(data, dict) else {}
+def _read_wsl_archive_manifest(config: AppConfig, archive: Path) -> dict[str, Any]:
+    return read_full_backup_manifest(config, archive)
 
 
-def _prepare_wsl_upload_manifest(distro: str, archive: Path, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
-    data = dict(manifest or _read_wsl_archive_manifest(archive))
+def _prepare_wsl_upload_manifest(config: AppConfig, distro: str, archive: Path, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    data = dict(manifest or _read_wsl_archive_manifest(config, archive))
     state = _read_wsl_backup_state(distro)
     device_id = str(data.get("device_id") or _wsl_device_id(distro))
     data["id"] = str(data.get("id") or archive.stem)
@@ -691,7 +1120,7 @@ def upload_wsl_full_backup(
     archive_path = Path(archive)
     if not archive_path.exists():
         return {"success": False, "error": f"archive not found: {archive_path}", "distro": distro}
-    upload_manifest = _prepare_wsl_upload_manifest(distro, archive_path, manifest)
+    upload_manifest = _prepare_wsl_upload_manifest(config, distro, archive_path, manifest)
     uploaded = upload_full_backup(
         config,
         archive_path,
@@ -723,7 +1152,7 @@ def wsl_full_backup_now(
     upload: bool = False,
     allow_plaintext_upload: bool = False,
 ) -> dict[str, Any]:
-    package = create_wsl_full_backup(distro, include_config=include_config, include_memories=include_memories)
+    package = create_wsl_full_backup(distro, include_config=include_config, include_memories=include_memories, config=config)
     if not package.get("success"):
         return package
     if not upload:
@@ -745,7 +1174,7 @@ def wsl_full_backup_now(
 
 def latest_wsl_backup(distro: str) -> Path | None:
     root = wsl_backup_dir(distro)
-    archives = sorted(root.glob("*.zip"), key=lambda path: path.stat().st_mtime, reverse=True)
+    archives = sorted([*root.glob("*.zip"), *root.glob("*.zip.enc")], key=lambda path: path.stat().st_mtime, reverse=True)
     return archives[0] if archives else None
 
 
@@ -756,14 +1185,21 @@ def _safe_rel(rel: str) -> str | None:
     return rel.replace("\\", "/")
 
 
-def restore_wsl_full_backup(distro: str, archive: str | Path, confirm_backup_id: str, restore_config: bool = False) -> dict[str, Any]:
+def restore_wsl_full_backup(
+    distro: str,
+    archive: str | Path,
+    confirm_backup_id: str,
+    restore_config: bool = False,
+    config: AppConfig | None = None,
+) -> dict[str, Any]:
     archive_path = Path(archive)
     if not archive_path.exists():
         return {"success": False, "error": f"archive not found: {archive_path}"}
-    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True)
+    config = config or AppConfig()
+    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True, config=config)
     restored: list[str] = []
     skipped: list[dict[str, Any]] = []
-    with zipfile.ZipFile(archive_path) as zf:
+    with open_full_backup_zip(config, archive_path) as zf:
         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
         backup_id = str(manifest.get("id") or "")
         if confirm_backup_id != backup_id:
@@ -798,14 +1234,15 @@ def restore_wsl_full_backup(distro: str, archive: str | Path, confirm_backup_id:
     }
 
 
-def restore_latest_wsl_full_backup(distro: str, restore_config: bool = False) -> dict[str, Any]:
+def restore_latest_wsl_full_backup(distro: str, restore_config: bool = False, config: AppConfig | None = None) -> dict[str, Any]:
     archive = latest_wsl_backup(distro)
     if archive is None:
         return {"success": False, "error": "No WSL full backup found", "distro": distro}
-    with zipfile.ZipFile(archive) as zf:
+    config = config or AppConfig()
+    with open_full_backup_zip(config, archive) as zf:
         manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
     backup_id = str(manifest.get("id") or "")
-    return restore_wsl_full_backup(distro, archive, confirm_backup_id=backup_id, restore_config=restore_config)
+    return restore_wsl_full_backup(distro, archive, confirm_backup_id=backup_id, restore_config=restore_config, config=config)
 
 
 def import_conversations_to_wsl(
@@ -814,6 +1251,7 @@ def import_conversations_to_wsl(
     thread_ids: list[str] | None,
     target_provider: str | None = None,
     close_running: bool = False,
+    config: AppConfig | None = None,
 ) -> dict[str, Any]:
     from .backup_import import _rewrite_rollout_meta, _zip_rollout_entry, _zip_state_entry
 
@@ -840,7 +1278,8 @@ def import_conversations_to_wsl(
     if err or target_state is None:
         return {"success": False, "error": err or f"读取 {state_rel} 失败"}
 
-    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True)
+    config = config or AppConfig()
+    preflight = create_wsl_full_backup(distro, include_config=True, include_memories=True, config=config)
     home = _wsl_codex_home(distro)
     imported: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
@@ -849,7 +1288,7 @@ def import_conversations_to_wsl(
     target_tmp.write(target_state)
     target_tmp.close()
 
-    with zipfile.ZipFile(archive_path) as zf:
+    with open_full_backup_zip(config, archive_path) as zf:
         entry = _zip_state_entry(zf)
         if not entry:
             Path(target_tmp.name).unlink(missing_ok=True)
