@@ -1,11 +1,10 @@
-// 系统设置与高级页面：整合服务器配置、备份策略、自动化自动化和高级诊断。
+// 系统设置与高级页面：整合服务器配置、同步策略、定时任务和后台诊断。
 // 采用 display 控制面板切换，确保未保存的编辑在切换 Tab 时不丢失。
-import { h, asObject, shortId } from "../dom.js";
+import { h, asObject } from "../dom.js";
 import { saveConfig, runAction } from "../api.js";
-import { refreshStatus, fetchSnapshots } from "../poller.js";
+import { refreshStatus } from "../poller.js";
 import { showToast } from "../toast.js";
-import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
-import { openSnapshot } from "./drawer.js";
+import { consoleCard, makeRun, actionButton } from "../ui.js";
 
 function loadingSpinner(text = "加载中…") {
   return h("div", { class: "spinner-wrap" }, h("span", { class: "spinner" }), h("span", {}, text));
@@ -376,62 +375,12 @@ export function mount(root, store) {
     appUpdateBody
   );
 
-  let retentionData = null;
-  let retentionLoading = false;
-  const retentionBody = h("div", { class: "result-stack" });
-
-  async function loadServerRetention() {
-    retentionLoading = true;
-    renderRetention();
-    try {
-      retentionData = await runAction("server-retention-status");
-      showToast(retentionData.success === false ? "服务器留存策略读取失败" : "服务器留存策略已更新", retentionData.success === false ? "error" : "success");
-    } catch (e) {
-      retentionData = { success: false, error: String(e.message || e) };
-      showToast(String(e.message || e), "error");
-    } finally {
-      retentionLoading = false;
-      renderRetention();
-    }
-  }
-
-  async function pruneServerRetention() {
-    if (!window.confirm("将删除服务器端超出留存策略的完整备份、项目备份和轻量快照。每个设备/项目会保留最新入口。确认执行？")) return;
-    retentionLoading = true;
-    renderRetention();
-    try {
-      retentionData = await runAction("server-retention-prune", { dry_run: false });
-      const n = Number(retentionData.deleted_count || 0);
-      showToast(`服务器清理完成：删除 ${n} 项`, retentionData.success === false ? "error" : "success");
-    } catch (e) {
-      retentionData = { success: false, error: String(e.message || e) };
-      showToast(String(e.message || e), "error");
-    } finally {
-      retentionLoading = false;
-      renderRetention();
-    }
-  }
-
-  const retentionCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, "服务器留存与自动清理"),
-    h("p", { class: "card-desc" }, "服务器上传后会按策略自动清理；这里可以预览当前会删什么，也可以手动立即执行。"),
-    h(
-      "div",
-      { class: "card-actions" },
-      actionButton("查看清理预览", "btn-ghost", loadServerRetention),
-      actionButton("立即执行清理", "btn-danger", pruneServerRetention)
-    ),
-    retentionBody
-  );
-
   const panelServer = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, connCard, deployCard),
-    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appUpdateCard, retentionCard)
+    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appUpdateCard)
   );
 
-  // ==================== PANEL 2: 备份策略 ====================
+  // ==================== PANEL 2: 备份参数策略 ====================
   const policyCard = h(
     "div",
     { class: "card" },
@@ -479,22 +428,8 @@ export function mount(root, store) {
     h("div", { class: "section", style: { marginTop: "20px" } }, advancedCard)
   );
 
-  // ==================== PANEL 3: 任务与 Hooks ====================
-  const daemonBadge = h("span", { class: "badge" }, "…");
+  // ==================== PANEL 3: 定时任务与钩子 ====================
   const hooksBadge = h("span", { class: "badge" }, "…");
-
-  const daemonCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, h("span", {}, "后台守护进程 (Daemon)"), daemonBadge),
-    h("p", { class: "card-desc" }, "以前台循环或终端挂载的形式运行：按周期同步轻量快照、补发失败快照、监控内容 digest。"),
-    h(
-      "div",
-      { class: "card-actions" },
-      actionButton("启动 Daemon", "btn-primary", () => run("start-daemon", { okMsg: "Daemon 已在后台线程启动" })),
-      actionButton("停止 Daemon", "btn-ghost", () => run("stop-daemon", { okMsg: "已发送停止 Daemon 信号" }))
-    )
-  );
 
   const hooksCard = h(
     "div",
@@ -608,11 +543,26 @@ export function mount(root, store) {
   );
 
   const panelAutomation = h("div", { class: "tab-panel" },
-    h("div", { class: "grid grid-2" }, daemonCard, hooksCard),
-    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appInstallCard, taskCard)
+    h("div", { class: "grid grid-2" }, hooksCard, taskCard),
+    h("div", { class: "grid grid-2", style: { marginTop: "20px" } }, appInstallCard)
   );
 
-  // ==================== PANEL 4: 高级同步诊断 ====================
+  // ==================== PANEL 4: 后台服务与诊断 ====================
+  const daemonBadge = h("span", { class: "badge" }, "…");
+
+  const daemonCard = h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, h("span", {}, "后台守护进程 (Daemon)"), daemonBadge),
+    h("p", { class: "card-desc" }, "以前台循环或终端挂载的形式运行：按周期同步轻量快照、补发失败快照、监控内容 digest。"),
+    h(
+      "div",
+      { class: "card-actions" },
+      actionButton("启动 Daemon", "btn-primary", () => run("start-daemon", { okMsg: "Daemon 已在后台线程启动" })),
+      actionButton("停止 Daemon", "btn-ghost", () => run("stop-daemon", { okMsg: "已发送停止 Daemon 信号" }))
+    )
+  );
+
   const diagCard = h(
     "div",
     { class: "card" },
@@ -629,39 +579,8 @@ export function mount(root, store) {
     )
   );
 
-  const tableBody = h("tbody", {});
-  const snapCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, h("span", {}, "云端轻量快照历史"), actionButton("刷新快照列表", "btn-ghost btn-sm", () => fetchSnapshots(store, { force: true }))),
-    h("p", { class: "card-desc" }, "快照仅记录最近的 cwd、Git 补丁大小与最近活跃时间，主要用于工作现场的紧急诊断。"),
-    h(
-      "div",
-      { class: "table-wrap" },
-      h(
-        "table",
-        { class: "table" },
-        h(
-          "thead",
-          {},
-          h(
-            "tr",
-            {},
-            h("th", {}, "发送设备"),
-            h("th", {}, "项目路径"),
-            h("th", {}, "上传时间（本机）"),
-            h("th", {}, "快照 ID"),
-            h("th", {}, "诊断操作")
-          )
-        ),
-        tableBody
-      )
-    )
-  );
-
   const panelDiagnosis = h("div", { class: "tab-panel" },
-    h("div", { class: "section" }, diagCard),
-    h("div", { class: "section" }, snapCard)
+    h("div", { class: "grid grid-2" }, daemonCard, diagCard)
   );
 
   // ==================== TAB 切换逻辑 ====================
@@ -670,7 +589,7 @@ export function mount(root, store) {
     { id: "server", label: "服务器与部署", panel: panelServer },
     { id: "policy", label: "备份参数策略", panel: panelPolicy },
     { id: "automation", label: "定时任务与 Hooks", panel: panelAutomation },
-    { id: "diagnosis", label: "高级故障诊断", panel: panelDiagnosis }
+    { id: "diagnosis", label: "后台服务与诊断", panel: panelDiagnosis }
   ];
 
   function switchTab(tabId) {
@@ -690,8 +609,6 @@ export function mount(root, store) {
     } else if (tabId === "automation") {
       refreshTaskStatus();
       refreshAppInstall();
-    } else if (tabId === "diagnosis") {
-      fetchSnapshots(store, { force: false }).catch(() => {});
     }
   }
 
@@ -818,17 +735,19 @@ export function mount(root, store) {
     startupToggleBtn.disabled = !supported || (!installable && !installedAvailable);
 
     if (data.error) {
-      appInstallBody.replaceChildren(h("div", { class: "status-line error" }, data.error));
+      const errNodes = [h("div", { class: "status-line error" }, data.error)];
+      appInstallBody.replaceChildren(...errNodes.filter(Boolean));
       return;
     }
     if (!supported) {
-      appInstallBody.replaceChildren(h("div", { class: "status-line warn" }, "本机安装和开机自启仅支持 Windows EXE。"));
+      const unsupportedNodes = [h("div", { class: "status-line warn" }, "本机安装和开机自启仅支持 Windows EXE。")];
+      appInstallBody.replaceChildren(...unsupportedNodes.filter(Boolean));
       return;
     }
 
     const runMode = installedHere ? "已从安装目录运行" : installedAvailable ? "当前是便携位置运行" : "未安装";
     const startupText = startup.enabled ? (startup.target_exists === false ? "已开启，但目标不存在" : "已开启") : "未开启";
-    appInstallBody.replaceChildren(
+    const nodes = [
       h(
         "div",
         { class: "result-facts" },
@@ -848,47 +767,8 @@ export function mount(root, store) {
           : installedHere
             ? h("div", { class: "status-line ok" }, "当前正在使用固定安装位置，自启和快捷方式不会随解压目录移动而失效。")
             : null
-    );
-  }
-
-  function renderRetention() {
-    if (retentionLoading) {
-      retentionBody.replaceChildren(loadingSpinner("正在读取服务器留存状态…"));
-      return;
-    }
-    if (!retentionData) {
-      retentionBody.replaceChildren(h("div", { class: "empty compact" }, "尚未读取服务器留存状态。"));
-      return;
-    }
-    if (retentionData.success === false || retentionData.error) {
-      retentionBody.replaceChildren(h("div", { class: "status-line error" }, retentionData.error || "读取失败"));
-      return;
-    }
-    const policy = asObject(retentionData.policy);
-    const full = asObject(policy.full_backups);
-    const project = asObject(policy.project_backups);
-    const snapshots = asObject(policy.snapshots);
-    const usage = asObject(retentionData.usage);
-    const planned = Number(retentionData.planned_count || 0);
-    const actionCount = retentionData.dry_run ? planned : Number(retentionData.deleted_count ?? planned);
-    const actionBytes = retentionData.dry_run ? retentionData.planned_bytes : (retentionData.deleted_bytes ?? retentionData.planned_bytes);
-    retentionBody.replaceChildren(
-      h(
-        "div",
-        { class: "result-facts" },
-        fact("完整备份策略", `每设备/分支 ${full.keep_per_device_branch ?? "-"} 份 · ${full.max_age_days ?? "-"} 天`),
-        fact("项目备份策略", `每项目/设备 ${project.keep_per_repo_device ?? "-"} 份 · ${project.max_age_days ?? "-"} 天`),
-        fact("轻量快照策略", `每设备 ${snapshots.keep_per_device ?? "-"} 条 · ${snapshots.max_age_days ?? "-"} 天`),
-        fact("服务器容量上限", formatBytes(policy.server_total_max_bytes)),
-        fact("当前备份占用", formatBytes(usage.backup_bytes)),
-        fact("当前记录", `完整 ${usage.full_backup_count || 0} · 项目 ${usage.project_backup_count || 0} · 快照 ${usage.snapshot_count || 0}`),
-        fact(retentionData.dry_run ? "预览删除" : "本次删除", `${actionCount} 项 · ${formatBytes(actionBytes)}`),
-        fact("已保护入口", `${usage.protected_count || 0} 项`)
-      ),
-      Array.isArray(retentionData.warnings) && retentionData.warnings.length
-        ? h("div", { class: "status-line warn" }, retentionData.warnings.join("；"))
-        : null
-    );
+    ];
+    appInstallBody.replaceChildren(...nodes.filter(Boolean));
   }
 
   function renderCompatibility() {
@@ -905,7 +785,7 @@ export function mount(root, store) {
     const features = Array.isArray(expected.required_features) ? expected.required_features : [];
     const missing = Array.isArray(compatData.missing_features) ? compatData.missing_features : [];
     const tone = compatData.compatible ? "ok" : compatData.needs_update ? "warn" : "danger";
-    compatBody.replaceChildren(
+    const nodes = [
       h(
         "div",
         { class: "result-section" },
@@ -931,7 +811,8 @@ export function mount(root, store) {
             ? h("div", { class: "status-line error" }, compatData.error)
             : null
       )
-    );
+    ];
+    compatBody.replaceChildren(...nodes.filter(Boolean));
   }
 
   function renderAppUpdate() {
@@ -957,7 +838,7 @@ export function mount(root, store) {
     const tone = appUpdateData.update_available ? "warn" : "ok";
     downloadUpdateBtn.disabled = !asset.url;
     openUpdateBtn.disabled = false;
-    appUpdateBody.replaceChildren(
+    const nodes = [
       h(
         "div",
         { class: "result-section" },
@@ -982,44 +863,13 @@ export function mount(root, store) {
             ? h("div", { class: "status-line warn" }, "有新版可用。下载后请退出当前应用，再解压并运行新版 EXE。")
             : h("div", { class: "status-line ok" }, "当前 EXE 与 GitHub 最新 Release 一致。")
       )
-    );
+    ];
+    appUpdateBody.replaceChildren(...nodes.filter(Boolean));
   }
-
-  const renderTable = () => {
-    const { items, loading, error } = store.getState().snapshots;
-    if (loading && !items.length) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, loadingSpinner("正在拉取远程快照…"))));
-      return;
-    }
-    if (error) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, `拉取失败：${error}`)));
-      return;
-    }
-    if (!items.length) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, "暂无快照历史")));
-      return;
-    }
-    tableBody.replaceChildren(...items.map(snap => {
-      const snapObj = asObject(snap);
-      const mini = (label, intent) => {
-        const b = h("button", { class: "btn btn-ghost btn-sm", type: "button" }, label);
-        b.addEventListener("click", () => openSnapshot(store, snapObj, intent));
-        return b;
-      };
-      return h("tr", {},
-        h("td", {}, snapObj.device_id || "-"),
-        h("td", { class: "mono cell-ellipsis", title: snapObj.cwd || "" }, snapObj.cwd || "-"),
-        h("td", { title: snapObj.created_at ? `UTC: ${snapObj.created_at}` : "" }, formatDateTime(snapObj.created_at)),
-        h("td", { class: "mono", title: snapObj.id || "" }, snapObj.id ? shortId(snapObj.id) : "-"),
-        h("td", {}, h("div", { class: "row-actions" }, mini("详情", "detail"), mini("接续", "resume"), mini("还原", "restore")))
-      );
-    }));
-  };
 
   syncFields();
   syncBadges();
   loadDeployConfig();
-  renderRetention();
   renderCompatibility();
   renderAppUpdate();
   renderAppInstall();
@@ -1031,14 +881,12 @@ export function mount(root, store) {
   const uConfig = store.select(s => s.status?.config, syncFields);
   const uStatus = store.select(s => s.status, syncBadges);
   const uAppInstall = store.select(s => s.status?.app_install, renderAppInstall);
-  const uSnapshots = store.select(s => s.snapshots, renderTable);
   const uCon = store.select(s => s.console, () => setOutput(store.getState().console));
 
   return () => {
     uConfig();
     uStatus();
     uAppInstall();
-    uSnapshots();
     uCon();
   };
 }

@@ -353,7 +353,7 @@ export function mount(root, store) {
     const isRepo = Boolean(state.is_repo);
     const enabled = Boolean(state.enabled_for_git_commit);
     const last = asObject(state.last);
-    autoBackupCard.replaceChildren(
+    const nodes = [
       h(
         "div",
         { class: "card-title" },
@@ -378,7 +378,8 @@ export function mount(root, store) {
         actionButton("处理待备份队列", "btn-ghost", processAutoBackupQueue),
         actionButton("刷新自动备份状态", "btn-ghost", () => refreshAutoBackupStatus(true))
       )
-    );
+    ];
+    autoBackupCard.replaceChildren(...nodes.filter(Boolean));
   }
 
   function renderServerBackups() {

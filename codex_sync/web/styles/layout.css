@@ -70,19 +70,49 @@
   padding-top: 4px;
 }
 .nav-item {
-  padding: 9px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  margin: 2px 0;
   border-radius: var(--radius);
   color: var(--text-secondary);
   font-weight: 550;
-  transition: background var(--transition), color var(--transition);
+  font-size: 13px;
+  position: relative;
+  transition: all var(--transition);
+}
+.nav-item .nav-icon {
+  flex-shrink: 0;
+  opacity: 0.65;
+  transition: opacity var(--transition), transform var(--transition), stroke var(--transition);
 }
 .nav-item:hover {
   background: var(--bg-elev-2);
   color: var(--text);
 }
+.nav-item:hover .nav-icon {
+  opacity: 1;
+  transform: translateX(2px);
+}
 .nav-item.active {
   background: var(--accent-soft);
   color: var(--text);
+}
+.nav-item.active .nav-icon {
+  opacity: 1;
+  color: var(--accent);
+}
+.nav-item.active::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 25%;
+  width: 4px;
+  height: 50%;
+  background: var(--accent-gradient);
+  border-radius: 99px;
+  box-shadow: 0 0 10px var(--accent);
 }
 
 .sidebar-foot {

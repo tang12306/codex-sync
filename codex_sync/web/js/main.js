@@ -10,10 +10,11 @@ import { $ } from "./dom.js";
 const store = createStore(initialState());
 
 const VIEW_META = {
-  overview: ["首页", "数据同步与灾备状态"],
-  conversations: ["对话与备份", "管理 Windows/WSL 的完整对话备份、导入迁移、渠道合并与浏览"],
-  project: ["项目备份", "选择项目目录并上传代码快照到同步服务器"],
-  settings: ["系统设置", "配置服务器凭证、调整备份策略、控制后台任务与高级故障诊断"],
+  overview: ["系统概览", "本机同步拓扑与状态大盘"],
+  conversations: ["对话与渠道", "合并多渠道对话、还原历史记录、检索与浏览对话正文"],
+  project: ["项目同步", "备份当前项目代码快照、安装 Git 提交触发并执行恢复"],
+  backups: ["备份与恢复", "控制 Windows/WSL 完整备份、下载云端快照或恢复历史备份"],
+  settings: ["系统设置", "配置云端凭证、一键部署服务器、调整备份策略参数及安装 Windows 定时任务"],
 };
 
 const viewRoot = $("view-root");

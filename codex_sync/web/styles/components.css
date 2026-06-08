@@ -211,15 +211,19 @@
   background: var(--text-muted);
   margin-right: 6px;
   vertical-align: middle;
+  position: relative;
 }
 .dot.ok {
   background: var(--ok);
+  box-shadow: 0 0 8px var(--ok);
 }
 .dot.danger {
   background: var(--danger);
+  box-shadow: 0 0 8px var(--danger);
 }
 .dot.warn {
   background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
 }
 .badge {
   display: inline-block;
@@ -229,35 +233,46 @@
   border: 1px solid var(--border);
   color: var(--text-secondary);
   font-family: var(--font-mono);
+  background: rgba(255, 255, 255, 0.03);
+  transition: all var(--transition);
 }
 .badge.ok,
 .badge.clean {
   color: var(--ok);
-  border-color: var(--ok);
+  border-color: rgba(16, 185, 129, 0.3);
+  background: var(--ok-soft);
 }
 .badge.warn,
 .badge.changed {
   color: var(--warn);
-  border-color: var(--warn);
+  border-color: rgba(245, 158, 11, 0.3);
+  background: var(--warn-soft);
 }
 .badge.danger {
   color: var(--danger);
-  border-color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.3);
+  background: var(--danger-bg);
 }
 .conn-pill {
   font-size: 12px;
-  padding: 4px 10px;
+  padding: 4px 12px;
   border-radius: 999px;
   border: 1px solid var(--border);
   color: var(--text-secondary);
+  background: rgba(255, 255, 255, 0.02);
+  transition: all var(--transition);
 }
 .conn-pill[data-state="ok"] {
   color: var(--ok);
-  border-color: var(--ok);
+  border-color: rgba(16, 185, 129, 0.4);
+  background: var(--ok-soft);
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.15);
 }
 .conn-pill[data-state="down"] {
   color: var(--danger);
-  border-color: var(--danger);
+  border-color: rgba(239, 68, 68, 0.4);
+  background: var(--danger-bg);
+  box-shadow: 0 0 10px rgba(239, 68, 68, 0.15);
 }
 
 /* ---------- 同步链路拓扑 ---------- */
@@ -1538,7 +1553,7 @@
 
 /* ---------- 现代高级美学重载 (Premium Aesthetics Override) ---------- */
 body {
-  background: radial-gradient(circle at 50% 0%, #101424 0%, #030712 100%) !important;
+  background: radial-gradient(circle at 50% 0%, hsl(var(--bg-h), 35%, 8%) 0%, hsl(var(--bg-h), 25%, 3%) 100%) !important;
   background-attachment: fixed !important;
 }
 
@@ -1546,24 +1561,26 @@ body {
 .card, .metric, .sidebar, .topbar, .drawer-panel, .logs-panel {
   backdrop-filter: blur(20px) !important;
   -webkit-backdrop-filter: blur(20px) !important;
-  background-color: rgba(17, 24, 39, 0.65) !important;
+  background-color: hsla(var(--bg-h), 22%, 9%, 0.72) !important;
   border: 1px solid rgba(255, 255, 255, 0.08) !important;
-  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37) !important;
+  box-shadow: var(--card-shadow) !important;
 }
 
 .card, .metric {
   transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: 0 4px 20px 0 rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.03) !important;
 }
 
 .card:hover, .metric:hover {
-  border-color: rgba(99, 102, 241, 0.4) !important;
-  transform: translateY(-2px);
-  box-shadow: 0 12px 40px 0 rgba(0, 0, 0, 0.45), 0 0 15px rgba(99, 102, 241, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.1) !important;
+  border-color: rgba(99, 102, 241, 0.45) !important;
+  transform: translateY(-3px);
+  box-shadow: 0 20px 48px 0 rgba(0, 0, 0, 0.5), 0 0 25px rgba(99, 102, 241, 0.18), inset 0 1px 0 rgba(255, 255, 255, 0.12) !important;
 }
 
 /* 按钮渐变与发光 */
 .btn {
   transition: all var(--transition);
+  border: 1px solid rgba(255, 255, 255, 0.08);
 }
 
 .btn-primary {
@@ -1583,14 +1600,25 @@ body {
   transform: translateY(1px);
 }
 
+.btn-ghost {
+  background: rgba(255, 255, 255, 0.02) !important;
+  border-color: rgba(255, 255, 255, 0.08) !important;
+}
+.btn-ghost:hover {
+  background: rgba(255, 255, 255, 0.08) !important;
+  border-color: rgba(255, 255, 255, 0.2) !important;
+  color: #ffffff !important;
+  transform: translateY(-1px);
+}
+
 /* 二级 Tab 设计（子页面导航页签） */
 .sub-tabs {
   display: flex;
   gap: 6px;
-  background: rgba(3, 7, 18, 0.6);
+  background: rgba(3, 7, 18, 0.5) !important;
   padding: 4px;
   border-radius: var(--radius-lg);
-  border: 1px solid var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.06);
   margin-bottom: 20px;
   width: fit-content;
 }
@@ -1604,11 +1632,12 @@ body {
   font-size: 13px;
   font-weight: 600;
   transition: all var(--transition);
+  cursor: pointer;
 }
 
 .sub-tab-btn:hover {
   color: var(--text);
-  background: rgba(255, 255, 255, 0.05);
+  background: rgba(255, 255, 255, 0.06);
 }
 
 .sub-tab-btn.active {
@@ -1624,19 +1653,59 @@ body {
 }
 
 .nav-item.active {
-  background: var(--accent-gradient) !important;
+  background: rgba(99, 102, 241, 0.08) !important;
   color: #fff !important;
-  box-shadow: 0 4px 15px rgba(99, 102, 241, 0.35) !important;
+  box-shadow: none !important;
 }
 
 .sidebar {
-  border-right: 1px solid var(--border) !important;
-  background: rgba(11, 15, 27, 0.8) !important;
+  border-right: 1px solid rgba(255, 255, 255, 0.06) !important;
+  background: hsla(var(--bg-h), 22%, 6%, 0.8) !important;
 }
 
 .topbar {
-  border-bottom: 1px solid var(--border) !important;
-  background: rgba(11, 15, 27, 0.85) !important;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06) !important;
+  background: hsla(var(--bg-h), 22%, 6%, 0.85) !important;
+}
+
+/* 输入框聚焦效果 */
+.input {
+  background: var(--bg-inset) !important;
+  border: 1px solid rgba(255, 255, 255, 0.08) !important;
+  color: var(--text) !important;
+  transition: all var(--transition) !important;
+}
+.input:focus {
+  outline: none !important;
+  border-color: var(--accent) !important;
+  box-shadow: 0 0 10px rgba(99, 102, 241, 0.25) !important;
+}
+
+/* 状态呼吸动画 */
+@keyframes pulse-ok {
+  0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+@keyframes pulse-warn {
+  0% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(245, 158, 11, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(245, 158, 11, 0); }
+}
+@keyframes pulse-danger {
+  0% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4); }
+  70% { box-shadow: 0 0 0 6px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+.dot.ok {
+  animation: pulse-ok 2s infinite;
+}
+.dot.warn {
+  animation: pulse-warn 2s infinite;
+}
+.dot.danger {
+  animation: pulse-danger 2s infinite;
 }
 
 /* Spinner 缓冲旋转特效 */

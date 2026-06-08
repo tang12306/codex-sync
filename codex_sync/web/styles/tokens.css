@@ -1,51 +1,59 @@
-/* 设计变量：现代精致暗色，融合渐变与发光微动效 */
+/* 设计变量：现代极客精美暗色，融合微光渐变、玻璃拟态与发光动效 */
 :root {
-  /* 背景：深邃暗色阶梯 */
-  --bg: #0b0f17;
-  --bg-elev-1: #111827;
-  --bg-elev-2: #1f2937;
-  --bg-inset: #030712;
+  /* HSL 调色底盘 (224° 深空蓝) */
+  --bg-h: 224;
 
-  /* 边框：带微透精致细线 */
-  --border: rgba(55, 65, 81, 0.5);
-  --border-strong: rgba(75, 85, 99, 0.8);
+  /* 背景：深邃且有层次的暗色阶梯 */
+  --bg: hsl(var(--bg-h), 25%, 5%);
+  --bg-elev-1: hsl(var(--bg-h), 22%, 9%);
+  --bg-elev-2: hsl(var(--bg-h), 18%, 14%);
+  --bg-elev-3: hsl(var(--bg-h), 16%, 19%);
+  --bg-inset: hsl(var(--bg-h), 30%, 3%);
 
-  /* 文本：多层次高可读 */
-  --text: #f3f4f6;
-  --text-secondary: #9ca3af;
-  --text-muted: #6b7280;
+  /* 边框：高度精细的半透明细微描边 */
+  --border: rgba(255, 255, 255, 0.06);
+  --border-strong: rgba(255, 255, 255, 0.12);
+  --border-glow: rgba(99, 102, 241, 0.15);
 
-  /* 强调色：蓝青霓虹渐变（New API 风格） */
-  --accent: #4f46e5;
-  --accent-hover: #6366f1;
-  --accent-soft: rgba(79, 70, 229, 0.1);
+  /* 文本：对比度舒适的层次色 */
+  --text: #f8fafc;
+  --text-secondary: #cbd5e1;
+  --text-muted: #64748b;
+
+  /* 强调色：蓝紫/青色霓虹渐变（现代 API 控制台风格） */
+  --accent: #6366f1;
+  --accent-hover: #818cf8;
+  --accent-soft: rgba(99, 102, 241, 0.08);
   --on-accent: #ffffff;
   
-  /* 现代渐变色 */
-  --accent-gradient: linear-gradient(135deg, #4f46e5, #06b6d4);
-  --accent-gradient-hover: linear-gradient(135deg, #6366f1, #22d3ee);
-  --accent-glow: 0 0 15px rgba(79, 70, 229, 0.35);
+  /* 渐变与阴影光晕 */
+  --accent-gradient: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
+  --accent-gradient-hover: linear-gradient(135deg, #818cf8 0%, #22d3ee 100%);
+  --accent-glow: 0 0 20px rgba(99, 102, 241, 0.3);
+  --card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
 
   /* 语义色 */
   --ok: #10b981;
+  --ok-soft: rgba(16, 185, 129, 0.1);
   --warn: #f59e0b;
+  --warn-soft: rgba(245, 158, 11, 0.1);
   --danger: #ef4444;
   --danger-hover: #f87171;
-  --danger-bg: rgba(239, 68, 68, 0.1);
+  --danger-bg: rgba(239, 68, 68, 0.08);
 
-  /* 字体：Outfit & Inter 现代英文与系统无衬线中文 */
+  /* 字体：Outfit + Inter 现代无衬线英文与系统优雅中文 */
   --font-sans: 'Outfit', 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
     "PingFang SC", "Microsoft YaHei", sans-serif;
   --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular",
     "Liberation Mono", Menlo, monospace;
 
-  /* 形状/节奏 */
+  /* 形状/圆角/节奏 */
   --radius: 12px;
   --radius-sm: 8px;
   --radius-lg: 16px;
-  --transition: 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 
-  /* 尺寸 */
-  --sidebar-w: 240px;
-  --topbar-h: 70px;
+  /* 尺寸限制 */
+  --sidebar-w: 260px;
+  --topbar-h: 75px;
 }

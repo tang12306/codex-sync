@@ -226,7 +226,7 @@ function buildHealth({ health, busy, store, run, refresh }) {
   const local = asObject(health.local);
   const pending = Array.isArray(health.pending_devices) ? health.pending_devices : [];
   const needs = Boolean(local.needs_upload);
-  card.replaceChildren(
+  const nodes = [
     title,
     h(
       "div",
@@ -251,7 +251,8 @@ function buildHealth({ health, busy, store, run, refresh }) {
           })
         )
       : null
-  );
+  ];
+  card.replaceChildren(...nodes.filter(Boolean));
   return card;
 }
 

@@ -1,6 +1,6 @@
 // 极简 hash 路由。
 
-export const ROUTES = ["overview", "conversations", "project", "settings"];
+export const ROUTES = ["overview", "conversations", "project", "backups", "settings"];
 export const DEFAULT_ROUTE = "overview";
 
 export function currentRoute() {
