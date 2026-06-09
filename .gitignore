@@ -31,3 +31,7 @@ _*_domcheck.mjs
 # 本地运行/发布产物
 /.codex-sync/
 /codex_snapshots/
+
+# 代码分析工具缓存（勿提交）
+/.codegraph/
+/.reasonix/

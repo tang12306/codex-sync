@@ -4,6 +4,8 @@ import base64
 import hashlib
 import json
 import shutil
+import threading
+import time
 import urllib.error
 import urllib.request
 import uuid
@@ -59,14 +61,47 @@ DENY_PARTS = {
 }
 
 
-def git_root(cwd: str | Path | None = None) -> Path | None:
+# git_root/git_state 走多个 git 子进程；status() 每 5s 轮询与 sync-health 都会反复调用。
+# 用进程内短期缓存（按 cwd 键，monotonic + TTL）合并这些重复调用，避免持续 fork git。
+# 备份/内容指纹等需要实时结果的调用方传 max_age=0 绕过缓存。
+_GIT_CACHE_TTL = 10.0
+_git_root_cache: dict[str, tuple[float, Path | None]] = {}
+_git_state_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+_git_cache_lock = threading.Lock()
+
+
+def _git_cache_key(cwd: str | Path | None) -> str:
+    if cwd is None:
+        try:
+            return str(Path.cwd())
+        except OSError:
+            return "."
+    return str(cwd)
+
+
+def _compute_git_root(cwd: str | Path | None = None) -> Path | None:
     code, out, _ = run_cmd(["git", "rev-parse", "--show-toplevel"], cwd=cwd)
     if code != 0 or not out:
         return None
     return Path(out).resolve()
 
 
-def git_state(cwd: str | Path | None = None) -> dict[str, Any]:
+def git_root(cwd: str | Path | None = None, max_age: float = _GIT_CACHE_TTL) -> Path | None:
+    if max_age <= 0:
+        return _compute_git_root(cwd)
+    key = _git_cache_key(cwd)
+    now = time.monotonic()
+    with _git_cache_lock:
+        entry = _git_root_cache.get(key)
+        if entry is not None and now - entry[0] <= max_age:
+            return entry[1]
+    root = _compute_git_root(cwd)
+    with _git_cache_lock:
+        _git_root_cache[key] = (time.monotonic(), root)
+    return root
+
+
+def _compute_git_state(cwd: str | Path | None = None) -> dict[str, Any]:
     root = git_root(cwd)
     if not root:
         return {"is_repo": False}
@@ -89,6 +124,22 @@ def git_state(cwd: str | Path | None = None) -> dict[str, Any]:
         "remote_origin": remote_url,
         "untracked": [line for line in untracked.splitlines() if line.strip()],
     }
+
+
+def git_state(cwd: str | Path | None = None, max_age: float = _GIT_CACHE_TTL) -> dict[str, Any]:
+    """读取 Git 工作区状态。默认走 max_age 秒的进程内缓存；调用方修改返回 dict 顶层是安全的（返回浅拷贝），但不要原地修改 untracked 列表。"""
+    if max_age <= 0:
+        return _compute_git_state(cwd)
+    key = _git_cache_key(cwd)
+    now = time.monotonic()
+    with _git_cache_lock:
+        entry = _git_state_cache.get(key)
+        if entry is not None and now - entry[0] <= max_age:
+            return dict(entry[1])
+    state = _compute_git_state(cwd)
+    with _git_cache_lock:
+        _git_state_cache[key] = (time.monotonic(), state)
+    return dict(state)
 
 
 def _is_safe_untracked(path: Path) -> bool:
@@ -159,7 +210,7 @@ def create_patch_snapshot(cwd: str | Path | None, config: AppConfig) -> dict[str
     root = git_root(cwd)
     if not root:
         raise RuntimeError("Current directory is not inside a Git repository.")
-    state = git_state(root)
+    state = git_state(root, max_age=0)
     stamp = utc_now().replace(":", "").replace("+", "Z")
     repo_name = safe_filename(root.name)
     snapshot_dir = app_dir() / "snapshots" / repo_name / stamp
@@ -201,7 +252,7 @@ def create_commit_patch_snapshot(cwd: str | Path | None, config: AppConfig, comm
     code, commit, err = run_cmd(["git", "rev-parse", ref], cwd=root)
     if code != 0 or not commit:
         raise RuntimeError(f"git rev-parse failed: {err}")
-    state = git_state(root)
+    state = git_state(root, max_age=0)
     stamp = utc_now().replace(":", "").replace("+", "Z")
     repo_name = safe_filename(root.name)
     snapshot_dir = app_dir() / "snapshots" / repo_name / stamp
@@ -218,7 +269,7 @@ def create_commit_patch_snapshot(cwd: str | Path | None, config: AppConfig, comm
 
 def create_full_project_snapshot(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
     root = _project_root(cwd)
-    project = git_state(root)
+    project = git_state(root, max_age=0)
     if project.get("is_repo"):
         return create_filesystem_project_snapshot(root, config, project=project)
     return create_filesystem_project_snapshot(root, config)

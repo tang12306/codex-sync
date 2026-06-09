@@ -4,6 +4,10 @@ import { runAction } from "../api.js";
 import { makeRun, actionButton, formatDateTime } from "../ui.js";
 import { showToast } from "../toast.js";
 
+const HEALTH_CACHE_MS = 60 * 1000;
+const COMPATIBILITY_CACHE_MS = 5 * 60 * 1000;
+const APP_UPDATE_CACHE_MS = 60 * 60 * 1000;
+
 export function mount(root, store) {
   const run = makeRun(store);
   const appUpdateWrap = h("div", { class: "section" });
@@ -25,16 +29,29 @@ export function mount(root, store) {
     statusWrap
   );
 
-  let appUpdate = null;
+  const cachedOverview = asObject(store.getState().overview);
+
+  const saveOverview = (patch) => {
+    store.setState((state) => ({ overview: { ...asObject(state.overview), ...patch } }));
+  };
+
+  let appUpdate = cachedOverview.appUpdate || null;
+  let appUpdateLoadedAt = Number(cachedOverview.appUpdateLoadedAt || 0);
   let appUpdateBusy = false;
   const renderAppUpdate = () => {
     appUpdateWrap.replaceChildren(buildAppUpdate({ appUpdate, busy: appUpdateBusy, refresh: refreshAppUpdate, run }));
   };
   async function refreshAppUpdate(force = false) {
+    if (!force && appUpdateLoadedAt && Date.now() - appUpdateLoadedAt < APP_UPDATE_CACHE_MS) {
+      renderAppUpdate();
+      return;
+    }
     appUpdateBusy = true;
     renderAppUpdate();
     try {
       appUpdate = await runAction("app-update-check", { force });
+      appUpdateLoadedAt = Date.now();
+      saveOverview({ appUpdate, appUpdateLoadedAt });
       if (appUpdate.update_available) {
         const key = `codex-sync-update-${appUpdate.latest_version || "latest"}`;
         if (!sessionStorage.getItem(key)) {
@@ -44,31 +61,43 @@ export function mount(root, store) {
       }
     } catch (e) {
       appUpdate = { success: false, error: String(e.message || e) };
+      appUpdateLoadedAt = Date.now();
+      saveOverview({ appUpdate, appUpdateLoadedAt });
     }
     appUpdateBusy = false;
     renderAppUpdate();
   }
 
-  let compatibility = null;
+  let compatibility = cachedOverview.compatibility || null;
+  let compatibilityLoadedAt = Number(cachedOverview.compatibilityLoadedAt || 0);
   let compatibilityBusy = false;
   const renderCompatibility = () => {
     versionWrap.replaceChildren(buildCompatibility({ compatibility, busy: compatibilityBusy, refresh: refreshCompatibility }));
   };
-  async function refreshCompatibility() {
+  async function refreshCompatibility(force = false) {
+    if (!force && compatibilityLoadedAt && Date.now() - compatibilityLoadedAt < COMPATIBILITY_CACHE_MS) {
+      renderCompatibility();
+      return;
+    }
     compatibilityBusy = true;
     renderCompatibility();
     try {
       compatibility = await runAction("server-compatibility");
+      compatibilityLoadedAt = Date.now();
+      saveOverview({ compatibility, compatibilityLoadedAt });
     } catch (e) {
       compatibility = { success: false, compatible: false, error: String(e.message || e) };
+      compatibilityLoadedAt = Date.now();
+      saveOverview({ compatibility, compatibilityLoadedAt });
     }
     compatibilityBusy = false;
     renderCompatibility();
   }
 
-  let health = null;
+  let health = cachedOverview.health || null;
+  let healthLoadedAt = Number(cachedOverview.healthLoadedAt || 0);
   let healthBusy = false;
-  let healthExpanded = false;
+  let healthExpanded = Boolean(cachedOverview.healthExpanded);
   const renderHealth = () => {
     healthWrap.replaceChildren(buildHealth({
       health,
@@ -76,20 +105,29 @@ export function mount(root, store) {
       expanded: healthExpanded,
       toggle: () => {
         healthExpanded = !healthExpanded;
+        saveOverview({ healthExpanded });
         renderHealth();
       },
       store,
       run,
-      refresh: refreshHealth,
+      refresh: () => refreshHealth(true),
     }));
   };
-  async function refreshHealth() {
+  async function refreshHealth(force = false) {
+    if (!force && healthLoadedAt && Date.now() - healthLoadedAt < HEALTH_CACHE_MS) {
+      renderHealth();
+      return;
+    }
     healthBusy = true;
     renderHealth();
     try {
-      health = await runAction("sync-health");
+      health = await runAction("sync-health", { force });
+      healthLoadedAt = Date.now();
+      saveOverview({ health, healthLoadedAt, healthExpanded });
     } catch (e) {
       health = { success: false, error: String(e.message || e) };
+      healthLoadedAt = Date.now();
+      saveOverview({ health, healthLoadedAt, healthExpanded });
     }
     healthBusy = false;
     renderHealth();
@@ -183,7 +221,7 @@ function buildCompatibility({ compatibility, busy, refresh }) {
       "div",
       { class: "card-actions" },
       actionButton("去更新服务器", "btn-primary", async () => { window.location.hash = "#/settings"; }),
-      actionButton("重新检查", "btn-ghost", refresh)
+      actionButton("重新检查", "btn-ghost", () => refresh(true))
     )
   );
 }

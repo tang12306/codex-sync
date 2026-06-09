@@ -23,7 +23,7 @@ def run_daemon(config: AppConfig, stop_check: Callable[[], bool] | None = None, 
             if log:
                 log(f"{utc_now()} flush_outbox: {flushed}")
             if config.full_backup_enabled:
-                full_backup = scan_full_backup_changes(config, create_package=True, notify_dirty=True, check_remote=True)
+                full_backup = scan_full_backup_changes(config, create_package=True, notify_dirty=True, check_remote=True, upload=True)
                 if log:
                     log(f"{utc_now()} full_backup_scan: {full_backup}")
                 remote_state = get_remote_device_state(config)

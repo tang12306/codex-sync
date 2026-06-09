@@ -14,6 +14,7 @@ const CONFIRM_MSG =
 
 const browseCache = {
   homes: null,
+  workspaceByHome: new Map(),
   channelsByHome: new Map(),
   conversationsByHome: new Map(),
 };
@@ -201,20 +202,67 @@ function mountBrowse(container, run, store, setOutput) {
       renderHomeOptions(false);
       return;
     }
+    await loadWorkspace(force);
+  }
+
+  function cacheKey() {
+    return sourceHome || "all";
+  }
+
+  function clearWorkspaceCache() {
+    browseCache.workspaceByHome.clear();
+    browseCache.channelsByHome.clear();
+    browseCache.conversationsByHome.clear();
+  }
+
+  function applyWorkspace(workspace) {
+    homes = Array.isArray(workspace?.homes) ? workspace.homes : homes;
+    browseCache.homes = homes;
+    const rawConversations = workspace?.conversations && typeof workspace.conversations === "object"
+      ? workspace.conversations
+      : { success: false, error: workspace?.error || "加载对话工作区失败" };
+    const rawChannels = workspace?.channels && typeof workspace.channels === "object"
+      ? workspace.channels
+      : { success: false, error: workspace?.error || "加载渠道工作区失败" };
+    browseCache.conversationsByHome.set(cacheKey(), rawConversations);
+    browseCache.channelsByHome.set(cacheKey(), rawChannels);
+    conversationsData = filterConversations(rawConversations);
+    channelsData = rawChannels;
+  }
+
+  async function loadWorkspace(force = false, probeHomes = false) {
     if (force) {
-      browseCache.channelsByHome.clear();
-      browseCache.conversationsByHome.clear();
+      clearWorkspaceCache();
     }
+    const key = cacheKey();
+    if (!force && browseCache.workspaceByHome.has(key)) {
+      applyWorkspace(browseCache.workspaceByHome.get(key));
+      renderHomeOptions(false);
+      syncConversationFilters();
+      fillTargetProviderOptions();
+      renderList();
+      renderBatch();
+      return;
+    }
+    busy = true;
     renderHomeOptions(true);
+    renderBatch();
     try {
-      const result = await runAction("list-codex-homes");
-      homes = Array.isArray(result.homes) ? result.homes : [];
-      browseCache.homes = homes;
-    } catch {
+      const workspace = await runAction("conversation-workspace", { source_home: sourceHome, force, probe_homes: probeHomes });
+      browseCache.workspaceByHome.set(key, workspace);
+      applyWorkspace(workspace);
+    } catch(e) {
       homes = [{ id: "windows", kind: "windows", label: "Windows", ok: true, has_codex: true }];
       browseCache.homes = homes;
+      conversationsData = { success: false, error: String(e.message || e) };
+      channelsData = { success: false, error: String(e.message || e) };
     }
+    busy = false;
     renderHomeOptions(false);
+    syncConversationFilters();
+    fillTargetProviderOptions();
+    renderList();
+    renderBatch();
   }
 
   function convKey(c) {
@@ -238,12 +286,11 @@ function mountBrowse(container, run, store, setOutput) {
   }
 
   async function refreshAll(force = false) {
-    await Promise.all([loadChannelsData(force), refreshConversations(force)]);
+    await loadWorkspace(force);
   }
 
   async function refreshEnvironment() {
-    await loadHomes(true);
-    await refreshAll(true);
+    await loadWorkspace(true, true);
   }
 
   homeSel.addEventListener("change", async () => {
@@ -263,12 +310,7 @@ function mountBrowse(container, run, store, setOutput) {
       fillTargetProviderOptions();
       return;
     }
-    try {
-      channelsData = await runAction("list-channels", { source_home: sourceHome });
-      browseCache.channelsByHome.set(cacheKey, channelsData);
-    } catch(e) {
-      channelsData = { success: false, error: String(e.message || e) };
-    }
+    await loadWorkspace(force);
     fillTargetProviderOptions();
   }
 
@@ -283,20 +325,7 @@ function mountBrowse(container, run, store, setOutput) {
       return;
     }
 
-    busy = true;
-    renderBatch();
-    try {
-      const raw = await runAction("list-conversations", { source_home: sourceHome, search: "", cwd: "", provider: "" });
-      browseCache.conversationsByHome.set(cacheKey, raw);
-      conversationsData = filterConversations(raw);
-    } catch (e) {
-      conversationsData = { success: false, error: String(e.message || e) };
-    }
-    busy = false;
-    syncConversationFilters();
-    fillTargetProviderOptions();
-    renderList();
-    renderBatch();
+    await loadWorkspace(force);
   }
 
   function filterConversations(data) {
@@ -507,7 +536,7 @@ function mountBrowse(container, run, store, setOutput) {
   renderHomeOptions(true);
   listWrap.replaceChildren(loadingSpinner("正在检测本机环境…"));
   detailWrap.replaceChildren(h("div", { class: "empty" }, "点击左侧对话标题查看具体正文"));
-  loadHomes(false).finally(() => refreshAll(false));
+  loadWorkspace(false);
 
   return () => {
     clearTimeout(searchTimer);
@@ -534,7 +563,7 @@ function mountChannels(container, run, store, setOutput) {
       { class: "card-actions", style: { marginBottom: "15px" } },
       homeSel,
       actionButton("刷新渠道", "btn-ghost btn-sm", () => refreshChannels(true)),
-      actionButton("刷新运行环境", "btn-ghost btn-sm", () => loadHomes(true))
+      actionButton("刷新运行环境", "btn-ghost btn-sm", () => loadWorkspace(true, true))
     ),
     channelsCardBody
   );
@@ -571,20 +600,55 @@ function mountChannels(container, run, store, setOutput) {
       renderHomeOptions(false);
       return;
     }
+    await loadWorkspace(force);
+  }
+
+  function cacheKey() {
+    return sourceHome || "windows";
+  }
+
+  function clearWorkspaceCache() {
+    browseCache.workspaceByHome.clear();
+    browseCache.channelsByHome.clear();
+    browseCache.conversationsByHome.clear();
+  }
+
+  function applyWorkspace(workspace) {
+    homes = Array.isArray(workspace?.homes) ? workspace.homes : homes;
+    browseCache.homes = homes;
+    channelsData = workspace?.channels && typeof workspace.channels === "object"
+      ? workspace.channels
+      : { success: false, error: workspace?.error || "加载渠道工作区失败" };
+    browseCache.channelsByHome.set(cacheKey(), channelsData);
+    if (workspace?.conversations && typeof workspace.conversations === "object") {
+      browseCache.conversationsByHome.set(cacheKey(), workspace.conversations);
+    }
+  }
+
+  async function loadWorkspace(force = false, probeHomes = false) {
     if (force) {
-      browseCache.channelsByHome.clear();
-      browseCache.conversationsByHome.clear();
+      clearWorkspaceCache();
+    }
+    const key = cacheKey();
+    if (!force && browseCache.workspaceByHome.has(key)) {
+      applyWorkspace(browseCache.workspaceByHome.get(key));
+      renderHomeOptions(false);
+      renderChannels();
+      return;
     }
     renderHomeOptions(true);
+    channelsCardBody.replaceChildren(loadingSpinner("正在加载渠道分布数据…"));
     try {
-      const result = await runAction("list-codex-homes");
-      homes = Array.isArray(result.homes) ? result.homes : [];
-      browseCache.homes = homes;
-    } catch {
+      const workspace = await runAction("conversation-workspace", { source_home: sourceHome, force, probe_homes: probeHomes });
+      browseCache.workspaceByHome.set(key, workspace);
+      applyWorkspace(workspace);
+    } catch(e) {
       homes = [{ id: "windows", kind: "windows", label: "Windows", ok: true, has_codex: true }];
       browseCache.homes = homes;
+      channelsData = { success: false, error: String(e.message || e) };
     }
     renderHomeOptions(false);
+    renderChannels();
   }
 
   homeSel.addEventListener("change", async () => {
@@ -599,14 +663,7 @@ function mountChannels(container, run, store, setOutput) {
       renderChannels();
       return;
     }
-    channelsCardBody.replaceChildren(loadingSpinner("正在加载渠道分布数据…"));
-    try {
-      channelsData = await runAction("list-channels", { source_home: sourceHome });
-      browseCache.channelsByHome.set(cacheKey, channelsData);
-    } catch(e) {
-      channelsData = { success: false, error: String(e.message || e) };
-    }
-    renderChannels();
+    await loadWorkspace(force);
   }
 
   async function submitChannelOp(action, opts, label) {
@@ -675,6 +732,7 @@ function mountChannels(container, run, store, setOutput) {
     const writable = channelsData.write_supported !== false && sourceHome !== "all";
     const cur = channelsData.current_provider || "(未知)";
     const running = Boolean(channelsData.codex_running);
+    const runningKnown = channelsData.codex_running_known !== false;
     const merged = channelsData.merged || {};
 
     const rows = (channelsData.channels || []).map(c => {
@@ -700,7 +758,7 @@ function mountChannels(container, run, store, setOutput) {
     const originKeys = Object.keys(origins).sort();
 
     const runBadge = writable
-      ? h("span", { class: `badge ${running ? "warn" : "ok"}` }, running ? "Codex 运行中" : "Codex 未运行")
+      ? h("span", { class: `badge ${!runningKnown || running ? "warn" : "ok"}` }, runningKnown ? (running ? "Codex 运行中" : "Codex 未运行") : "操作时确认运行状态")
       : h("span", { class: "badge warn" }, "只读");
 
     const nodes = [
@@ -762,7 +820,7 @@ function mountChannels(container, run, store, setOutput) {
     );
   }
 
-  loadHomes(false).finally(() => refreshChannels(false));
+  loadWorkspace(false);
 
   return () => {};
 }

@@ -6,10 +6,12 @@ import unittest
 import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
+from unittest import mock
 
 import sync_server
 from codex_sync.config import AppConfig
 from codex_sync.full_backup import (
+    build_full_backup_manifest,
     create_full_backup_package,
     download_full_backup,
     full_backup_now,
@@ -51,6 +53,37 @@ class FullBackupTests(unittest.TestCase):
                 second = create_full_backup_package(AppConfig(device_id="full-test"), force=False)
                 self.assertFalse(second["created"])
                 self.assertEqual(second["reason"], "no changes")
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+                if old_codex is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex
+
+    def test_full_backup_manifest_reuses_cached_file_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as codex_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            old_codex = os.environ.get("CODEX_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            os.environ["CODEX_HOME"] = codex_home
+            try:
+                root = Path(codex_home)
+                (root / "sessions").mkdir()
+                session = root / "sessions" / "session.jsonl"
+                session.write_text("conversation", encoding="utf-8")
+
+                first = build_full_backup_manifest(AppConfig(device_id="cache-test"))
+                self.assertEqual(first["scan_stats"]["hash_miss_count"], 1)
+                self.assertEqual(first["scan_stats"]["cache_hit_count"], 0)
+
+                with mock.patch("codex_sync.full_backup._hash_file", side_effect=AssertionError("hash cache miss")):
+                    second = build_full_backup_manifest(AppConfig(device_id="cache-test"))
+                self.assertEqual(second["content_digest"], first["content_digest"])
+                self.assertEqual(second["scan_stats"]["hash_miss_count"], 0)
+                self.assertEqual(second["scan_stats"]["cache_hit_count"], 1)
             finally:
                 if old_sync is None:
                     os.environ.pop("CODEX_SYNC_HOME", None)
@@ -125,6 +158,55 @@ class FullBackupTests(unittest.TestCase):
                     self.assertTrue(delayed["success"])
                     self.assertFalse(delayed["device_state"]["dirty"])
                     self.assertEqual(delayed["device_state"]["sync_state"], "clean")
+                finally:
+                    httpd.shutdown()
+                    httpd.server_close()
+                    thread.join(timeout=5)
+            finally:
+                sync_server.DATA_DIR = old_data_dir
+                sync_server.DB_PATH = old_db_path
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+                if old_codex is None:
+                    os.environ.pop("CODEX_HOME", None)
+                else:
+                    os.environ["CODEX_HOME"] = old_codex
+
+    def test_full_backup_now_uploads_existing_unuploaded_package(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as data_dir:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            old_codex = os.environ.get("CODEX_HOME")
+            old_data_dir = sync_server.DATA_DIR
+            old_db_path = sync_server.DB_PATH
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            os.environ["CODEX_HOME"] = codex_home
+            try:
+                root = Path(codex_home)
+                (root / "sessions").mkdir()
+                (root / "sessions" / "session.jsonl").write_text("conversation", encoding="utf-8")
+
+                sync_server.DATA_DIR = Path(data_dir).resolve()
+                sync_server.DB_PATH = sync_server.DATA_DIR / "snapshots.sqlite3"
+                sync_server.init_db()
+                token = "existing-package-token"
+                sync_server.SyncHandler.token = token
+                httpd = ThreadingHTTPServer(("127.0.0.1", 0), sync_server.SyncHandler)
+                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+                thread.start()
+                cfg = AppConfig(server_url=f"http://127.0.0.1:{httpd.server_port}", api_token=token, device_id="existing-package-device")
+                try:
+                    local = full_backup_now(cfg, force=True, upload=False)
+                    self.assertTrue(local["success"])
+                    self.assertTrue(local["created"])
+
+                    uploaded = full_backup_now(cfg, upload=True)
+                    self.assertTrue(uploaded["success"])
+                    self.assertTrue(uploaded["uploaded"])
+                    self.assertFalse(uploaded["created"])
+                    self.assertEqual(uploaded["upload"]["backup_id"], local["backup_id"])
+                    self.assertEqual(uploaded["upload"]["device_state"]["head_backup_id"], local["backup_id"])
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

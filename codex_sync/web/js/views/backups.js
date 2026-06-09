@@ -246,14 +246,22 @@ function mountFullBackups(container, run, store, setOutput) {
 
   async function restoreSelected() {
     const home = selected();
-    if (home.kind !== "wsl") {
-      showToast("Windows 完整恢复请使用 CLI restore-full-backup 并确认包 ID，以防误操作覆盖。", "warning");
-      return;
+    if (home.kind === "wsl") {
+      if (!window.confirm(`将把最近一份 WSL 完整备份还原到 ${home.label}。默认不覆盖 config.toml 配置文件。继续吗？`)) return;
+      return run("wsl-restore-latest", {
+        payload: { distro: home.distro, restore_config: false },
+        okMsg: "WSL 备份已还原"
+      });
     }
-    if (!window.confirm(`将把最近一份 WSL 完整备份还原到 ${home.label}。默认不覆盖 config.toml 配置文件。继续吗？`)) return;
-    return run("wsl-restore-latest", {
-      payload: { distro: home.distro, restore_config: false },
-      okMsg: "WSL 备份已还原"
+    if (!window.confirm(
+      "将从云端拉取最新的完整对话备份并还原到本机 ~/.codex（“合盖即走”的接力恢复）。\n\n" +
+      "· 恢复前会自动创建一次本地灾难备份（preflight）以防万一\n" +
+      "· 默认不覆盖 config.toml / AGENTS.md 等配置文件\n" +
+      "· 加密包需要本机已设置相同的加密口令，或已导入对应密钥\n\n确认从云端恢复最新对话吗？"
+    )) return;
+    return run("restore-latest-full-backup", {
+      payload: { restore_config: false },
+      okMsg: "已从云端拉取并恢复最新完整对话备份"
     });
   }
 

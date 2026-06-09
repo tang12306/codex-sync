@@ -109,6 +109,14 @@ export function mount(root, store) {
     toggleToken.textContent = show ? "隐藏" : "显示";
   });
 
+  const encPass = (f.full_backup_encryption_passphrase = bindDirty(h("input", { class: "input", type: "password", placeholder: "留空保持不变" })));
+  const toggleEncPass = h("button", { class: "input-affix", type: "button" }, "显示");
+  toggleEncPass.addEventListener("click", () => {
+    const show = encPass.type === "password";
+    encPass.type = show ? "text" : "password";
+    toggleEncPass.textContent = show ? "隐藏" : "显示";
+  });
+
   const connCard = h(
     "div",
     { class: "card" },
@@ -125,7 +133,18 @@ export function mount(root, store) {
       ),
       h("div", { class: "input-wrap" }, apiToken, toggleToken)
     ),
-    field("device_id", "Device ID", "这台机器在云端的唯一设备标识", { type: "text" })
+    field("device_id", "Device ID", "这台机器在云端的唯一设备标识", { type: "text" }),
+    h(
+      "div",
+      { class: "field" },
+      h(
+        "label",
+        { class: "field-label" },
+        h("span", {}, "完整备份加密密码"),
+        h("span", { class: "field-hint" }, "两台电脑填同一密码即可互相恢复；设置后自动启用加密、关闭明文上传")
+      ),
+      h("div", { class: "input-wrap" }, encPass, toggleEncPass)
+    )
   );
 
   const { card: deployOut, setOutput: setDeployOut } = consoleCard("部署终端输出");
@@ -390,8 +409,9 @@ export function mount(root, store) {
     toggle("full_backup_include_config", "完整包包含配置", "把本地 Agent 的预设和全局系统配置打包归档"),
     toggle("full_backup_include_memories", "完整包包含记忆库", "把本地 Agent 的 memories 长期记忆目录一并打包"),
     toggle("full_backup_encryption_enabled", "完整包客户端加密", "默认开启；跨设备恢复时请在其它设备设置相同口令，或复制本机私有 key 文件"),
+    toggle("full_backup_auto_upload", "完整包自动上传云端", "开启后：会话静默期结束即由后台自动加密上传，无需手动点击，是“合盖即走”的关键开关"),
     toggle("full_backup_allow_plaintext_upload", "允许云端明文上传", "仅用于兼容旧明文包；关闭客户端加密后仍需显式允许才能上传完整正文 zip"),
-    toggle("project_auto_backup_on_codex_stop", "Codex 关闭时入队项目备份", "可选：Stop hook 只记录待备份任务，后台再上传当前 Git 项目")
+    toggle("project_auto_backup_on_codex_stop", "Codex 关闭时自动兜底项目", "默认开启：每次 Codex 停止即把当前项目（含未提交改动）排队，由后台自动上传，避免漏备")
   );
 
   const appBehaviorCard = h(
@@ -418,16 +438,29 @@ export function mount(root, store) {
     field("sync_interval_minutes", "Daemon 同步轮询周期（分钟）", "守护进程的后台事件上传周期", { type: "number", min: "1", step: "1" }),
     field("max_untracked_copy_mb", "项目文件单体大小上限（MB）", "项目备份中，超过此大小的未跟踪文件将被跳过", { type: "number", min: "0", step: "1" }),
     field("disaster_backup_min_interval_hours", "灾难备份冷冻周期（小时）", "多长时间内仅允许自动创建一次灾难备份，防止 IO 开销", { type: "number", min: "0", step: "1" }),
-    field("full_backup_encryption_passphrase", "完整备份加密口令", "留空保持不变；多设备使用同一口令即可解密彼此的云端完整包", { type: "password", autocomplete: "new-password" }),
     field("full_backup_quiet_minutes", "完整备份安静期时长（分钟）", "会话内容停止变化后，等待多久再生成本地大包", { type: "number", min: "0", step: "1" }),
     field("project_auto_backup_min_interval_minutes", "项目自动备份最短间隔（分钟）", "用于 Git 提交和 Codex Stop 触发，避免频繁上传", { type: "number", min: "0", step: "1" }),
     field("full_backup_retention_count", "本地备份留存数量限制", "本地 full_backups 最大保留包数，0表示不限制", { type: "number", min: "0" }),
     field("full_backup_retention_max_gb", "本地备份留存容量限制（GB）", "本地 full_backups 最大允许占用的磁盘空间，0 表示不限制", { type: "number", min: "0", step: "0.5" })
   );
 
+  const keyCard = h(
+    "div",
+    { class: "card" },
+    h("div", { class: "card-title" }, "完整备份加密密钥（跨设备）"),
+    h("p", { class: "card-desc" }, "“合盖即走”要在另一台电脑解密云端完整对话包：要么两台机器填相同的上方「完整备份加密口令」，要么在此导出本机密钥、到另一台「从文件导入」。密钥为明文，请仅经可信通道传输，绝不会上传服务器。"),
+    h(
+      "div",
+      { class: "card-actions" },
+      actionButton("导出本机密钥", "btn-primary", () => run("export-encryption-key", { okMsg: "密钥已导出，请妥善保管该文件" })),
+      actionButton("从文件导入密钥", "btn-ghost", () => run("import-encryption-key", { okMsg: "密钥已导入本机" }))
+    )
+  );
+
   const panelPolicy = h("div", { class: "tab-panel" },
     h("div", { class: "grid grid-2" }, policyCard, appBehaviorCard),
-    h("div", { class: "section", style: { marginTop: "20px" } }, advancedCard)
+    h("div", { class: "section", style: { marginTop: "20px" } }, advancedCard),
+    h("div", { class: "section", style: { marginTop: "20px" } }, keyCard)
   );
 
   // ==================== PANEL 3: 定时任务与钩子 ====================
@@ -647,6 +680,7 @@ export function mount(root, store) {
       full_backup_include_config: f.full_backup_include_config.checked,
       full_backup_include_memories: f.full_backup_include_memories.checked,
       full_backup_encryption_enabled: f.full_backup_encryption_enabled.checked,
+      full_backup_auto_upload: f.full_backup_auto_upload.checked,
       full_backup_allow_plaintext_upload: f.full_backup_allow_plaintext_upload.checked,
       project_auto_backup_on_codex_stop: f.project_auto_backup_on_codex_stop.checked,
       full_backup_quiet_seconds: fromUnit(f.full_backup_quiet_minutes.value, 60, 60),
@@ -701,6 +735,7 @@ export function mount(root, store) {
     setIfUnfocused(f.full_backup_include_config, cfg.full_backup_include_config);
     setIfUnfocused(f.full_backup_include_memories, cfg.full_backup_include_memories);
     setIfUnfocused(f.full_backup_encryption_enabled, cfg.full_backup_encryption_enabled !== false);
+    setIfUnfocused(f.full_backup_auto_upload, cfg.full_backup_auto_upload !== false);
     setIfUnfocused(f.full_backup_allow_plaintext_upload, cfg.full_backup_allow_plaintext_upload);
     setIfUnfocused(f.project_auto_backup_on_codex_stop, cfg.project_auto_backup_on_codex_stop);
     setIfUnfocused(f.full_backup_quiet_minutes, toUnit(cfg.full_backup_quiet_seconds, 60));

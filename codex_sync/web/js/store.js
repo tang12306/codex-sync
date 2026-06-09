@@ -60,5 +60,14 @@ export function initialState() {
     },
     logs: { filter: "all", search: "", autoScroll: true, panelOpen: false },
     console: null,
+    overview: {
+      appUpdate: null,
+      appUpdateLoadedAt: 0,
+      compatibility: null,
+      compatibilityLoadedAt: 0,
+      health: null,
+      healthLoadedAt: 0,
+      healthExpanded: false,
+    },
   };
 }

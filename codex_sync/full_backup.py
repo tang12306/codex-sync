@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import tempfile
+import time
 import urllib.request
 import uuid
 import zipfile
@@ -100,6 +101,7 @@ ENCRYPTION_AAD = b"codex-sync-full-backup-v1"
 ENCRYPTION_KDF_ITERATIONS = 390_000
 ENCRYPTION_ENV_VAR = "CODEX_SYNC_FULL_BACKUP_PASSPHRASE"
 ENCRYPTION_KEY_FILE = "full-backup-encryption.key"
+HASH_CACHE_VERSION = 1
 
 
 def full_backup_dir() -> Path:
@@ -445,6 +447,29 @@ def _hash_path(path: Path) -> str:
     return _hash_file(path)
 
 
+def _hash_cache_entries(state: dict[str, Any], root: Path) -> dict[str, Any]:
+    cache = state.get("file_hash_cache")
+    if not isinstance(cache, dict):
+        return {}
+    if cache.get("version") != HASH_CACHE_VERSION:
+        return {}
+    if str(cache.get("root") or "") != str(root):
+        return {}
+    entries = cache.get("entries")
+    return entries if isinstance(entries, dict) else {}
+
+
+def _cache_hit(entry: Any, stat: os.stat_result) -> str | None:
+    if not isinstance(entry, dict):
+        return None
+    if int(entry.get("bytes") or -1) != int(stat.st_size):
+        return None
+    if int(entry.get("mtime_ns") or -1) != int(stat.st_mtime_ns):
+        return None
+    sha256 = str(entry.get("sha256") or "")
+    return sha256 if sha256 else None
+
+
 def _manifest_digest(files: list[dict[str, Any]]) -> str:
     digest = hashlib.sha256()
     for item in files:
@@ -458,13 +483,20 @@ def _manifest_digest(files: list[dict[str, Any]]) -> str:
 
 
 def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
+    scan_start = time.perf_counter()
     root = codex_home()
     state = _remember_branch(config, _read_state())
+    cached_hashes = _hash_cache_entries(state, root)
+    next_hashes: dict[str, Any] = {}
     included: list[dict[str, Any]] = []
     skipped: list[dict[str, Any]] = []
+    cache_hits = 0
+    hash_misses = 0
+    hashed_bytes = 0
     total = 0
 
-    for file in _iter_candidate_files(root, config):
+    candidates = _iter_candidate_files(root, config)
+    for file in candidates:
         rel = file.relative_to(root).as_posix()
         try:
             stat = file.stat()
@@ -478,11 +510,18 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
         if total + size > config.full_backup_max_total_bytes:
             skipped.append({"path": rel, "reason": "backup size limit", "bytes": size})
             continue
-        try:
-            sha256 = _hash_file(file)
-        except OSError as exc:
-            skipped.append({"path": rel, "reason": str(exc), "bytes": size})
-            continue
+        sha256 = _cache_hit(cached_hashes.get(rel), stat)
+        if sha256:
+            cache_hits += 1
+        else:
+            try:
+                sha256 = _hash_file(file)
+            except OSError as exc:
+                skipped.append({"path": rel, "reason": str(exc), "bytes": size})
+                continue
+            hash_misses += 1
+            hashed_bytes += size
+        next_hashes[rel] = {"bytes": size, "mtime_ns": stat.st_mtime_ns, "sha256": sha256}
         included.append(
             {
                 "path": rel,
@@ -494,6 +533,20 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
         total += size
 
     digest = _manifest_digest(included)
+    scan_ms = int((time.perf_counter() - scan_start) * 1000)
+    scan_stats = {
+        "candidate_count": len(candidates),
+        "included_count": len(included),
+        "included_bytes": total,
+        "skipped_count": len(skipped),
+        "cache_hit_count": cache_hits,
+        "hash_miss_count": hash_misses,
+        "hashed_bytes": hashed_bytes,
+        "scan_ms": scan_ms,
+    }
+    state["file_hash_cache"] = {"version": HASH_CACHE_VERSION, "root": str(root), "entries": next_hashes}
+    state["last_manifest_scan"] = scan_stats
+    _write_state(state)
     backup_id = str(uuid.uuid4())
     encrypted = bool(getattr(config, "full_backup_encryption_enabled", True))
     return {
@@ -512,6 +565,7 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
         "included_bytes": total,
         "files": included,
         "skipped": skipped,
+        "scan_stats": scan_stats,
         "excluded_by_policy": sorted(DENY_NAMES),
         "include_config": config.full_backup_include_config,
         "include_memories": config.full_backup_include_memories,
@@ -519,16 +573,21 @@ def build_full_backup_manifest(config: AppConfig) -> dict[str, Any]:
 
 
 def create_full_backup_package(config: AppConfig, force: bool = False, manifest: dict[str, Any] | None = None) -> dict[str, Any]:
+    package_start = time.perf_counter()
     manifest = manifest or build_full_backup_manifest(config)
     prior = _read_state()
     if not force and prior.get("last_content_digest") == manifest["content_digest"]:
+        last_archive = str(prior.get("last_archive") or "")
+        manifest_path = str(_manifest_path_for_archive(Path(last_archive))) if last_archive else ""
         return {
             "created": False,
             "reason": "no changes",
             "content_digest": manifest["content_digest"],
+            "backup_id": prior.get("last_backup_id"),
             "last_backup_id": prior.get("last_backup_id"),
             "last_archive": prior.get("last_archive"),
-            "manifest": manifest,
+            "archive": last_archive or None,
+            "manifest": manifest_path if manifest_path and Path(manifest_path).exists() else manifest,
         }
 
     encrypted = bool(manifest.get("encrypted"))
@@ -543,6 +602,7 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
     root = codex_home()
     manifest["archive_name"] = archive.name
 
+    zip_start = time.perf_counter()
     with zipfile.ZipFile(plain_archive, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
         for item in manifest["files"]:
@@ -551,21 +611,34 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
             if not source.exists() or not _safe_file(source, root):
                 continue
             zf.write(source, arcname=f"codex/{rel}")
+    zip_ms = int((time.perf_counter() - zip_start) * 1000)
 
+    encrypt_ms = 0
     if encrypted:
+        encrypt_start = time.perf_counter()
         try:
             encryption_header = _write_encrypted_archive(plain_archive, archive, config, manifest)
             manifest["encryption_header"] = {key: value for key, value in encryption_header.items() if key != "secret_source"}
             manifest["encryption_key_source"] = encryption_header.get("secret_source")
         finally:
             plain_archive.unlink(missing_ok=True)
+        encrypt_ms = int((time.perf_counter() - encrypt_start) * 1000)
 
+    archive_hash_start = time.perf_counter()
     archive_sha256 = _hash_path(archive)
+    archive_hash_ms = int((time.perf_counter() - archive_hash_start) * 1000)
     archive_bytes = archive.stat().st_size
     manifest_path = _manifest_path_for_archive(archive)
     manifest["archive"] = str(archive)
     manifest["archive_sha256"] = archive_sha256
     manifest["archive_bytes"] = archive_bytes
+    timing = {
+        "zip_ms": zip_ms,
+        "encrypt_ms": encrypt_ms,
+        "archive_hash_ms": archive_hash_ms,
+        "total_ms": int((time.perf_counter() - package_start) * 1000),
+    }
+    manifest["package_timing"] = timing
     write_json(manifest_path, manifest)
     new_state = {
         **_remember_branch(config, prior),
@@ -589,6 +662,8 @@ def create_full_backup_package(config: AppConfig, force: bool = False, manifest:
         "included_count": manifest["included_count"],
         "included_bytes": manifest["included_bytes"],
         "skipped": manifest["skipped"],
+        "scan_stats": manifest.get("scan_stats"),
+        "timing": timing,
         "encrypted": encrypted,
         "encryption": manifest.get("encryption", "none"),
         "retention": retention,
@@ -810,6 +885,7 @@ def scan_full_backup_changes(
     force: bool = False,
     notify_dirty: bool = False,
     check_remote: bool = False,
+    upload: bool = False,
 ) -> dict[str, Any]:
     manifest = build_full_backup_manifest(config)
     state = _remember_branch(config, _read_state())
@@ -832,6 +908,7 @@ def scan_full_backup_changes(
         "parent_backup_id": manifest["parent_backup_id"],
         "included_count": manifest["included_count"],
         "included_bytes": manifest["included_bytes"],
+        "scan_stats": manifest.get("scan_stats"),
     }
     if remote_reconcile is not None:
         result["remote_reconcile"] = remote_reconcile
@@ -857,8 +934,13 @@ def scan_full_backup_changes(
             result["package_deferred"] = True
             result["package_deferred_reason"] = "waiting for full backup quiet period"
             return result
-        package = create_full_backup_package(config, force=True)
+        package = create_full_backup_package(config, force=True, manifest=manifest)
         result["package"] = package
+        if upload and package.get("created") and getattr(config, "full_backup_auto_upload", True) and config.server_url:
+            try:
+                result["upload"] = upload_full_backup(config, package["archive"], manifest=manifest)
+            except Exception as exc:  # noqa: BLE001 - auto upload must not break the scan loop
+                result["upload"] = {"success": False, "error": str(exc)}
     return result
 
 
@@ -881,7 +963,10 @@ def upload_full_backup(
             "backup_id": manifest.get("id"),
         }
 
-    archive_sha256 = _hash_path(archive_path)
+    archive_bytes = archive_path.stat().st_size
+    archive_sha256 = str(manifest.get("archive_sha256") or "")
+    if not archive_sha256 or int(manifest.get("archive_bytes") or -1) != archive_bytes:
+        archive_sha256 = _hash_path(archive_path)
     metadata = {
         "id": manifest.get("id"),
         "type": "codex_full_backup",
@@ -894,7 +979,7 @@ def upload_full_backup(
         "included_count": manifest.get("included_count"),
         "included_bytes": manifest.get("included_bytes"),
         "archive_sha256": archive_sha256,
-        "archive_bytes": archive_path.stat().st_size,
+        "archive_bytes": archive_bytes,
         "encrypted": bool(manifest.get("encrypted")),
         "encryption": manifest.get("encryption", "none"),
     }
@@ -953,6 +1038,18 @@ def full_backup_now(config: AppConfig, force: bool = False, upload: bool = False
         result = {"success": True, "uploaded": False, **package}
         if remote_reconcile is not None:
             result["remote_reconcile"] = remote_reconcile
+        if upload and package.get("archive") and Path(str(package["archive"])).exists():
+            package_manifest = package.get("manifest")
+            if isinstance(package_manifest, str) and Path(package_manifest).exists():
+                manifest = json.loads(Path(package_manifest).read_text(encoding="utf-8"))
+            elif isinstance(package_manifest, dict) and str(package_manifest.get("id") or "") == str(package.get("backup_id") or ""):
+                manifest = package_manifest
+            else:
+                manifest = read_full_backup_manifest(config, str(package["archive"]))
+            if str(manifest.get("content_digest") or "") != str(package.get("content_digest") or ""):
+                manifest = build_full_backup_manifest(config)
+            uploaded = upload_full_backup(config, str(package["archive"]), manifest=manifest, allow_plaintext_upload=allow_plaintext_upload)
+            result.update({"success": bool(uploaded.get("success")), "uploaded": bool(uploaded.get("success")), "upload": uploaded})
         return result
     if not upload:
         return {"success": True, "uploaded": False, **package}
@@ -1079,4 +1176,128 @@ def restore_full_backup(config: AppConfig, archive: str | Path, confirm_backup_i
         "restored": restored,
         "skipped": skipped,
         "preflight_backup": protection,
+    }
+
+
+def restore_latest_full_backup(
+    config: AppConfig,
+    *,
+    branch_id: str | None = None,
+    device_id: str | None = None,
+    restore_config: bool = False,
+) -> dict[str, Any]:
+    """从同步服务器拉取最新完整对话备份，下载、解密并恢复到本机 ~/.codex。
+
+    用于「合上 A 机，在 B 机一键接着干」：B 机设好相同加密口令后一键还原最新现场。
+    默认挑全局最新（两机场景即对方最新包）；可用 device_id / branch_id 精确指定来源。
+    """
+    listing = list_full_backups(config)
+    if not isinstance(listing, dict) or not listing.get("success"):
+        error = listing.get("error") if isinstance(listing, dict) else None
+        return {"success": False, "error": error or "无法获取云端完整备份列表"}
+    backups = listing.get("full_backups") or []
+    if not isinstance(backups, list) or not backups:
+        return {"success": False, "error": "云端没有任何完整对话备份可恢复"}
+    target_branch = branch_id or _branch_id(config)
+
+    def _pick(predicate):
+        for row in backups:  # 列表已按 received_at DESC，首个匹配即最新
+            if isinstance(row, dict) and row.get("id") and predicate(row):
+                return row
+        return None
+
+    chosen = None
+    if device_id:
+        chosen = _pick(lambda r: str(r.get("device_id") or "") == device_id)
+    if chosen is None and target_branch:
+        chosen = _pick(lambda r: str(r.get("branch_id") or "") == target_branch)
+    if chosen is None and not device_id:
+        chosen = _pick(lambda r: True)
+    if chosen is None:
+        return {"success": False, "error": "未找到匹配的完整对话备份", "branch_id": target_branch, "device_id": device_id}
+
+    backup_id = str(chosen.get("id"))
+    downloaded = download_full_backup(config, backup_id)
+    if not downloaded.get("success"):
+        return {"success": False, "error": downloaded.get("error") or "下载完整备份失败", "backup_id": backup_id, "selected": chosen}
+    result = restore_full_backup(config, downloaded["path"], confirm_backup_id=backup_id, restore_config=restore_config)
+    result.setdefault("backup_id", backup_id)
+    result["selected"] = chosen
+    result["downloaded"] = {"path": downloaded.get("path"), "bytes": downloaded.get("bytes"), "encrypted": downloaded.get("encrypted")}
+    return result
+
+
+def export_encryption_key(config: AppConfig, output_path: str | Path) -> dict[str, Any]:
+    """把当前生效的完整备份加密密钥导出到本地文件（明文！仅用于在可信通道间手动迁移到其它设备）。
+
+    密钥绝不经服务器；导出文件务必妥善保管。其它设备导入后即可解密本机上传的加密完整包。
+    """
+    secret, source = _encryption_secret(config, create=True)
+    if not secret:
+        return {"success": False, "error": "当前没有可导出的加密密钥"}
+    out = Path(output_path)
+    payload = {
+        "type": "codex_sync_full_backup_key",
+        "version": 1,
+        "created_at": utc_now(),
+        "key_id": _encryption_key_id(secret),
+        "secret": secret.decode("utf-8"),
+    }
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        write_json(out, payload)
+        try:
+            out.chmod(0o600)
+        except OSError:
+            pass
+    except OSError as exc:
+        return {"success": False, "error": f"写出密钥文件失败: {exc}", "path": str(out)}
+    return {
+        "success": True,
+        "path": str(out),
+        "key_id": payload["key_id"],
+        "source": source,
+        "warning": "该文件包含明文加密密钥，请通过可信通道保管/传输，切勿上传服务器或提交版本库。",
+    }
+
+
+def import_encryption_key(config: AppConfig, source_path: str | Path) -> dict[str, Any]:
+    """从导出的密钥文件导入完整备份加密密钥，写入本机私有 key 文件。
+
+    导入后本机即可解密用该密钥加密的云端完整包。若已配置加密口令（环境变量或设置），
+    口令优先级高于 key 文件，会提示用户。
+    """
+    src = Path(source_path)
+    if not src.exists():
+        return {"success": False, "error": f"密钥文件不存在: {src}"}
+    try:
+        raw = src.read_text(encoding="utf-8").strip()
+    except OSError as exc:
+        return {"success": False, "error": f"读取密钥文件失败: {exc}", "path": str(src)}
+    secret = ""
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            secret = str(data.get("secret") or "").strip()
+        elif isinstance(data, str):
+            secret = data.strip()
+    except json.JSONDecodeError:
+        secret = raw  # 容许纯文本密钥
+    if not secret:
+        return {"success": False, "error": "密钥文件中未找到 secret 字段或内容为空", "path": str(src)}
+    _write_encryption_key_file(secret)
+    key_id = _encryption_key_id(secret.encode("utf-8"))
+    cfg_secret = str(getattr(config, "full_backup_encryption_passphrase", "") or "").strip()
+    env_secret = os.environ.get(ENCRYPTION_ENV_VAR, "").strip()
+    shadowed = bool(env_secret or cfg_secret)
+    return {
+        "success": True,
+        "path": str(encryption_key_path()),
+        "key_id": key_id,
+        "shadowed_by_passphrase": shadowed,
+        "note": (
+            "注意：当前已配置加密口令（环境变量或设置），其优先级高于导入的 key 文件；如需改用导入的密钥，请清空口令。"
+            if shadowed
+            else "已写入本机私有 key 文件，可解密用该密钥加密的云端完整包。"
+        ),
     }

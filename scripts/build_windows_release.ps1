@@ -1,5 +1,5 @@
 param(
-    [string]$Version = "0.2.0"
+    [string]$Version = "0.3.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -23,6 +23,9 @@ python -m PyInstaller `
     --add-data "codex_sync\sync_server.py;codex_sync" `
     --collect-all webview `
     --collect-data codex_sync `
+    --hidden-import tkinter `
+    --hidden-import tkinter.ttk `
+    --hidden-import tkinter.filedialog `
     app_entry.py
 
 if ($LASTEXITCODE -ne 0) {

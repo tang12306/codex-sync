@@ -20,11 +20,14 @@ from .project_auto_backup import (
 )
 from .full_backup import (
     download_full_backup,
+    export_encryption_key,
     full_backup_now,
     get_remote_device_state,
+    import_encryption_key,
     list_full_backups,
     notify_codex_changed,
     restore_full_backup,
+    restore_latest_full_backup,
     scan_full_backup_changes,
 )
 from .server import (
@@ -75,6 +78,7 @@ def cmd_config(args: argparse.Namespace) -> None:
         "full_backup_encryption_enabled",
         "full_backup_encryption_passphrase",
         "full_backup_allow_plaintext_upload",
+        "full_backup_auto_upload",
         "full_backup_quiet_seconds",
         "full_backup_retention_count",
         "full_backup_retention_max_bytes",
@@ -118,7 +122,7 @@ def cmd_sync_now(args: argparse.Namespace) -> None:
     result: dict[str, object] = {"sync": sync_once(cfg, cwd=os.getcwd(), skip_unchanged=bool(args.skip_unchanged_snapshot))}
     result["flush_outbox"] = flush_outbox(cfg)
     if cfg.full_backup_enabled:
-        result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True)
+        result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True, upload=True)
         result["device_state"] = get_remote_device_state(cfg)
     result["project_auto_backup"] = process_project_auto_backup_queue(cfg)
     print_json(result)
@@ -293,6 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--full-backup-encryption-enabled", action=argparse.BooleanOptionalAction)
     p.add_argument("--full-backup-encryption-passphrase")
     p.add_argument("--full-backup-allow-plaintext-upload", action=argparse.BooleanOptionalAction)
+    p.add_argument("--full-backup-auto-upload", action=argparse.BooleanOptionalAction)
     p.add_argument("--full-backup-quiet-seconds", type=int)
     p.add_argument("--full-backup-retention-count", type=int)
     p.add_argument("--full-backup-retention-max-bytes", type=int)
@@ -377,6 +382,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--confirm-backup-id", required=True)
     p.add_argument("--restore-config", action="store_true")
     p.set_defaults(func=lambda args: print_json(restore_full_backup(load_config(), args.archive, confirm_backup_id=args.confirm_backup_id, restore_config=args.restore_config)))
+
+    p = sub.add_parser("restore-latest-full-backup", help="Pull the latest full conversation backup from the sync server and restore it locally.")
+    p.add_argument("--branch-id", default=None, help="Restore the latest backup on this branch id (defaults to this device's branch).")
+    p.add_argument("--device-id", default=None, help="Restore the latest backup uploaded by this device id.")
+    p.add_argument("--restore-config", action="store_true")
+    p.set_defaults(func=lambda args: print_json(restore_latest_full_backup(load_config(), branch_id=args.branch_id, device_id=args.device_id, restore_config=args.restore_config)))
+
+    p = sub.add_parser("export-encryption-key", help="Export the active full-backup encryption key to a local file (plaintext; keep it safe, never upload).")
+    p.add_argument("output", help="Path to write the exported key JSON file.")
+    p.set_defaults(func=lambda args: print_json(export_encryption_key(load_config(), args.output)))
+
+    p = sub.add_parser("import-encryption-key", help="Import a full-backup encryption key from a file into this machine's private key file.")
+    p.add_argument("source", help="Path to the exported key JSON file.")
+    p.set_defaults(func=lambda args: print_json(import_encryption_key(load_config(), args.source)))
 
     p = sub.add_parser("wsl-status", help="Detect WSL distros and Codex config.")
     p.set_defaults(func=lambda _args: print_json(wsl_status()))

@@ -21,6 +21,7 @@ import os
 import re
 import shutil
 import sqlite3
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -34,13 +35,44 @@ from .util import run_cmd, utc_now, write_json
 
 # ---------- 定位 Codex 数据与渠道 ----------
 
-def codex_state_db() -> Path:
-    """定位 Codex 桌面应用的状态库（state_*.sqlite，版本号可能变，取最新的）。"""
-    home = codex_home()
+# 一次「对话工作区」扫描会从 list_conversations / list_channels 等多处反复定位 state 库，
+# 每次都 glob+stat 整个 ~/.codex。用进程内短期缓存合并这些重复的文件系统扫描。
+_STATE_DB_CACHE_TTL = 5.0
+_state_db_cache: dict[str, tuple[float, Path]] = {}
+_state_db_cache_lock = threading.Lock()
+
+
+def _resolve_state_db(home: Path) -> Path:
     candidates = sorted(home.glob("state_*.sqlite"), key=lambda p: p.stat().st_mtime, reverse=True)
     if not candidates:
         raise FileNotFoundError(f"未找到 Codex 状态数据库 state_*.sqlite（目录 {home}）")
     return candidates[0]
+
+
+def codex_state_db(max_age: float = _STATE_DB_CACHE_TTL) -> Path:
+    """定位 Codex 桌面应用的状态库（state_*.sqlite，版本号可能变，取最新的）。
+
+    TTL 内直接复用缓存路径以跳过 glob+stat（仍校验文件存在，防 Codex 升级换库后用到失效路径）。
+    写操作（合并/还原）后会调 invalidate_state_db_cache() 主动失效。
+    """
+    home = codex_home()
+    key = str(home)
+    if max_age > 0:
+        now = time.monotonic()
+        with _state_db_cache_lock:
+            entry = _state_db_cache.get(key)
+            if entry is not None and now - entry[0] <= max_age and entry[1].exists():
+                return entry[1]
+    db = _resolve_state_db(home)
+    if max_age > 0:
+        with _state_db_cache_lock:
+            _state_db_cache[key] = (time.monotonic(), db)
+    return db
+
+
+def invalidate_state_db_cache() -> None:
+    with _state_db_cache_lock:
+        _state_db_cache.clear()
 
 
 def current_codex_provider() -> str | None:
@@ -190,7 +222,7 @@ def _rollout_set_provider(rollout_path: str | Path | None, provider: str) -> dic
 
 # ---------- 查询 ----------
 
-def list_channels() -> dict[str, Any]:
+def list_channels(check_running: bool = True) -> dict[str, Any]:
     try:
         db = codex_state_db()
     except FileNotFoundError as exc:
@@ -222,7 +254,8 @@ def list_channels() -> dict[str, Any]:
         "success": True,
         "db": str(db),
         "current_provider": current_codex_provider(),
-        "codex_running": codex_running(),
+        "codex_running": codex_running() if check_running else False,
+        "codex_running_known": bool(check_running),
         "channels": channels,
         "merged": {
             "total": len(merge_state),
@@ -301,6 +334,7 @@ def _merge_rows(config: AppConfig, db: Path, rows: list[sqlite3.Row], target: st
     finally:
         con.close()
     _write_merge_state(merge_state)
+    invalidate_state_db_cache()
     return {
         "success": True,
         "moved": len(moved),
@@ -407,6 +441,7 @@ def _restore_rows(config: AppConfig, db: Path, to_restore: dict[str, Any]) -> di
     for tid in to_restore:
         merge_state.pop(tid, None)
     _write_merge_state(merge_state)
+    invalidate_state_db_cache()
     return {
         "success": True,
         "restored": len(restored),

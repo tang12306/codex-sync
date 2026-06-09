@@ -127,7 +127,7 @@ def _content_id(root: Path, mode: str, config: AppConfig, commit_ref: str | None
     commit = _git_commit(root, commit_ref or "HEAD")
     if mode == "git_commit":
         return f"commit:{commit}"
-    status = git_state(root).get("status", "")
+    status = git_state(root, max_age=0).get("status", "")
     return f"worktree:{commit}:{status}"
 
 

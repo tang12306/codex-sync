@@ -31,12 +31,13 @@ class AppConfig:
     full_backup_encryption_enabled: bool = True
     full_backup_encryption_passphrase: str = ""
     full_backup_allow_plaintext_upload: bool = False
+    full_backup_auto_upload: bool = True
     full_backup_max_file_bytes: int = 256 * 1024 * 1024
     full_backup_max_total_bytes: int = 2 * 1024 * 1024 * 1024
     full_backup_quiet_seconds: int = 60
     full_backup_retention_count: int = 20
     full_backup_retention_max_bytes: int = 2 * 1024 * 1024 * 1024
-    project_auto_backup_on_codex_stop: bool = False
+    project_auto_backup_on_codex_stop: bool = True
     project_auto_backup_min_interval_seconds: int = 10 * 60
     desktop_close_behavior: str = "ask"  # ask | minimize_to_tray | exit
 

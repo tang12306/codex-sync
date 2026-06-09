@@ -229,11 +229,61 @@ class ChannelMergeTests(unittest.TestCase):
         counts = {c["provider"]: c["threads"] for c in res["channels"]}
         self.assertEqual(counts, {"openai": 2, "custom": 1, "anyrouter": 1})
         self.assertEqual(res["current_provider"], "custom")
+        self.assertTrue(res["codex_running_known"])
+
+    def test_list_channels_can_skip_running_check(self) -> None:
+        with mock.patch.object(codex_channels, "codex_running", side_effect=AssertionError("should not check running state")):
+            res = codex_channels.list_channels(check_running=False)
+        self.assertTrue(res["success"])
+        self.assertFalse(res["codex_running"])
+        self.assertFalse(res["codex_running_known"])
 
     def test_rollout_set_provider_handles_missing(self) -> None:
         res = codex_channels._rollout_set_provider(self.rollout_dir / "nope.jsonl", "custom")
         self.assertFalse(res["ok"])
         self.assertEqual(res["reason"], "missing")
+
+
+class CodexStateDbCacheTests(unittest.TestCase):
+    """codex_state_db 的进程内短期缓存：TTL 内复用、写后失效、max_age=0 绕过。"""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self.tmp.name)
+        (self.home / "state_1.sqlite").write_bytes(b"")
+        self._old_home = os.environ.get("CODEX_HOME")
+        os.environ["CODEX_HOME"] = str(self.home)
+        codex_channels.invalidate_state_db_cache()
+
+    def tearDown(self) -> None:
+        codex_channels.invalidate_state_db_cache()
+        if self._old_home is None:
+            os.environ.pop("CODEX_HOME", None)
+        else:
+            os.environ["CODEX_HOME"] = self._old_home
+        self.tmp.cleanup()
+
+    def test_caches_resolution_within_ttl(self) -> None:
+        with mock.patch.object(codex_channels, "_resolve_state_db", wraps=codex_channels._resolve_state_db) as resolve:
+            first = codex_channels.codex_state_db()
+            second = codex_channels.codex_state_db()
+        self.assertEqual(resolve.call_count, 1)  # 第二次命中缓存，跳过 glob+stat
+        self.assertEqual(first, second)
+
+    def test_invalidate_forces_reresolution(self) -> None:
+        codex_channels.codex_state_db()  # 预填缓存
+        with mock.patch.object(codex_channels, "_resolve_state_db", wraps=codex_channels._resolve_state_db) as resolve:
+            codex_channels.codex_state_db()
+            self.assertEqual(resolve.call_count, 0)  # 命中缓存
+            codex_channels.invalidate_state_db_cache()
+            codex_channels.codex_state_db()
+            self.assertEqual(resolve.call_count, 1)  # 失效后重新解析
+
+    def test_max_age_zero_bypasses_cache(self) -> None:
+        with mock.patch.object(codex_channels, "_resolve_state_db", wraps=codex_channels._resolve_state_db) as resolve:
+            codex_channels.codex_state_db(max_age=0)
+            codex_channels.codex_state_db(max_age=0)
+        self.assertEqual(resolve.call_count, 2)
 
 
 if __name__ == "__main__":

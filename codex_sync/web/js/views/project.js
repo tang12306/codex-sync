@@ -11,7 +11,7 @@ export function mount(root, store) {
   let projectStatus = asObject(store.getState().status?.git);
   let selectedPath = projectStatus.root || projectStatus.selected_path || store.getState().status?.cwd || "";
   let serverBackups = null;
-  let selectedProjectKey = "";
+  let expandedKeys = new Set();
   let serverBackupsHasMore = false;
   let autoBackupStatus = null;
   let loadingStatus = false;
@@ -76,7 +76,7 @@ export function mount(root, store) {
         : await runAction("list-project-backups", { limit: projectBackupPageSize, offset: 0 });
       const rows = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
       serverBackupsHasMore = rows.length >= projectBackupPageSize;
-      ensureSelectedProject();
+      ensureExpanded();
     } finally {
       loadingBackups = false;
       renderServerBackups();
@@ -108,7 +108,7 @@ export function mount(root, store) {
       serverBackupsHasMore = next.length >= projectBackupPageSize;
       setOutput(serverBackups);
       showToast(next.length ? `已加载更多：${next.length} 份` : "没有更多项目备份", "success");
-      ensureSelectedProject();
+      ensureExpanded();
     } finally {
       loadingMoreBackups = false;
       renderServerBackups();
@@ -386,9 +386,7 @@ export function mount(root, store) {
   function renderServerBackups() {
     const backups = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
     const groups = buildProjectGroups(backups);
-    if (!selectedProjectKey && groups.length) selectedProjectKey = groups[0].key;
-    const selected = groups.find((group) => group.key === selectedProjectKey) || groups[0] || null;
-    const query = projectSearchInput.value.trim().toLowerCase();
+    const query = groups.length > 1 ? projectSearchInput.value.trim().toLowerCase() : "";
     const visibleGroups = query
       ? groups.filter((group) => projectGroupSearchText(group).includes(query))
       : groups;
@@ -421,45 +419,42 @@ export function mount(root, store) {
         : backups.length
           ? h(
               "div",
-              { class: "project-library-grid" },
+              { class: "project-panels" },
+              groups.length > 1
+                ? h("div", { class: "field project-search-field" }, h("label", { class: "field-label" }, h("span", {}, "搜索项目")), projectSearchInput)
+                : null,
               h(
                 "div",
-                { class: "project-list-pane" },
-                h("div", { class: "field" }, h("label", { class: "field-label" }, h("span", {}, "项目搜索")), projectSearchInput),
-                h(
-                  "div",
-                  { class: "project-list" },
-                  visibleGroups.length
-                    ? visibleGroups.map((group) => projectGroupButton(group))
-                    : h("div", { class: "empty compact" }, "没有匹配的项目")
-                )
-              ),
-              h(
-                "div",
-                { class: "project-version-pane" },
-                selected
-                  ? renderProjectVersions(selected)
-                  : h("div", { class: "empty compact" }, "请选择一个项目")
+                { class: "project-panel-list" },
+                visibleGroups.length
+                  ? visibleGroups.map((group) => projectPanel(group))
+                  : h("div", { class: "empty compact" }, "没有匹配的项目")
               )
             )
-          : h("div", { class: "empty compact" }, loadingBackups ? "正在读取服务器备份…" : "还没有加载服务器备份，点击“刷新服务器备份”。")
+          : h("div", { class: "empty compact" }, loadingBackups ? "正在读取服务器备份…" : "还没有加载服务器备份，点击“刷新项目库”。")
     );
   }
 
-  function projectGroupButton(group) {
-    const active = group.key === selectedProjectKey;
-    const button = h(
+  function projectPanel(group) {
+    const expanded = expandedKeys.has(group.key);
+    const head = h(
       "button",
-      { class: `project-list-item ${active ? "active" : ""}`, type: "button" },
-      h("strong", {}, group.repoName),
-      h("span", {}, `${group.backups.length} 份 · ${group.devices.size} 台设备 · 最新 ${formatDateTime(group.latestAt)}`),
-      h("small", { title: group.rootsText }, group.rootsText || "原始路径未知")
+      { class: `project-panel-head ${expanded ? "expanded" : ""}`, type: "button", "aria-expanded": expanded ? "true" : "false" },
+      h("span", { class: "project-panel-caret" }, expanded ? "▾" : "▸"),
+      h("span", { class: "project-panel-name", title: group.rootsText || group.repoName }, group.repoName),
+      h("span", { class: "project-panel-meta" }, `${group.backups.length} 份 · ${group.devices.size} 台设备 · 最新 ${formatDateTime(group.latestAt)}`)
     );
-    button.addEventListener("click", () => {
-      selectedProjectKey = group.key;
+    head.addEventListener("click", () => {
+      if (expandedKeys.has(group.key)) expandedKeys.delete(group.key);
+      else expandedKeys.add(group.key);
       renderServerBackups();
     });
-    return button;
+    return h(
+      "div",
+      { class: `project-panel ${expanded ? "expanded" : ""}` },
+      head,
+      expanded ? h("div", { class: "project-panel-body" }, renderProjectVersions(group)) : null
+    );
   }
 
   function renderProjectVersions(group) {
@@ -467,12 +462,9 @@ export function mount(root, store) {
     return h(
       "div",
       { class: "project-version-stack" },
-      h(
-        "div",
-        { class: "project-selected-summary" },
-        h("div", {}, h("strong", {}, group.repoName), h("span", {}, `${group.backups.length} 份备份 · ${Array.from(group.devices).join("、") || "未知设备"}`)),
-        h("div", { class: "mono cell-ellipsis", title: group.rootsText }, group.rootsText || "-")
-      ),
+      group.rootsText
+        ? h("div", { class: "project-roots mono cell-ellipsis", title: group.rootsText }, group.rootsText)
+        : null,
       !hasFull
         ? h("div", { class: "status-line warn" }, "该项目当前列表里只有补丁备份。恢复到新电脑时，建议先选择一份完整基线；补丁只适合同一 Git 仓库继续应用。")
         : null,
@@ -489,16 +481,14 @@ export function mount(root, store) {
     );
   }
 
-  function ensureSelectedProject() {
+  function ensureExpanded() {
     const backups = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
     const groups = buildProjectGroups(backups);
-    if (!groups.length) {
-      selectedProjectKey = "";
-      return;
+    const validKeys = new Set(groups.map((group) => group.key));
+    for (const key of Array.from(expandedKeys)) {
+      if (!validKeys.has(key)) expandedKeys.delete(key);
     }
-    if (!groups.some((group) => group.key === selectedProjectKey)) {
-      selectedProjectKey = groups[0].key;
-    }
+    if (!expandedKeys.size && groups.length) expandedKeys.add(groups[0].key);
   }
 
   renderProjectStatus();
