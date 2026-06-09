@@ -1,10 +1,9 @@
-// 数据备份与恢复控制中心：完整备份与灾备、云端备份与快照、本地备份导入、服务器留存策略。
+// 数据备份与恢复控制中心：完整备份与灾备、云端备份、本地备份导入、服务器留存策略。
 import { h, asObject, shortId } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
-import { refreshStatus, fetchSnapshots } from "../poller.js";
-import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
-import { openSnapshot } from "./drawer.js";
+import { refreshStatus } from "../poller.js";
+import { makeRun, actionButton, formatDateTime } from "../ui.js";
 
 const ROLE_LABEL = { user: "用户", assistant: "助手", developer: "系统注入", reasoning: "思考", tool_call: "工具调用", tool_output: "工具输出" };
 const ROW_STYLE = { display: "flex", gap: "10px", padding: "10px 0", borderBottom: "1px solid var(--border)" };
@@ -45,7 +44,6 @@ function msgStyle(role) {
 
 export function mount(root, store) {
   const run = makeRun(store);
-  const { card: outCard, setOutput } = consoleCard("备份管理输出详情");
 
   let currentTab = "full"; // full | cloud | import | retention
   const tabContainer = h("div", { class: "sub-tabs" });
@@ -53,7 +51,7 @@ export function mount(root, store) {
 
   const tabs = [
     { id: "full", label: "完整备份与灾备" },
-    { id: "cloud", label: "云端备份与快照" },
+    { id: "cloud", label: "云端备份" },
     { id: "import", label: "本地备份导入" },
     { id: "retention", label: "服务器留存策略" }
   ];
@@ -70,13 +68,13 @@ export function mount(root, store) {
     viewContainer.replaceChildren();
 
     if (tabId === "full") {
-      unmountCurrent = mountFullBackups(viewContainer, run, store, setOutput);
+      unmountCurrent = mountFullBackups(viewContainer, run, store);
     } else if (tabId === "cloud") {
-      unmountCurrent = mountCloudSnapshots(viewContainer, run, store, setOutput);
+      unmountCurrent = mountCloudBackups(viewContainer, run, store);
     } else if (tabId === "import") {
-      unmountCurrent = mountImportArchive(viewContainer, run, store, setOutput);
+      unmountCurrent = mountImportArchive(viewContainer, run, store);
     } else if (tabId === "retention") {
-      unmountCurrent = mountRetentionPolicy(viewContainer, run, store, setOutput);
+      unmountCurrent = mountRetentionPolicy(viewContainer, run, store);
     }
   }
 
@@ -92,23 +90,19 @@ export function mount(root, store) {
 
   root.replaceChildren(
     tabContainer,
-    viewContainer,
-    h("div", { class: "section", style: { marginTop: "20px" } }, outCard)
+    viewContainer
   );
 
   renderTabs();
   switchTab(currentTab);
 
-  const uCon = store.select(s => s.console, () => setOutput(store.getState().console));
-
   return () => {
     if (unmountCurrent) unmountCurrent();
-    uCon();
   };
 }
 
 // ==================== TAB 1: 完整备份与灾备 ====================
-function mountFullBackups(container, run, store, setOutput) {
+function mountFullBackups(container, run, store) {
   let homes = [];
   let selectedHome = "windows";
   const homeTabs = h("div", { class: "home-tabs" });
@@ -140,11 +134,14 @@ function mountFullBackups(container, run, store, setOutput) {
     }
   });
 
+  const encInfo = h("div", { class: "enc-status" });
+
   const fullCard = h(
     "div",
     { class: "card" },
     h("div", { class: "card-title" }, "Codex Home 完整备份"),
     h("p", { class: "card-desc" }, "选择一个 Codex 运行环境（Windows 或 WSL）对其所有会话进行完整打包归档。"),
+    encInfo,
     homeTabs,
     h(
       "div",
@@ -177,8 +174,31 @@ function mountFullBackups(container, run, store, setOutput) {
     h("div", { class: "section" }, disasterCard)
   );
 
+  const ENC_SOURCE_LABELS = { env: "环境变量", config: "口令", key_file: "私有 key 文件", generated_key_file: "自动生成的私有 key 文件" };
   const syncUpload = () => {
-    const allow = Boolean(asObject(store.getState().status?.config).full_backup_allow_plaintext_upload);
+    const cfg = asObject(store.getState().status?.config);
+    const enc = asObject(cfg.full_backup_encryption);
+    const encrypted = enc.enabled !== false && Boolean(enc.configured);
+    if (encrypted) {
+      encInfo.replaceChildren(
+        h("span", { class: "badge ok" }, "已启用客户端加密"),
+        h("span", { class: "enc-meta" }, `密钥来源：${ENC_SOURCE_LABELS[enc.source] || enc.source || "—"}`),
+        h("span", { class: "enc-meta" }, `密钥指纹：${enc.key_id || "—"}`),
+        h("div", { class: "enc-hint" }, "完整包会自动加密上传，无需明文。另一台电脑填入相同口令、指纹一致即可互相解密恢复。")
+      );
+    } else if (enc.enabled === false) {
+      encInfo.replaceChildren(
+        h("span", { class: "badge warn" }, "客户端加密已关闭"),
+        h("div", { class: "enc-hint" }, "完整对话包将按明文处理，建议到「系统设置」开启加密并设置口令。")
+      );
+    } else {
+      encInfo.replaceChildren(
+        h("span", { class: "badge warn" }, "尚未设置加密密钥"),
+        h("div", { class: "enc-hint" }, "到「系统设置 → 完整备份加密密码」设置口令后，完整包将自动加密上传。")
+      );
+    }
+    const allow = Boolean(cfg.full_backup_allow_plaintext_upload);
+    uploadBtn.style.display = encrypted ? "none" : "";
     uploadBtn.disabled = !allow;
     uploadBtn.title = allow ? "以明文上传当前选中环境的完整对话包" : "需先在设置开启「允许明文上传」";
   };
@@ -282,50 +302,16 @@ function mountFullBackups(container, run, store, setOutput) {
   };
 }
 
-// ==================== TAB 2: 云端备份与快照 ====================
-function mountCloudSnapshots(container, run, store, setOutput) {
+// ==================== TAB 2: 云端备份 ====================
+function mountCloudBackups(container, run, store) {
   let cloudBackups = null;
   let loadingCloudBackups = false;
   let showAllCloudBackups = false;
 
   const cloudBackupsCard = h("div", { class: "card" });
-  const tableBody = h("tbody", {});
-
-  const snapCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" },
-      h("span", {}, "云端轻量快照历史"),
-      actionButton("刷新快照列表", "btn-ghost btn-sm", () => fetchSnapshots(store, { force: true }))
-    ),
-    h("p", { class: "card-desc" }, "快照仅记录最近的工作 Cwd、Git 补丁大小与活跃时间，主要用于多设备接力工作现场的紧急诊断与恢复。"),
-    h(
-      "div",
-      { class: "table-wrap" },
-      h(
-        "table",
-        { class: "table" },
-        h(
-          "thead",
-          {},
-          h(
-            "tr",
-            {},
-            h("th", {}, "发送设备"),
-            h("th", {}, "项目路径"),
-            h("th", {}, "上传时间（本机）"),
-            h("th", {}, "快照 ID"),
-            h("th", {}, "诊断操作")
-          )
-        ),
-        tableBody
-      )
-    )
-  );
 
   container.replaceChildren(
-    h("div", { class: "section" }, cloudBackupsCard),
-    h("div", { class: "section" }, snapCard)
+    h("div", { class: "section" }, cloudBackupsCard)
   );
 
   async function refreshCloudBackups({ notify = false } = {}) {
@@ -334,13 +320,11 @@ function mountCloudSnapshots(container, run, store, setOutput) {
     try {
       cloudBackups = await runAction("list-full-backups");
       if (notify) {
-        setOutput(cloudBackups);
         showToast(cloudBackups?.error ? "云端备份列表读取失败" : "云端备份列表已更新", cloudBackups?.error ? "error" : "success");
       }
     } catch (e) {
       cloudBackups = { success: false, error: String(e.message || e) };
       if (notify) {
-        setOutput(cloudBackups);
         showToast(String(e.message || e), "error");
       }
     } finally {
@@ -432,52 +416,14 @@ function mountCloudSnapshots(container, run, store, setOutput) {
     return device ? `Windows · ${device}` : "Windows";
   }
 
-  const renderTable = () => {
-    const { items, loading, error } = store.getState().snapshots;
-    if (loading && !items.length) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, loadingSpinner("正在拉取远程快照…"))));
-      return;
-    }
-    if (error) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, `拉取失败：${error}`)));
-      return;
-    }
-    if (!items.length) {
-      tableBody.replaceChildren(h("tr", {}, h("td", { colspan: "5", class: "table-msg" }, "暂无快照历史")));
-      return;
-    }
-    const rows = items.map(snap => {
-      const snapObj = asObject(snap);
-      const mini = (label, intent) => {
-        const b = h("button", { class: "btn btn-ghost btn-sm", type: "button" }, label);
-        b.addEventListener("click", () => openSnapshot(store, snapObj, intent));
-        return b;
-      };
-      const cellActions = [mini("详情", "detail"), mini("接续", "resume"), mini("还原", "restore")];
-      return h("tr", {},
-        h("td", {}, snapObj.device_id || "-"),
-        h("td", { class: "mono cell-ellipsis", title: snapObj.cwd || "" }, snapObj.cwd || "-"),
-        h("td", { title: snapObj.created_at ? `UTC: ${snapObj.created_at}` : "" }, formatDateTime(snapObj.created_at)),
-        h("td", { class: "mono", title: snapObj.id || "" }, snapObj.id ? shortId(snapObj.id) : "-"),
-        h("td", {}, h("div", { class: "row-actions" }, ...cellActions.filter(Boolean)))
-      );
-    });
-    tableBody.replaceChildren(...rows.filter(Boolean));
-  };
-
-  fetchSnapshots(store, { force: false }).catch(() => {});
   refreshCloudBackups();
   renderCloudBackups();
 
-  const uSnapshots = store.select(s => s.snapshots, renderTable);
-
-  return () => {
-    uSnapshots();
-  };
+  return () => {};
 }
 
 // ==================== TAB 3: 本地备份导入 ====================
-function mountImportArchive(container, run, store, setOutput) {
+function mountImportArchive(container, run, store) {
   let backups = null;
   let homes = [];
   let convos = null;
@@ -782,12 +728,10 @@ function mountImportArchive(container, run, store, setOutput) {
       let res = await runAction("import-conversations", { backup_id: curBackupId, thread_ids: ids, target: t, target_home: targetHome });
       if (res && res.needs_close) {
         if (!window.confirm(targetHome.startsWith("wsl:") ? WSL_CONFIRM_MSG : CONFIRM_MSG)) {
-          setOutput(res);
           return;
         }
         res = await runAction("import-conversations", { backup_id: curBackupId, thread_ids: ids, target: t, target_home: targetHome, close_codex: true });
       }
-      setOutput(res);
       const ok = res && res.success;
       const homeLabel = homes.find(h => h.id === targetHome)?.label || targetHome;
       showToast(ok ? `已成功导入 ${res.imported} 个会话到 ${homeLabel} · ${res.target}` : (res && res.error) || "导入失败", ok ? "success" : "error");
@@ -812,7 +756,7 @@ function mountImportArchive(container, run, store, setOutput) {
 }
 
 // ==================== TAB 4: 服务器留存策略 ====================
-function mountRetentionPolicy(container, run, store, setOutput) {
+function mountRetentionPolicy(container, run, store) {
   let retentionData = null;
   let retentionLoading = false;
   const retentionBody = h("div", { class: "result-stack" });
@@ -833,7 +777,7 @@ function mountRetentionPolicy(container, run, store, setOutput) {
   }
 
   async function pruneServerRetention() {
-    if (!window.confirm("将删除服务器端超出留存策略的完整备份、项目备份和轻量快照。每个设备/项目会保留最新入口。确认执行？")) return;
+    if (!window.confirm("将删除服务器端超出留存策略的完整备份和项目备份。每个设备/项目会保留最新入口。确认执行？")) return;
     retentionLoading = true;
     renderRetention();
     try {
@@ -883,7 +827,6 @@ function mountRetentionPolicy(container, run, store, setOutput) {
     const policy = asObject(retentionData.policy);
     const full = asObject(policy.full_backups);
     const project = asObject(policy.project_backups);
-    const snapshots = asObject(policy.snapshots);
     const usage = asObject(retentionData.usage);
     const planned = Number(retentionData.planned_count || 0);
     const actionCount = retentionData.dry_run ? planned : Number(retentionData.deleted_count ?? planned);
@@ -894,10 +837,9 @@ function mountRetentionPolicy(container, run, store, setOutput) {
         { class: "result-facts" },
         fact("完整备份策略", `每设备/分支 ${full.keep_per_device_branch ?? "-"} 份 · ${full.max_age_days ?? "-"} 天`),
         fact("项目备份策略", `每项目/设备 ${project.keep_per_repo_device ?? "-"} 份 · ${project.max_age_days ?? "-"} 天`),
-        fact("轻量快照策略", `每设备 ${snapshots.keep_per_device ?? "-"} 条 · ${snapshots.max_age_days ?? "-"} 天`),
         fact("服务器容量上限", formatBytes(policy.server_total_max_bytes)),
         fact("当前备份占用", formatBytes(usage.backup_bytes)),
-        fact("当前记录", `完整 ${usage.full_backup_count || 0} · 项目 ${usage.project_backup_count || 0} · 快照 ${usage.snapshot_count || 0}`),
+        fact("当前记录", `完整 ${usage.full_backup_count || 0} · 项目 ${usage.project_backup_count || 0}`),
         fact(retentionData.dry_run ? "预览删除" : "本次删除", `${actionCount} 项 · ${formatBytes(actionBytes)}`),
         fact("已保护入口", `${usage.protected_count || 0} 项`)
       ),

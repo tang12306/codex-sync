@@ -91,8 +91,8 @@ codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
 | 模块 | 职责 |
 |------|------|
 | `config.py` | `AppConfig` dataclass，JSON 持久化到 `~/.codex-sync/config.json` |
-| `server.py` | 客户端 HTTP 通信层：快照上传/下载、outbox 队列、服务器兼容性检查。期望 `SERVER_API_VERSION = 4` |
-| `collector.py` | Codex hook 事件捕获、快照构建（cwd、git 状态、配置摘要、最近事件） |
+| `server.py` | 客户端 HTTP 通信层：完整/项目备份的服务器通信、服务器兼容性检查与留存策略调用。期望 `SERVER_API_VERSION = 5` |
+| `collector.py` | Codex hook 事件捕获（`capture_event`）与 Codex 配置状态收集（`collect_codex_state`） |
 | `full_backup.py` | 完整对话备份：扫描 `~/.codex/` 变更、打包 ZIP、上传/下载/恢复。有安全排除列表（auth.json、.env、密钥等） |
 | `git_backup.py` | Git 项目补丁快照和备份 |
 | `codex_channels.py` | Codex 对话渠道合并/还原（model_provider 级别），操作 `~/.codex/` 下的 SQLite 数据库 |
@@ -101,7 +101,7 @@ codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
 | `wsl.py` | WSL 发行版检测、WSL 内 Codex 对话备份/恢复/导入、渠道查询 |
 | `deploy.py` | SSH 远程部署同步服务器（systemd + nginx 可选） |
 | `hooks.py` | 全局 Codex hooks 安装/状态查询 |
-| `daemon.py` | 前台同步循环（定时 sync-now + full-backup 扫描） |
+| `daemon.py` | 前台同步循环（定时 full-backup 扫描上传 + 项目自动备份队列处理） |
 | `windows_task.py` | Windows Task Scheduler 定时任务管理 |
 | `disaster_backup.py` | 敏感写入前的本地灾难备份 |
 | `paths.py` | 路径常量：`~/.codex-sync/`（本应用数据）、`~/.codex/`（Codex 数据） |
@@ -112,9 +112,9 @@ codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
 ### 数据流
 
 ```
-Codex hooks 事件 → capture_event() → snapshot → outbox 队列 → sync_once() → 同步服务器
-                                                                ↓
-                                             notify_codex_changed() → full_backup 扫描
+Codex hooks 事件 → capture_event() → notify_codex_changed() → full_backup 扫描/上传
+                                                            ↘ (Stop 事件) 项目自动备份入队
+daemon / sync-now → scan_full_backup_changes(upload) + process_project_auto_backup_queue
 ```
 
 ### 配置键位

@@ -284,7 +284,7 @@ function buildHealth({ health, busy, expanded, toggle, store, run, refresh }) {
   const summaryTone = summary.tone || (!health.success ? "danger" : needs || pending.length ? "warn" : "ok");
   const nodes = [
     title,
-    h("p", { class: "card-desc" }, "这里展示的是对话备份、WSL、项目备份、轻量接力快照、服务器连接和自动任务的当前状态。"),
+    h("p", { class: "card-desc" }, "这里展示的是对话备份、WSL、项目备份、服务器连接和自动任务的当前状态。"),
     h(
       "button",
       { class: `sync-summary ${summaryTone}`, type: "button", onClick: toggle },
@@ -443,7 +443,7 @@ function nextRunText(item, autoScan) {
   const row = asObject(item);
   if (row.next_run_in_seconds != null) return formatCountdown(row.next_run_in_seconds) || row.next_run_at || "-";
   if (row.next_run_at) return shortTime(row.next_run_at);
-  if (["windows-conversations", "project-backup", "resume-snapshot"].includes(row.id) && autoScan.enabled) {
+  if (["windows-conversations", "project-backup"].includes(row.id) && autoScan.enabled) {
     return formatCountdown(autoScan.next_run_in_seconds) || shortTime(autoScan.next_run);
   }
   if (String(row.id || "").startsWith("wsl-")) return "手动";
@@ -468,14 +468,13 @@ function buildStatus(status, statusError) {
   const cfg = asObject(status.config);
   const hooks = asObject(status.hooks);
   const hookCount = Array.isArray(hooks.events) ? hooks.events.length : 0;
-  const outbox = status.outbox_count ?? 0;
   return h(
     "div",
     { class: "grid grid-auto" },
     metric("同步服务器", cfg.server_url || "未配置", cfg.server_url ? "ok" : "warn"),
     metric("Hooks", hookCount ? `${hookCount} 个事件` : "未安装", hookCount ? "ok" : "warn"),
-    metric("Outbox", String(outbox), outbox > 0 ? "warn" : "ok"),
-    metric("守护进程", status.daemon_running ? "运行中" : "已停止", status.daemon_running ? "ok" : "")
+    metric("守护进程", status.daemon_running ? "运行中" : "已停止", status.daemon_running ? "ok" : ""),
+    metric("上次自动上传", status.last_full_backup_uploaded_at ? shortTime(status.last_full_backup_uploaded_at) : "尚无", status.last_full_backup_uploaded_at ? "ok" : "warn")
   );
 }
 

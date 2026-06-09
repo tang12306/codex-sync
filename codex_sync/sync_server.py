@@ -27,14 +27,11 @@ RETENTION_FULL_BACKUP_KEEP = int(os.environ.get("CODEX_SYNC_RETENTION_FULL_BACKU
 RETENTION_FULL_BACKUP_DAYS = int(os.environ.get("CODEX_SYNC_RETENTION_FULL_BACKUP_DAYS", "30"))
 RETENTION_PROJECT_BACKUP_KEEP = int(os.environ.get("CODEX_SYNC_RETENTION_PROJECT_BACKUP_KEEP", "20"))
 RETENTION_PROJECT_BACKUP_DAYS = int(os.environ.get("CODEX_SYNC_RETENTION_PROJECT_BACKUP_DAYS", "90"))
-RETENTION_SNAPSHOT_KEEP = int(os.environ.get("CODEX_SYNC_RETENTION_SNAPSHOT_KEEP", "100"))
-RETENTION_SNAPSHOT_DAYS = int(os.environ.get("CODEX_SYNC_RETENTION_SNAPSHOT_DAYS", "14"))
 RETENTION_MAX_BYTES = int(os.environ.get("CODEX_SYNC_RETENTION_MAX_BYTES", str(20 * 1024 * 1024 * 1024)))
 SERVER_VERSION = "0.1.0"
-SERVER_API_VERSION = 4
+SERVER_API_VERSION = 5
 SERVER_STARTED_AT = datetime.now(timezone.utc).isoformat(timespec="seconds")
 SERVER_FEATURES = {
-    "snapshots": True,
     "device_state": True,
     "devices": True,
     "changes": True,
@@ -123,21 +120,6 @@ def init_db() -> None:
     try:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS snapshots (
-                id TEXT PRIMARY KEY,
-                device_id TEXT NOT NULL,
-                created_at TEXT,
-                received_at TEXT NOT NULL,
-                cwd TEXT,
-                type TEXT,
-                payload_json TEXT NOT NULL
-            )
-            """
-        )
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_received_at ON snapshots(received_at DESC)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_snapshots_device_received ON snapshots(device_id, received_at DESC)")
-        conn.execute(
-            """
             CREATE TABLE IF NOT EXISTS full_backups (
                 id TEXT PRIMARY KEY,
                 device_id TEXT NOT NULL,
@@ -205,106 +187,6 @@ def _ensure_column(conn: sqlite3.Connection, table: str, column: str, declaratio
     existing = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
     if column not in existing:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
-
-
-def normalize_snapshot_payload(payload: dict[str, Any]) -> tuple[dict[str, Any], dict[str, str]]:
-    snapshot_id = str(payload.get("id") or secrets.token_hex(16))
-    device_id = str(payload.get("device_id") or "unknown_device")
-    created_at = str(payload.get("created_at") or "")
-    cwd = str(payload.get("cwd") or "")
-    snapshot_type = str(payload.get("type") or "")
-
-    payload = dict(payload)
-    payload["id"] = snapshot_id
-    payload["device_id"] = device_id
-    if created_at:
-        payload["created_at"] = created_at
-
-    return payload, {
-        "id": snapshot_id,
-        "device_id": device_id,
-        "created_at": created_at,
-        "cwd": cwd,
-        "type": snapshot_type,
-    }
-
-
-def save_snapshot(payload: dict[str, Any]) -> dict[str, Any]:
-    payload, meta = normalize_snapshot_payload(payload)
-    received_at = utc_now()
-    payload_json = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    conn = connect_db()
-    try:
-        conn.execute(
-            """
-            INSERT INTO snapshots (id, device_id, created_at, received_at, cwd, type, payload_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(id) DO UPDATE SET
-                device_id=excluded.device_id,
-                created_at=excluded.created_at,
-                received_at=excluded.received_at,
-                cwd=excluded.cwd,
-                type=excluded.type,
-                payload_json=excluded.payload_json
-            """,
-            (
-                meta["id"],
-                meta["device_id"],
-                meta["created_at"],
-                received_at,
-                meta["cwd"],
-                meta["type"],
-                payload_json,
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-    retention = prune_retention(dry_run=False)
-    return {
-        "snapshot_id": meta["id"],
-        "device_id": meta["device_id"],
-        "received_at": received_at,
-        "retention": {"deleted_count": retention.get("deleted_count", 0), "deleted_bytes": retention.get("deleted_bytes", 0)},
-    }
-
-
-def list_snapshots(limit: int = 50, offset: int = 0, device_id: str | None = None) -> list[dict[str, Any]]:
-    limit = max(1, min(limit, 200))
-    offset = max(0, offset)
-    params: list[Any] = []
-    where = ""
-    if device_id:
-        where = "WHERE device_id = ?"
-        params.append(device_id)
-    params.extend([limit, offset])
-    conn = connect_db()
-    try:
-        rows = conn.execute(
-            f"""
-            SELECT id, device_id, created_at, received_at, cwd, type
-            FROM snapshots
-            {where}
-            ORDER BY received_at DESC
-            LIMIT ? OFFSET ?
-            """,
-            params,
-        ).fetchall()
-    finally:
-        conn.close()
-    return [dict(row) for row in rows]
-
-
-def get_snapshot(snapshot_id: str) -> dict[str, Any] | None:
-    conn = connect_db()
-    try:
-        row = conn.execute("SELECT payload_json FROM snapshots WHERE id = ?", (snapshot_id,)).fetchone()
-    finally:
-        conn.close()
-    if not row:
-        return None
-    data = json.loads(row["payload_json"])
-    return data if isinstance(data, dict) else None
 
 
 def _device_state_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
@@ -484,7 +366,6 @@ def retention_policy() -> dict[str, Any]:
     return {
         "full_backups": {"keep_per_device_branch": RETENTION_FULL_BACKUP_KEEP, "max_age_days": RETENTION_FULL_BACKUP_DAYS},
         "project_backups": {"keep_per_repo_device": RETENTION_PROJECT_BACKUP_KEEP, "max_age_days": RETENTION_PROJECT_BACKUP_DAYS},
-        "snapshots": {"keep_per_device": RETENTION_SNAPSHOT_KEEP, "max_age_days": RETENTION_SNAPSHOT_DAYS},
         "server_total_max_bytes": RETENTION_MAX_BYTES,
     }
 
@@ -543,16 +424,6 @@ def _project_backup_rows() -> list[dict[str, Any]]:
     )
 
 
-def _snapshot_rows() -> list[dict[str, Any]]:
-    return _query_rows(
-        """
-        SELECT id, device_id, created_at, received_at, cwd, type
-        FROM snapshots
-        ORDER BY received_at DESC
-        """
-    )
-
-
 def _current_head_ids() -> set[str]:
     rows = _query_rows("SELECT head_backup_id FROM device_states WHERE head_backup_id IS NOT NULL AND head_backup_id != ''")
     return {str(row["head_backup_id"]) for row in rows if row.get("head_backup_id")}
@@ -603,27 +474,14 @@ def _backup_item(kind: str, row: dict[str, Any]) -> dict[str, Any]:
     return item
 
 
-def _snapshot_item(row: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "kind": "snapshot",
-        "id": str(row.get("id") or ""),
-        "device_id": row.get("device_id"),
-        "received_at": row.get("received_at"),
-        "created_at": row.get("created_at"),
-        "size_bytes": 0,
-    }
-
-
 def _build_retention_plan() -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
     full_rows = _full_backup_rows()
     project_rows = _project_backup_rows()
-    snapshot_rows = _snapshot_rows()
     warnings: list[str] = []
     plan: dict[tuple[str, str], dict[str, Any]] = {}
 
     full_groups = _group_rows(full_rows, lambda row: (row.get("device_id") or "", row.get("branch_id") or f"{row.get('device_id')}:main"))
     project_groups = _group_rows(project_rows, lambda row: (row.get("device_id") or "", row.get("repo_name") or "unknown_repo"))
-    snapshot_groups = _group_rows(snapshot_rows, lambda row: (row.get("device_id") or "unknown_device",))
 
     protected: set[tuple[str, str]] = set()
     for backup_id in _current_head_ids():
@@ -634,9 +492,6 @@ def _build_retention_plan() -> tuple[list[dict[str, Any]], dict[str, Any], list[
     for rows in project_groups.values():
         if rows:
             protected.add(("project_backup", str(rows[0].get("id") or "")))
-    for rows in snapshot_groups.values():
-        if rows:
-            protected.add(("snapshot", str(rows[0].get("id") or "")))
 
     full_cutoff = _cutoff(RETENTION_FULL_BACKUP_DAYS)
     for rows in full_groups.values():
@@ -660,20 +515,9 @@ def _build_retention_plan() -> tuple[list[dict[str, Any]], dict[str, Any], list[
             if project_cutoff and _row_time(row) < project_cutoff:
                 _add_plan(plan, _backup_item("project_backup", row), "project backup age limit")
 
-    snapshot_cutoff = _cutoff(RETENTION_SNAPSHOT_DAYS)
-    for rows in snapshot_groups.values():
-        for index, row in enumerate(rows):
-            key = ("snapshot", str(row.get("id") or ""))
-            if key in protected:
-                continue
-            if RETENTION_SNAPSHOT_KEEP > 0 and index >= RETENTION_SNAPSHOT_KEEP:
-                _add_plan(plan, _snapshot_item(row), "snapshot count limit")
-            if snapshot_cutoff and _row_time(row) < snapshot_cutoff:
-                _add_plan(plan, _snapshot_item(row), "snapshot age limit")
-
     backup_rows = [("full_backup", row) for row in full_rows] + [("project_backup", row) for row in project_rows]
     backup_bytes = sum(int(row.get("size_bytes") or 0) for _, row in backup_rows)
-    planned_bytes = sum(int(item.get("size_bytes") or 0) for item in plan.values() if item.get("kind") != "snapshot")
+    planned_bytes = sum(int(item.get("size_bytes") or 0) for item in plan.values())
     remaining_bytes = max(0, backup_bytes - planned_bytes)
     if RETENTION_MAX_BYTES > 0 and remaining_bytes > RETENTION_MAX_BYTES:
         for kind, row in sorted(backup_rows, key=lambda pair: _row_time(pair[1])):
@@ -690,7 +534,6 @@ def _build_retention_plan() -> tuple[list[dict[str, Any]], dict[str, Any], list[
     usage = {
         "full_backup_count": len(full_rows),
         "project_backup_count": len(project_rows),
-        "snapshot_count": len(snapshot_rows),
         "full_backup_bytes": sum(int(row.get("size_bytes") or 0) for row in full_rows),
         "project_backup_bytes": sum(int(row.get("size_bytes") or 0) for row in project_rows),
         "backup_bytes": backup_bytes,
@@ -709,11 +552,6 @@ def _delete_retention_item(item: dict[str, Any]) -> dict[str, Any]:
         return result
     conn = connect_db()
     try:
-        if kind == "snapshot":
-            conn.execute("DELETE FROM snapshots WHERE id = ?", (item_id,))
-            conn.commit()
-            result["deleted"] = True
-            return result
         if kind not in {"full_backup", "project_backup"}:
             result["deleted"] = False
             result["error"] = f"unsupported retention kind: {kind}"
@@ -1121,15 +959,6 @@ class SyncHandler(BaseHTTPRequestHandler):
         if not self.check_token():
             return
 
-        if parsed.path == "/api/snapshots":
-            query = parse_qs(parsed.query)
-            limit = int(query.get("limit", ["50"])[0])
-            offset = int(query.get("offset", ["0"])[0])
-            device_id = query.get("device_id", [None])[0]
-            snapshots = list_snapshots(limit=limit, offset=offset, device_id=device_id)
-            self.send_json_response(HTTPStatus.OK, {"success": True, "snapshots": snapshots, "limit": limit, "offset": offset})
-            return
-
         if parsed.path == "/api/device-state":
             query = parse_qs(parsed.query)
             device_id = query.get("device_id", [""])[0]
@@ -1226,18 +1055,6 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json_response(HTTPStatus.OK, {"success": True, "project_backup": metadata})
             return
 
-        if parsed.path.startswith("/api/snapshots/"):
-            snapshot_id = unquote(parsed.path.split("/")[-1])
-            if not snapshot_id:
-                self.send_error_response(HTTPStatus.BAD_REQUEST, "Missing snapshot id")
-                return
-            payload = get_snapshot(snapshot_id)
-            if payload is None:
-                self.send_error_response(HTTPStatus.NOT_FOUND, f"Snapshot ID '{snapshot_id}' not found")
-                return
-            self.send_json_response(HTTPStatus.OK, payload)
-            return
-
         self.send_error_response(HTTPStatus.NOT_FOUND, "API endpoint not found")
 
     def do_POST(self) -> None:
@@ -1322,34 +1139,7 @@ class SyncHandler(BaseHTTPRequestHandler):
             self.send_json_response(HTTPStatus.CREATED, {"success": True, "message": "Project backup saved successfully", **result})
             return
 
-        if parsed.path != "/api/snapshots":
-            self.send_error_response(HTTPStatus.NOT_FOUND, "API endpoint not found")
-            return
-
-        try:
-            length = int(self.headers.get("Content-Length", 0))
-            if length <= 0:
-                self.send_error_response(HTTPStatus.BAD_REQUEST, "Empty request body")
-                return
-            if length > MAX_BODY_BYTES:
-                self.send_error_response(HTTPStatus.REQUEST_ENTITY_TOO_LARGE, "Snapshot payload is too large")
-                return
-            payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            if not isinstance(payload, dict):
-                self.send_error_response(HTTPStatus.BAD_REQUEST, "JSON payload must be an object")
-                return
-        except Exception as exc:
-            self.send_error_response(HTTPStatus.BAD_REQUEST, f"Invalid JSON payload: {exc}")
-            return
-
-        try:
-            result = save_snapshot(payload)
-        except Exception as exc:
-            self.send_error_response(HTTPStatus.INTERNAL_SERVER_ERROR, f"Failed to save snapshot: {exc}")
-            return
-
-        print(f" => Saved snapshot {result['snapshot_id']} for device '{result['device_id']}'")
-        self.send_json_response(HTTPStatus.CREATED, {"success": True, "message": "Snapshot saved successfully", **result})
+        self.send_error_response(HTTPStatus.NOT_FOUND, "API endpoint not found")
 
     def send_json_response(self, status: HTTPStatus, data: dict[str, Any]) -> None:
         body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")

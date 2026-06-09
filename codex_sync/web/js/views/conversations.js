@@ -3,7 +3,7 @@ import { h, asObject, shortId } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
 import { refreshStatus } from "../poller.js";
-import { consoleCard, makeRun, actionButton, formatDateTime } from "../ui.js";
+import { makeRun, actionButton, formatDateTime } from "../ui.js";
 
 const ROLE_LABEL = { user: "用户", assistant: "助手", developer: "系统注入", reasoning: "思考", tool_call: "工具调用", tool_output: "工具输出" };
 const ROW_STYLE = { display: "flex", gap: "10px", padding: "10px 0", borderBottom: "1px solid var(--border)" };
@@ -45,7 +45,6 @@ function msgStyle(role) {
 
 export function mount(root, store) {
   const run = makeRun(store);
-  const { card: outCard, setOutput } = consoleCard("控制台输出详情");
 
   let currentTab = "browse"; // browse | channels
   const tabContainer = h("div", { class: "sub-tabs" });
@@ -68,9 +67,9 @@ export function mount(root, store) {
     viewContainer.replaceChildren();
 
     if (tabId === "browse") {
-      unmountCurrent = mountBrowse(viewContainer, run, store, setOutput);
+      unmountCurrent = mountBrowse(viewContainer, run, store);
     } else if (tabId === "channels") {
-      unmountCurrent = mountChannels(viewContainer, run, store, setOutput);
+      unmountCurrent = mountChannels(viewContainer, run, store);
     }
   }
 
@@ -86,23 +85,19 @@ export function mount(root, store) {
 
   root.replaceChildren(
     tabContainer,
-    viewContainer,
-    h("div", { class: "section", style: { marginTop: "20px" } }, outCard)
+    viewContainer
   );
 
   renderTabs();
   switchTab(currentTab);
 
-  const uCon = store.select(s => s.console, () => setOutput(store.getState().console));
-
   return () => {
     if (unmountCurrent) unmountCurrent();
-    uCon();
   };
 }
 
 // ==================== TAB 1: 对话浏览 ====================
-function mountBrowse(container, run, store, setOutput) {
+function mountBrowse(container, run, store) {
   let homes = [];
   let sourceHome = "all";
   let channelsData = null;
@@ -493,7 +488,6 @@ function mountBrowse(container, run, store, setOutput) {
         if (r && r.path) paths.push(r.path);
       } catch(e) {}
     }
-    setOutput({ exported_count: paths.length, paths });
     showToast(`已成功导出 ${paths.length} 个对话到 ~/.codex-sync/exports`, paths.length ? "success" : "error");
   }
 
@@ -515,12 +509,10 @@ function mountBrowse(container, run, store, setOutput) {
       let res = await runAction(action, payload);
       if (res && res.needs_close) {
         if (!window.confirm(CONFIRM_MSG)) {
-          setOutput(res);
           return;
         }
         res = await runAction(action, { ...payload, close_codex: true });
       }
-      setOutput(res);
       const ok = res && res.success;
       const n = res && (res.moved ?? res.restored);
       showToast(ok ? `${label} ${n} 个对话 · 刷新 Codex 可见` : (res && res.error) || `${label}失败`, ok ? "success" : "error");
@@ -544,7 +536,7 @@ function mountBrowse(container, run, store, setOutput) {
 }
 
 // ==================== TAB 2: 渠道整合 ====================
-function mountChannels(container, run, store, setOutput) {
+function mountChannels(container, run, store) {
   let homes = [];
   let sourceHome = "windows"; // 默认只选择 windows，因为渠道写入功能仅支持它
   let channelsData = null;
@@ -685,15 +677,12 @@ function mountChannels(container, run, store, setOutput) {
         if (window.confirm(CONFIRM_MSG)) {
           res = await runAction(action, { ...opts, source_home: sourceHome, close_codex: true });
         } else {
-          setOutput(res);
           return;
         }
       }
-      setOutput(res);
       const ok = res && res.success;
       showToast(ok ? `${label}完成 · 刷新 Codex 即可生效` : (res && res.error) || `${label}失败`, ok ? "success" : "error");
     } catch(e) {
-      setOutput({ error: String(e.message || e) });
       showToast(String(e.message || e), "error");
     } finally {
       busy = false;

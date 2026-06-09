@@ -13,7 +13,7 @@ const VIEW_META = {
   overview: ["系统概览", "本机同步拓扑与状态大盘"],
   conversations: ["对话与渠道", "合并多渠道对话、还原历史记录、检索与浏览对话正文"],
   project: ["项目同步", "备份当前项目代码快照、安装 Git 提交触发并执行恢复"],
-  backups: ["备份与恢复", "控制 Windows/WSL 完整备份、下载云端快照或恢复历史备份"],
+  backups: ["备份与恢复", "控制 Windows/WSL 完整备份、恢复历史备份"],
   settings: ["系统设置", "配置云端凭证、一键部署服务器、调整备份策略参数及安装 Windows 定时任务"],
 };
 
@@ -99,7 +99,6 @@ function bindTopbar() {
     btn.disabled = true;
     try {
       const result = await runAction("sync-now");
-      store.setState({ console: result });
       showToast(result.error ? `同步失败：${result.error}` : "同步完成", result.error ? "error" : "success");
       await refreshStatus(store);
     } catch (e) {
@@ -117,14 +116,12 @@ function bindTopbar() {
   window.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     const st = store.getState();
-    if (st.drawer.open) store.setState({ drawer: { ...st.drawer, open: false } });
-    else if (st.logs.panelOpen) store.setState({ logs: { ...st.logs, panelOpen: false } });
+    if (st.logs.panelOpen) store.setState({ logs: { ...st.logs, panelOpen: false } });
   });
 }
 
 // 启动
 mountPersistent("logs", "logs-root");
-mountPersistent("drawer", "drawer-root");
 bindTopbar();
 store.select((s) => s.status, updateTopbar);
 store.select((s) => s.statusError, updateTopbar);

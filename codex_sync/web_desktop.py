@@ -18,7 +18,7 @@ from urllib.parse import unquote, urlparse
 from . import __version__
 from .backup_import import _ensure_local_archive, import_conversations, list_backup_conversations, list_importable_backups, read_backup_conversation
 from .codex_channels import list_channels, merge_channels, merge_threads, restore_channels, restore_threads
-from .collector import capture_event, create_resume_prompt
+from .collector import capture_event
 from .config import AppConfig, load_config, save_config
 from .daemon import run_daemon
 from .conversations import export_conversation, list_conversations, read_conversation
@@ -32,6 +32,7 @@ from .git_backup import (
     git_state,
     list_project_backups,
     preview_project_backup_from_server,
+    restore_latest_project_backup,
     restore_project_backup_from_server,
 )
 from .full_backup import download_full_backup, encryption_status, export_encryption_key, full_backup_now, get_remote_device_state, import_encryption_key, list_full_backups, list_remote_devices, notify_codex_changed, restore_full_backup, restore_latest_full_backup, scan_full_backup_changes, summarize_sync_health
@@ -46,17 +47,8 @@ from .project_auto_backup import (
 )
 from .server import (
     check_server_compatibility,
-    flush_outbox,
     get_server_retention,
-    outbox_count,
     prune_server_retention,
-    snapshot_state_path,
-    sync_once,
-    list_remote_snapshots,
-    get_remote_snapshot_detail,
-    generate_remote_resume_context,
-    preview_restore_snapshot,
-    restore_snapshot_locally,
 )
 from .util import utc_now
 from .windows_task import install_windows_task, uninstall_windows_task, windows_task_status
@@ -732,6 +724,40 @@ def _project_path_from_payload(payload: dict[str, Any]) -> str | None:
     return raw or None
 
 
+def _normalize_project_path(path: str | None) -> str:
+    raw = (path or "").strip() or str(Path.cwd())
+    try:
+        return str(Path(raw).resolve())
+    except OSError:
+        return raw
+
+
+def _realtime_projects_normalized(cfg: AppConfig) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for path in (getattr(cfg, "realtime_backup_projects", None) or []):
+        if not isinstance(path, str) or not path.strip():
+            continue
+        norm = _normalize_project_path(path)
+        if norm not in seen:
+            seen.add(norm)
+            out.append(norm)
+    return out
+
+
+def _last_full_backup_uploaded_at() -> str | None:
+    try:
+        from .full_backup import state_path
+
+        path = state_path()
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data.get("last_uploaded_at") or None
+    except Exception:  # noqa: BLE001 - status must never break
+        return None
+    return None
+
+
 def _project_state(project_path: str | None = None) -> dict[str, Any]:
     state = git_state(project_path)
     if not state.get("is_repo"):
@@ -749,16 +775,6 @@ def _project_state(project_path: str | None = None) -> dict[str, Any]:
 
 def _as_dict(value: Any) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
-
-
-def _read_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return {}
-    return data if isinstance(data, dict) else {}
 
 
 def _status_item(
@@ -788,16 +804,6 @@ def _auto_scan_summary(config: AppConfig, task: dict[str, Any]) -> dict[str, Any
         "status": "已开启" if enabled else "未开启",
         "tone": "ok" if enabled else "warn",
         "error": task.get("error") if not enabled else None,
-    }
-
-
-def _snapshot_resume_status(outbox: int) -> dict[str, Any]:
-    state = _read_json_file(snapshot_state_path())
-    return {
-        "outbox_count": outbox,
-        "last_snapshot_id": state.get("last_snapshot_id"),
-        "last_snapshot_at": state.get("last_snapshot_at"),
-        "last_snapshot_signature": state.get("last_snapshot_signature"),
     }
 
 
@@ -911,7 +917,7 @@ def _collect_sync_health_locals(config: AppConfig) -> dict[str, Any]:
     """并行收集 sync-health 的本地数据。
 
     windows_task_status(schtasks)、_overview_codex_homes(sqlite)、_project_state(git)、
-    project_auto_backup_status 彼此独立且较慢，放进线程池并发执行；outbox/hooks/snapshot 很快，串行即可。
+    project_auto_backup_status 彼此独立且较慢，放进线程池并发执行；hooks 很快，串行即可。
     每个慢调用独立降级（_safe），互不影响整体。
     """
     def _safe(fn: Any, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -929,16 +935,13 @@ def _collect_sync_health_locals(config: AppConfig) -> dict[str, Any]:
         homes_result = f_homes.result()
         git = f_git.result()
         project_auto = f_project.result()
-    outbox = outbox_count()
     hooks = hook_status()
     return {
         "task": task,
         "auto_scan": _auto_scan_summary(config, task),
-        "outbox": outbox,
         "hooks": hooks,
         "git": git,
         "project_auto": project_auto,
-        "snapshot": _snapshot_resume_status(outbox),
         "homes_result": homes_result,
     }
 
@@ -949,11 +952,9 @@ def _decorate_sync_health(config: AppConfig, health: dict[str, Any], _locals: di
     data = _locals if _locals is not None else _collect_sync_health_locals(config)
     task = data["task"]
     auto_scan = data["auto_scan"]
-    outbox = data["outbox"]
     hooks = data["hooks"]
     git = data["git"]
     project_auto = data["project_auto"]
-    snapshot = data["snapshot"]
     homes_result = data["homes_result"]
 
     items: list[dict[str, Any]] = []
@@ -1126,29 +1127,6 @@ def _decorate_sync_health(config: AppConfig, health: dict[str, Any], _locals: di
         )
     )
 
-    if snapshot["outbox_count"]:
-        snap_status, snap_tone = f"{snapshot['outbox_count']} 条待发送", "warn"
-    elif not config.server_url:
-        snap_status, snap_tone = "服务器未配置", "warn"
-    elif not snapshot.get("last_snapshot_at"):
-        snap_status, snap_tone = "尚未生成", "warn"
-    else:
-        snap_status, snap_tone = "最近无待发送", "ok"
-    items.append(
-        _status_item(
-            "resume-snapshot",
-            "接力快照",
-            "轻量接力状态",
-            snap_status,
-            snap_tone,
-            "保存 cwd、repo 状态、Codex 配置元数据和最近 hook 事件，用于 remote-resume。",
-            last_checked_at=checked_at,
-            last_uploaded_at=snapshot.get("last_snapshot_at"),
-            action="sync-now",
-            action_label="立即同步",
-        )
-    )
-
     hook_events = hooks.get("events") if isinstance(hooks.get("events"), list) else []
     items.append(
         _status_item(
@@ -1185,7 +1163,6 @@ def _decorate_sync_health(config: AppConfig, health: dict[str, Any], _locals: di
     health["checked_at"] = checked_at
     health["task_status"] = task
     health["auto_scan"] = auto_scan
-    health["snapshot_resume"] = snapshot
     health["project_auto_backup"] = project_auto
     health["codex_homes"] = homes_result
     health["status_items"] = items
@@ -1641,13 +1618,15 @@ class DesktopRuntime:
                 "full_backup_retention_max_bytes": cfg.full_backup_retention_max_bytes,
                 "project_auto_backup_on_codex_stop": cfg.project_auto_backup_on_codex_stop,
                 "project_auto_backup_min_interval_seconds": cfg.project_auto_backup_min_interval_seconds,
+                "realtime_backup_interval_seconds": cfg.realtime_backup_interval_seconds,
+                "realtime_backup_projects": cfg.realtime_backup_projects,
                 "desktop_close_behavior": cfg.desktop_close_behavior,
             },
             "app_install": app_install_status(),
-            "outbox_count": outbox_count(),
             "hooks": hook_status(),
             "git": _project_state(),
             "daemon_running": bool(self.daemon_thread and self.daemon_thread.is_alive()),
+            "last_full_backup_uploaded_at": _last_full_backup_uploaded_at(),
             "logs": self.logs[-80:],
         }
 
@@ -1673,6 +1652,7 @@ class DesktopRuntime:
             "full_backup_retention_max_bytes",
             "project_auto_backup_on_codex_stop",
             "project_auto_backup_min_interval_seconds",
+            "realtime_backup_interval_seconds",
             "desktop_close_behavior",
         ):
             if key in payload:
@@ -1685,6 +1665,7 @@ class DesktopRuntime:
                     "full_backup_retention_count",
                     "full_backup_retention_max_bytes",
                     "project_auto_backup_min_interval_seconds",
+                    "realtime_backup_interval_seconds",
                 ):
                     value = int(value)
                 if key in (
@@ -1767,16 +1748,11 @@ class DesktopRuntime:
         self.log("run", f"action started: {name}")
         cfg = load_config()
         if name == "sync-now":
-            result = {
-                "sync": sync_once(cfg, skip_unchanged=bool(payload.get("skip_unchanged_snapshot", True))),
-                "flush_outbox": flush_outbox(cfg),
-            }
+            result = {}
             if cfg.full_backup_enabled:
                 result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True, upload=True)
                 result["device_state"] = get_remote_device_state(cfg)
             result["project_auto_backup"] = process_project_auto_backup_queue(cfg)
-        elif name == "flush-outbox":
-            result = flush_outbox(cfg)
         elif name == "install-hooks":
             result = install_hooks()
         elif name == "preflight-backup":
@@ -1807,8 +1783,35 @@ class DesktopRuntime:
                 confirm_backup_id=str(payload.get("confirm_backup_id") or ""),
                 overwrite=bool(payload.get("overwrite", True)),
             )
+        elif name == "restore-latest-project-backup":
+            result = restore_latest_project_backup(
+                cfg,
+                str(payload.get("repo_name") or "").strip(),
+                _project_path_from_payload(payload) or str(Path.cwd()),
+                overwrite=bool(payload.get("overwrite", True)),
+            )
         elif name == "project-auto-backup-status":
             result = project_auto_backup_status(_project_path_from_payload(payload), cfg)
+            norm = _normalize_project_path(result.get("root") or _project_path_from_payload(payload))
+            result["in_realtime"] = norm in _realtime_projects_normalized(cfg)
+            result["realtime_interval_seconds"] = cfg.realtime_backup_interval_seconds
+        elif name in {"realtime-backup-add", "realtime-backup-remove"}:
+            enabled = name == "realtime-backup-add"
+            target = _normalize_project_path(_project_path_from_payload(payload))
+            projects = _realtime_projects_normalized(cfg)
+            if enabled and target not in projects:
+                projects.append(target)
+            elif not enabled:
+                projects = [item for item in projects if item != target]
+            cfg.realtime_backup_projects = projects
+            save_config(cfg)
+            result = {
+                "success": True,
+                "project_path": target,
+                "in_realtime": target in projects,
+                "realtime_backup_projects": projects,
+                "realtime_interval_seconds": cfg.realtime_backup_interval_seconds,
+            }
         elif name == "project-auto-backup-install-git-hook":
             result = install_project_git_hook(_project_path_from_payload(payload), cfg)
         elif name == "project-auto-backup-uninstall-git-hook":
@@ -1915,8 +1918,6 @@ class DesktopRuntime:
                 device_id=str(payload.get("device_id") or "").strip() or None,
                 restore_config=bool(payload.get("restore_config", False)),
             )
-        elif name == "resume":
-            result = {"path": str(create_resume_prompt(cfg))}
         elif name == "wsl-status":
             result = wsl_status()
         elif name == "list-codex-homes":
@@ -1975,33 +1976,6 @@ class DesktopRuntime:
             result = self.start_daemon()
         elif name == "stop-daemon":
             result = self.stop_daemon()
-        elif name == "list-snapshots":
-            result = list_remote_snapshots(cfg)
-        elif name == "snapshot-detail":
-            snapshot_id = payload.get("snapshot_id")
-            if not snapshot_id:
-                raise ValueError("Missing 'snapshot_id' parameter")
-            result = get_remote_snapshot_detail(cfg, str(snapshot_id))
-        elif name == "remote-resume":
-            snapshot_id = payload.get("snapshot_id")
-            if not snapshot_id:
-                raise ValueError("Missing 'snapshot_id' parameter")
-            result = generate_remote_resume_context(cfg, str(snapshot_id))
-        elif name == "preview-restore":
-            snapshot_id = payload.get("snapshot_id")
-            if not snapshot_id:
-                raise ValueError("Missing 'snapshot_id' parameter")
-            result = preview_restore_snapshot(cfg, str(snapshot_id), restore_hooks=bool(payload.get("restore_hooks", False)))
-        elif name == "restore-snapshot":
-            snapshot_id = payload.get("snapshot_id")
-            if not snapshot_id:
-                raise ValueError("Missing 'snapshot_id' parameter")
-            result = restore_snapshot_locally(
-                cfg,
-                str(snapshot_id),
-                confirm_snapshot_id=str(payload.get("confirm_snapshot_id", "")),
-                restore_hooks=bool(payload.get("restore_hooks", False)),
-            )
         elif name == "install-task":
             result = install_windows_task(minutes=int(payload.get("minutes", cfg.sync_interval_seconds // 60 or 3)))
         elif name == "uninstall-task":
@@ -2214,7 +2188,6 @@ class DesktopRuntime:
         if name in {
             "sync-now",
             "full-backup-now",
-            "restore-snapshot",
             "restore-channels",
             "merge-channels",
             "restore-threads",

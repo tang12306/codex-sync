@@ -23,7 +23,6 @@ def ensure_app_dirs() -> Path:
     for child in (
         root,
         root / "events",
-        root / "outbox",
         root / "snapshots",
         root / "logs",
         root / "wsl",

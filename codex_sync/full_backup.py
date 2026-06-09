@@ -191,6 +191,7 @@ def encryption_status(config: AppConfig) -> dict[str, Any]:
         "enabled": bool(getattr(config, "full_backup_encryption_enabled", True)),
         "configured": bool(secret),
         "source": source if secret else "",
+        "key_id": _encryption_key_id(secret) if secret else "",
         "key_file": str(encryption_key_path()),
         "env_var": ENCRYPTION_ENV_VAR,
     }

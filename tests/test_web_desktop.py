@@ -217,7 +217,6 @@ class WebDesktopTests(unittest.TestCase):
         health = {"success": True, "local": {}, "devices": [], "pending_devices": []}
         with (
             patch("codex_sync.web_desktop.windows_task_status", return_value={"installed": True}),
-            patch("codex_sync.web_desktop.outbox_count", return_value=0),
             patch("codex_sync.web_desktop.hook_status", return_value={"events": ["Stop"]}),
             patch("codex_sync.web_desktop._project_state", return_value={"exists": True, "is_dir": True, "is_repo": True, "dirty": False, "root": "C:\\project"}),
             patch("codex_sync.web_desktop.project_auto_backup_status", return_value={"queue_count": 0, "enabled_for_git_commit": True}),

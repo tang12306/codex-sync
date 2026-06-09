@@ -66,17 +66,3 @@ export function shortId(value) {
   if (!text) return "-";
   return text.length > 16 ? `${text.slice(0, 12)}…` : text;
 }
-
-// 把 unified diff 文本渲染成带行级高亮的 HTML（每行已 escapeHtml）。
-export function formatDiff(diffText) {
-  if (!diffText) return "";
-  return diffText
-    .split("\n")
-    .map((line) => {
-      if (line.startsWith("+")) return `<span class="diff-added">${escapeHtml(line)}</span>`;
-      if (line.startsWith("-")) return `<span class="diff-removed">${escapeHtml(line)}</span>`;
-      if (line.startsWith("@")) return `<span class="diff-meta">${escapeHtml(line)}</span>`;
-      return escapeHtml(line);
-    })
-    .join("\n");
-}

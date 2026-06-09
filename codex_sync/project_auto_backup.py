@@ -4,6 +4,7 @@ import json
 import hashlib
 import os
 import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -122,7 +123,8 @@ def _filesystem_content_id(root: Path, config: AppConfig) -> str:
 
 
 def _content_id(root: Path, mode: str, config: AppConfig, commit_ref: str | None = None, is_repo: bool | None = None) -> str:
-    if is_repo is False or not git_root(root):
+    # 完整快照（full/git_full/baseline/worktree）按工作树内容哈希去重：内容真变才重传，没变就跳过。
+    if mode in {"full", "git_full", "baseline", "worktree"} or is_repo is False or not git_root(root):
         return _filesystem_content_id(root, config)
     commit = _git_commit(root, commit_ref or "HEAD")
     if mode == "git_commit":
@@ -132,9 +134,9 @@ def _content_id(root: Path, mode: str, config: AppConfig, commit_ref: str | None
 
 
 def _mode_for_reason(reason: str) -> str:
-    if reason == "codex-stop":
-        return "full"
-    return "git_commit" if reason == "git-post-commit" else "worktree"
+    # 统一完整快照：每个上云的包都 backup_kind=full、独立完整可恢复，
+    # B 机一键拉最新包解压即可，无需补丁链。reason 仅用于记录触发来源。
+    return "full"
 
 
 def _queue_path(item_id: str) -> Path:
@@ -250,10 +252,8 @@ def run_project_auto_backup_item(config: AppConfig, item: dict[str, Any]) -> dic
     if existing is not None:
         return existing
     mode = str(item.get("mode") or _mode_for_reason(str(item.get("reason") or "")))
+    # 0.3.3：统一完整快照——每次都传独立完整可恢复的包，不再区分首次基线/后续补丁。
     if not is_repo:
-        mode = "full"
-    project = _read_state().get("projects", {}).get(_project_key(root), {})
-    if is_repo and not project.get("last_full_backup_id"):
         mode = "full"
     result = backup_project_to_server_for_auto(root, config, mode=mode, reason=str(item.get("reason") or "auto"), commit_ref=item.get("commit"))
     return result
@@ -317,12 +317,21 @@ def _strip_managed_block(text: str) -> str:
     return text
 
 
-def _hook_script() -> str:
+def _cli_invoker() -> list[str]:
+    """CLI 调用前缀：打包 exe 用自身（CodexSync.exe <子命令>，路径稳定）；
+    源码模式用 pythonw + hook_runner.py。"""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
     runner = Path(__file__).resolve().parent / "hook_runner.py"
+    return [pythonw_executable(), str(runner)]
+
+
+def _hook_script() -> str:
+    invoker = " ".join(_quote_sh(part) for part in _cli_invoker())
     lines = [
         HOOK_BEGIN,
         'REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"',
-        f"{_quote_sh(pythonw_executable())} {_quote_sh(runner)} project-auto-backup --reason git-post-commit --cwd \"$REPO_ROOT\" --process >/dev/null 2>&1 &",
+        f'{invoker} project-auto-backup --reason git-post-commit --cwd "$REPO_ROOT" --process >/dev/null 2>&1 &',
         HOOK_END,
     ]
     return "\n".join(lines)
@@ -412,10 +421,8 @@ def project_auto_backup_status(cwd: str | Path | None, config: AppConfig) -> dic
 
 
 def spawn_project_auto_backup(cwd: str | Path | None, *, reason: str = "manual") -> dict[str, Any]:
-    runner = Path(__file__).resolve().parent / "hook_runner.py"
     args = [
-        pythonw_executable(),
-        str(runner),
+        *_cli_invoker(),
         "project-auto-backup",
         "--reason",
         reason,

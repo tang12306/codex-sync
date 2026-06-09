@@ -202,7 +202,8 @@ class ProjectAutoBackupTests(unittest.TestCase):
                     self.assertTrue(queued["queued"])
                     processed = process_project_auto_backup_queue(cfg)
                     self.assertTrue(processed["processed"][0]["result"]["success"])
-                    self.assertEqual(processed["processed"][0]["result"]["package"]["manifest"]["source_mode"], "git_commit")
+                    # 0.3.3：自动备份统一为完整快照，后续提交也走 git_full（不再降级为 git_commit 补丁）
+                    self.assertEqual(processed["processed"][0]["result"]["package"]["manifest"]["source_mode"], "git_full")
                 finally:
                     httpd.shutdown()
                     httpd.server_close()

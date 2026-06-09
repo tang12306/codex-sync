@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -16,13 +17,21 @@ def hooks_path() -> Path:
     return codex_home() / "hooks.json"
 
 
-def _command(event: str) -> str:
+def _hook_invoker() -> list[str]:
+    """hook 调用前缀：打包 exe 用自身（CodexSync.exe <子命令>，路径稳定）；
+    源码模式用 pythonw + hook_runner.py。"""
+    if getattr(sys, "frozen", False):
+        return [sys.executable]
     script = Path(__file__).resolve().parent / "hook_runner.py"
-    return subprocess.list2cmdline([pythonw_executable(), str(script), "capture", "--event", event, "--sync"])
+    return [pythonw_executable(), str(script)]
+
+
+def _command(event: str) -> str:
+    return subprocess.list2cmdline([*_hook_invoker(), "capture", "--event", event])
 
 
 def _posix_command(event: str) -> str:
-    return f"python3 -m codex_sync capture --event {event} --sync"
+    return f"python3 -m codex_sync capture --event {event}"
 
 
 def _hook_entry(event: str) -> dict[str, Any]:
@@ -46,8 +55,9 @@ def _hook_entry(event: str) -> dict[str, Any]:
 
 def _contains_codex_sync(entry: dict[str, Any]) -> bool:
     for hook in entry.get("hooks", []):
-        command = hook.get("commandWindows") or hook.get("command") or ""
-        if "codex_sync" in command or "codex-sync" in command:
+        command = (hook.get("commandWindows") or hook.get("command") or "").lower()
+        # 同时匹配源码模式（codex_sync / codex-sync）与打包 exe（CodexSync.exe → codexsync）
+        if "codex_sync" in command or "codex-sync" in command or "codexsync" in command:
             return True
     return False
 

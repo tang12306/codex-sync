@@ -39,6 +39,8 @@ class AppConfig:
     full_backup_retention_max_bytes: int = 2 * 1024 * 1024 * 1024
     project_auto_backup_on_codex_stop: bool = True
     project_auto_backup_min_interval_seconds: int = 10 * 60
+    realtime_backup_projects: list[str] = field(default_factory=list)
+    realtime_backup_interval_seconds: int = 5 * 60
     desktop_close_behavior: str = "ask"  # ask | minimize_to_tray | exit
 
     @classmethod

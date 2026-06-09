@@ -4,7 +4,7 @@ import { h, asObject } from "../dom.js";
 import { saveConfig, runAction } from "../api.js";
 import { refreshStatus } from "../poller.js";
 import { showToast } from "../toast.js";
-import { consoleCard, makeRun, actionButton } from "../ui.js";
+import { makeRun, actionButton } from "../ui.js";
 
 function loadingSpinner(text = "加载中…") {
   return h("div", { class: "spinner-wrap" }, h("span", { class: "spinner" }), h("span", {}, text));
@@ -45,7 +45,6 @@ function fromUnit(value, multiplier, fallback) {
 
 export function mount(root, store) {
   const run = makeRun(store);
-  const { card: outCard, setOutput } = consoleCard("系统设置详情输出");
 
   let currentTab = "server"; // server | policy | automation | diagnosis
   let dirty = false; // 用户是否修改了表单
@@ -116,6 +115,7 @@ export function mount(root, store) {
     encPass.type = show ? "text" : "password";
     toggleEncPass.textContent = show ? "隐藏" : "显示";
   });
+  const encFingerprint = h("div", { class: "field-hint", style: "margin-top:6px" }, "");
 
   const connCard = h(
     "div",
@@ -143,11 +143,11 @@ export function mount(root, store) {
         h("span", {}, "完整备份加密密码"),
         h("span", { class: "field-hint" }, "两台电脑填同一密码即可互相恢复；设置后自动启用加密、关闭明文上传")
       ),
-      h("div", { class: "input-wrap" }, encPass, toggleEncPass)
+      h("div", { class: "input-wrap" }, encPass, toggleEncPass),
+      encFingerprint
     )
   );
 
-  const { card: deployOut, setOutput: setDeployOut } = consoleCard("部署终端输出");
   const deployFields = {};
   const deployInput = (key, attrs = {}) => (deployFields[key] = h("input", { class: "input", ...attrs }));
   const deployField = (key, label, hint, attrs = {}) =>
@@ -237,17 +237,15 @@ export function mount(root, store) {
       const result = await runAction("deploy-config");
       syncDeployFields(result.config);
     } catch (e) {
-      setDeployOut({ error: String(e.message || e) });
+      showToast(String(e.message || e), "error");
     }
   }
 
   async function saveDeployConfig() {
     try {
-      const result = await runAction("save-deploy-config", deployPayload(false));
-      setDeployOut(result);
+      await runAction("save-deploy-config", deployPayload(false));
       showToast("部署配置已保存", "success");
     } catch (e) {
-      setDeployOut({ error: String(e.message || e) });
       showToast(String(e.message || e), "error");
     }
   }
@@ -335,27 +333,27 @@ export function mount(root, store) {
       actionButton("保存部署配置", "btn-ghost", saveDeployConfig),
       actionButton("查看远程服务状态", "btn-ghost", async () => {
         try {
-          setDeployOut({ loading: true, message: "正在与远程服务器建立 SSH 握手并拉取 Systemd 服务状态…" });
-          setDeployOut(await runAction("deploy-status", deployPayload(true)));
+          const result = await runAction("deploy-status", deployPayload(true));
+          const ok = result && result.success !== false && !result.error;
+          showToast(ok ? "远程服务状态已拉取，详情见日志面板" : `状态拉取失败：${result.error || "未知错误"}`, ok ? "success" : "error");
         } catch (e) {
-          setDeployOut({ error: String(e.message || e) });
+          showToast(String(e.message || e), "error");
         }
       }),
       actionButton("检查服务器版本", "btn-ghost", checkServerCompatibility),
       actionButton("一键安装服务器", "btn-primary", async () => {
         if (!window.confirm("将通过 SSH 在远程服务器创建目录、安装 systemd 服务、生成 token 并启动同步服务。确认开始安装？")) return;
-        setDeployOut(await run("deploy-install", { payload: { ...deployPayload(true), save_config: true, backfill_local: true }, okMsg: "服务器已安装并已回填本地连接配置", errMsg: "安装失败", label: "服务器安装" }));
+        await run("deploy-install", { payload: { ...deployPayload(true), save_config: true, backfill_local: true }, okMsg: "服务器已安装并已回填本地连接配置", errMsg: "安装失败", label: "服务器安装" });
         await refreshStatus(store);
         await checkServerCompatibility();
       }),
       actionButton("一键更新部署", "btn-primary", async () => {
         if (!window.confirm("将把本地 sync_server.py 编译并推送到已配置的远程服务器上重启。确认开始更新？")) return;
-        setDeployOut(await run("deploy-update", { payload: { ...deployPayload(true), save_config: true }, okMsg: "远程服务已成功升级", errMsg: "部署失败", label: "服务器部署", refresh: false }));
+        await run("deploy-update", { payload: { ...deployPayload(true), save_config: true }, okMsg: "远程服务已成功升级", errMsg: "部署失败", label: "服务器部署", refresh: false });
         await checkServerCompatibility();
       })
     ),
-    compatBody,
-    deployOut
+    compatBody
   );
 
   const downloadUpdateBtn = actionButton("下载新版安装包", "btn-primary", async () => {
@@ -589,7 +587,7 @@ export function mount(root, store) {
     "div",
     { class: "card" },
     h("div", { class: "card-title" }, h("span", {}, "后台守护进程 (Daemon)"), daemonBadge),
-    h("p", { class: "card-desc" }, "以前台循环或终端挂载的形式运行：按周期同步轻量快照、补发失败快照、监控内容 digest。"),
+    h("p", { class: "card-desc" }, "以前台循环或终端挂载的形式运行：按周期扫描并上传完整对话备份、监控内容 digest、处理项目自动备份队列。"),
     h(
       "div",
       { class: "card-actions" },
@@ -602,14 +600,12 @@ export function mount(root, store) {
     "div",
     { class: "card" },
     h("div", { class: "card-title" }, "手动同步控制"),
-    h("p", { class: "card-desc" }, "直接控制同步引擎上传 Outbox 失败项，补发 Dirty 通知，或生成接续诊断 Prompt。"),
+    h("p", { class: "card-desc" }, "立即扫描并上传完整对话备份、处理项目备份队列，或补发 Dirty 通知。"),
     h(
       "div",
       { class: "card-actions" },
       actionButton("立即同步", "btn-primary", () => run("sync-now", { okMsg: "同步流程执行完毕" })),
-      actionButton("补发 Outbox 队列", "btn-ghost", () => run("flush-outbox", { okMsg: "Outbox 补发队列发送完毕" })),
       actionButton("补发 Dirty 通知", "btn-ghost", () => run("notify-change", { okMsg: "已强制推送脏通知" })),
-      actionButton("生成接续 Prompt", "btn-ghost", () => run("resume", { refresh: false, okMsg: "本地接续上下文 Prompt 已写入" })),
       actionButton("模拟捕获 Hook 事件", "btn-ghost", () => run("test-capture", { okMsg: "已向 stdin 管道注入测试 Hook 数据" }))
     )
   );
@@ -717,8 +713,7 @@ export function mount(root, store) {
     panelPolicy,
     panelAutomation,
     panelDiagnosis,
-    h("div", { class: "form-actions", style: { marginTop: "20px" } }, saveBtn),
-    h("div", { class: "section", style: { marginTop: "20px" } }, outCard)
+    h("div", { class: "form-actions", style: { marginTop: "20px" } }, saveBtn)
   );
 
   // --- 初始化同步与状态刷新 ---
@@ -748,6 +743,12 @@ export function mount(root, store) {
     }
     if (document.activeElement !== f.full_backup_encryption_passphrase) {
       f.full_backup_encryption_passphrase.placeholder = cfg.full_backup_encryption_passphrase_configured ? "已保存加密口令，留空保持不变" : "留空则使用本机自动生成的私有 key";
+    }
+    const enc = (cfg.full_backup_encryption && typeof cfg.full_backup_encryption === "object") ? cfg.full_backup_encryption : {};
+    if (enc.configured && enc.key_id) {
+      encFingerprint.textContent = `当前密钥指纹：${enc.key_id}　·　在另一台电脑填入相同密码，指纹一致即可互相解密恢复`;
+    } else {
+      encFingerprint.textContent = "尚未设置加密密钥：填入上方密码并保存后，这里会显示密钥指纹用于跨设备核对";
     }
   };
 
@@ -921,17 +922,13 @@ export function mount(root, store) {
   renderTabs();
   switchTab(currentTab);
 
-  setOutput(store.getState().console);
-
   const uConfig = store.select(s => s.status?.config, syncFields);
   const uStatus = store.select(s => s.status, syncBadges);
   const uAppInstall = store.select(s => s.status?.app_install, renderAppInstall);
-  const uCon = store.select(s => s.console, () => setOutput(store.getState().console));
 
   return () => {
     uConfig();
     uStatus();
     uAppInstall();
-    uCon();
   };
 }

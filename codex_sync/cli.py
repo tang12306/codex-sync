@@ -5,7 +5,7 @@ import json
 import os
 import sys
 
-from .collector import capture_event, create_resume_prompt
+from .collector import capture_event
 from .config import AppConfig, load_config, save_config
 from .daemon import run_daemon
 from .disaster_backup import create_disaster_backup
@@ -31,16 +31,8 @@ from .full_backup import (
     scan_full_backup_changes,
 )
 from .server import (
-    flush_outbox,
-    outbox_count,
     get_server_retention,
-    sync_once,
-    list_remote_snapshots,
-    get_remote_snapshot_detail,
-    generate_remote_resume_context,
     prune_server_retention,
-    preview_restore_snapshot,
-    restore_snapshot_locally,
     check_server_compatibility,
 )
 from .windows_task import install_windows_task, uninstall_windows_task, windows_task_status
@@ -98,7 +90,7 @@ def cmd_config(args: argparse.Namespace) -> None:
 
 def cmd_capture(args: argparse.Namespace) -> None:
     cfg = load_config()
-    raw = sys.stdin.read()
+    raw = sys.stdin.read() if sys.stdin is not None else ""
     item = capture_event(args.event, raw, cfg, cwd=os.getcwd())
     result = {
         "captured": item,
@@ -110,17 +102,14 @@ def cmd_capture(args: argparse.Namespace) -> None:
             changed_at=item["created_at"],
         ),
     }
-    if args.sync:
-        result["sync"] = sync_once(cfg, cwd=os.getcwd())
     if args.event == "Stop" and cfg.project_auto_backup_on_codex_stop:
         result["project_auto_backup"] = enqueue_project_auto_backup(os.getcwd(), cfg, reason="codex-stop")
     print_json(result)
 
 
-def cmd_sync_now(args: argparse.Namespace) -> None:
+def cmd_sync_now(_: argparse.Namespace) -> None:
     cfg = load_config()
-    result: dict[str, object] = {"sync": sync_once(cfg, cwd=os.getcwd(), skip_unchanged=bool(args.skip_unchanged_snapshot))}
-    result["flush_outbox"] = flush_outbox(cfg)
+    result: dict[str, object] = {}
     if cfg.full_backup_enabled:
         result["full_backup_scan"] = scan_full_backup_changes(cfg, create_package=True, notify_dirty=True, check_remote=True, upload=True)
         result["device_state"] = get_remote_device_state(cfg)
@@ -151,12 +140,6 @@ def cmd_project_auto_backup(args: argparse.Namespace) -> None:
     if args.process:
         result["process"] = process_project_auto_backup_queue(cfg, limit=args.limit)
     print_json(result)
-
-
-def cmd_desktop_legacy(_: argparse.Namespace) -> None:
-    from .desktop import main as desktop_main
-
-    desktop_main()
 
 
 def cmd_daemon(_: argparse.Namespace) -> None:
@@ -282,9 +265,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--port", type=int, help="Bind the local web UI to a specific port.")
     p.set_defaults(func=cmd_desktop)
 
-    p = sub.add_parser("desktop-legacy", help="Open the legacy Tkinter desktop test console.")
-    p.set_defaults(func=cmd_desktop_legacy)
-
     p = sub.add_parser("config", help="Show or update local configuration.")
     p.add_argument("--server-url")
     p.add_argument("--api-token")
@@ -318,24 +298,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("capture", help="Capture a Codex hook event from stdin.")
     p.add_argument("--event", required=True)
-    p.add_argument("--sync", action="store_true")
+    p.add_argument("--sync", action="store_true", help="Deprecated no-op; accepted for backward compatibility with already-installed hooks.")
     p.set_defaults(func=cmd_capture)
 
-    p = sub.add_parser("sync-now", help="Collect and upload one snapshot, then scan full conversation backup changes.")
-    p.add_argument("--skip-unchanged-snapshot", action="store_true", help="Skip lightweight snapshot upload when stable snapshot content has not changed.")
+    p = sub.add_parser("sync-now", help="Scan full conversation backup changes, upload, and process the project auto-backup queue.")
     p.set_defaults(func=cmd_sync_now)
-
-    p = sub.add_parser("flush-outbox", help="Send queued snapshots.")
-    p.set_defaults(func=lambda _args: print_json(flush_outbox(load_config())))
-
-    p = sub.add_parser("outbox", help="Show queued snapshot count.")
-    p.set_defaults(func=lambda _args: print_json({"count": outbox_count()}))
 
     p = sub.add_parser("daemon", help="Run foreground sync loop.")
     p.set_defaults(func=cmd_daemon)
-
-    p = sub.add_parser("resume", help="Generate a resume prompt from local state.")
-    p.set_defaults(func=lambda _args: print_json({"path": str(create_resume_prompt(load_config(), cwd=os.getcwd()))}))
 
     p = sub.add_parser("git-snapshot", help="Create a local patch snapshot for the current repo.")
     p.set_defaults(func=lambda _args: print_json(create_patch_snapshot(os.getcwd(), load_config())))
@@ -435,11 +405,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--restore-config", action="store_true")
     p.set_defaults(func=lambda args: print_json(restore_latest_wsl_full_backup(args.distro, restore_config=args.restore_config, config=load_config())))
 
-    p = sub.add_parser("list-snapshots", help="List remote snapshots on the sync server.")
-    p.set_defaults(func=lambda _args: print_json(list_remote_snapshots(load_config())))
-
     p = sub.add_parser("server-retention", help="Preview or apply sync server retention cleanup.")
-    p.add_argument("--prune", action="store_true", help="Delete backups/snapshots selected by the server retention policy.")
+    p.add_argument("--prune", action="store_true", help="Delete backups selected by the server retention policy.")
     p.add_argument("--dry-run", action="store_true", help="Preview cleanup without deleting anything.")
     p.set_defaults(
         func=lambda args: print_json(
@@ -457,34 +424,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Check whether the remote sync server API is compatible with this client.",
     )
     p.set_defaults(func=lambda _args: print_json(check_server_compatibility(load_config())))
-
-    p = sub.add_parser("snapshot-detail", help="Fetch one remote snapshot by id.")
-    p.add_argument("snapshot_id")
-    p.set_defaults(func=lambda args: print_json(get_remote_snapshot_detail(load_config(), args.snapshot_id)))
-
-    p = sub.add_parser("remote-resume", help="Generate a resume prompt from a remote snapshot.")
-    p.add_argument("snapshot_id")
-    p.set_defaults(func=lambda args: print_json(generate_remote_resume_context(load_config(), args.snapshot_id)))
-
-    p = sub.add_parser("restore-snapshot", help="Restore configuration files from a remote snapshot.")
-    p.add_argument("snapshot_id")
-    p.add_argument("--confirm-snapshot-id", required=True)
-    p.add_argument("--restore-hooks", action="store_true")
-    p.set_defaults(
-        func=lambda args: print_json(
-            restore_snapshot_locally(
-                load_config(),
-                args.snapshot_id,
-                confirm_snapshot_id=args.confirm_snapshot_id,
-                restore_hooks=args.restore_hooks,
-            )
-        )
-    )
-
-    p = sub.add_parser("preview-restore", help="Preview local config changes before restoring a remote snapshot.")
-    p.add_argument("snapshot_id")
-    p.add_argument("--restore-hooks", action="store_true")
-    p.set_defaults(func=lambda args: print_json(preview_restore_snapshot(load_config(), args.snapshot_id, restore_hooks=args.restore_hooks)))
 
     p = sub.add_parser("install-task", help="Install a Windows scheduled task for periodic sync-now.")
     p.add_argument("--minutes", type=int, default=3)

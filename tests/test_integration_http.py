@@ -18,14 +18,7 @@ from codex_sync.git_backup import (
     restore_project_backup,
 )
 from codex_sync.util import run_cmd
-from codex_sync.server import (
-    check_server_compatibility,
-    flush_outbox,
-    generate_remote_resume_context,
-    get_remote_snapshot_detail,
-    list_remote_snapshots,
-    sync_once,
-)
+from codex_sync.server import check_server_compatibility
 
 
 class HttpIntegrationTests(unittest.TestCase):
@@ -59,74 +52,6 @@ class HttpIntegrationTests(unittest.TestCase):
             finally:
                 sync_server.DATA_DIR = old_data_dir
                 sync_server.DB_PATH = old_db_path
-
-    def test_sync_list_detail_resume_and_outbox_flush(self) -> None:
-        with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as codex_home, tempfile.TemporaryDirectory() as data_dir:
-            old_sync = os.environ.get("CODEX_SYNC_HOME")
-            old_codex = os.environ.get("CODEX_HOME")
-            old_data_dir = sync_server.DATA_DIR
-            old_db_path = sync_server.DB_PATH
-            os.environ["CODEX_SYNC_HOME"] = sync_home
-            os.environ["CODEX_HOME"] = codex_home
-            try:
-                sync_server.DATA_DIR = Path(data_dir).resolve()
-                sync_server.DB_PATH = sync_server.DATA_DIR / "snapshots.sqlite3"
-                sync_server.init_db()
-                token = "integration-token"
-                sync_server.SyncHandler.token = token
-                httpd = ThreadingHTTPServer(("127.0.0.1", 0), sync_server.SyncHandler)
-                thread = threading.Thread(target=httpd.serve_forever, daemon=True)
-                thread.start()
-                server_url = f"http://127.0.0.1:{httpd.server_port}"
-                try:
-                    secret = "sk-testabcdefghijklmnopqrstuvwxyz123456"
-                    Path(codex_home, "config.toml").write_text(f"api_key = '{secret}'\n", encoding="utf-8")
-                    cfg = AppConfig(server_url=server_url, api_token=token, device_id="integration-device")
-
-                    synced = sync_once(cfg, cwd=sync_home)
-                    self.assertTrue(synced["sent"])
-
-                    skipped = sync_once(cfg, cwd=sync_home, skip_unchanged=True)
-                    self.assertTrue(skipped["skipped"])
-                    self.assertFalse(skipped["sent"])
-
-                    listed = list_remote_snapshots(cfg)
-                    self.assertTrue(listed["success"])
-                    self.assertEqual(len(listed["snapshots"]), 1)
-                    snapshot_id = synced["snapshot_id"]
-
-                    detail = get_remote_snapshot_detail(cfg, snapshot_id)
-                    self.assertTrue(detail["success"])
-                    snapshot = detail["snapshot"]
-                    self.assertEqual(snapshot["id"], snapshot_id)
-                    self.assertEqual(snapshot["codex"]["configs"], {})
-                    preview = snapshot["codex"]["config_files"]["config.toml"]["redacted_preview"]
-                    self.assertNotIn(secret, preview)
-                    self.assertIn("<redacted>", preview)
-
-                    resume = generate_remote_resume_context(cfg, snapshot_id)
-                    self.assertTrue(resume["success"])
-                    self.assertTrue(Path(resume["path"]).exists())
-
-                    queued = sync_once(AppConfig(server_url="", api_token=token, device_id="queued-device"), cwd=sync_home)
-                    self.assertTrue(queued["queued"])
-                    flushed = flush_outbox(cfg)
-                    self.assertGreaterEqual(flushed["sent"], 1)
-                finally:
-                    httpd.shutdown()
-                    httpd.server_close()
-                    thread.join(timeout=5)
-            finally:
-                sync_server.DATA_DIR = old_data_dir
-                sync_server.DB_PATH = old_db_path
-                if old_sync is None:
-                    os.environ.pop("CODEX_SYNC_HOME", None)
-                else:
-                    os.environ["CODEX_SYNC_HOME"] = old_sync
-                if old_codex is None:
-                    os.environ.pop("CODEX_HOME", None)
-                else:
-                    os.environ["CODEX_HOME"] = old_codex
 
     def test_devices_listing_and_sync_health(self) -> None:
         with tempfile.TemporaryDirectory() as sync_home, tempfile.TemporaryDirectory() as data_dir:
@@ -300,18 +225,14 @@ class HttpIntegrationTests(unittest.TestCase):
                 sync_server.RETENTION_FULL_BACKUP_DAYS,
                 sync_server.RETENTION_PROJECT_BACKUP_KEEP,
                 sync_server.RETENTION_PROJECT_BACKUP_DAYS,
-                sync_server.RETENTION_SNAPSHOT_KEEP,
-                sync_server.RETENTION_SNAPSHOT_DAYS,
                 sync_server.RETENTION_MAX_BYTES,
             )
             sync_server.DATA_DIR = Path(data_dir).resolve()
             sync_server.DB_PATH = sync_server.DATA_DIR / "snapshots.sqlite3"
             sync_server.RETENTION_FULL_BACKUP_KEEP = 99
             sync_server.RETENTION_PROJECT_BACKUP_KEEP = 99
-            sync_server.RETENTION_SNAPSHOT_KEEP = 99
             sync_server.RETENTION_FULL_BACKUP_DAYS = 0
             sync_server.RETENTION_PROJECT_BACKUP_DAYS = 0
-            sync_server.RETENTION_SNAPSHOT_DAYS = 0
             sync_server.RETENTION_MAX_BYTES = 0
             try:
                 sync_server.init_db()
@@ -339,13 +260,6 @@ class HttpIntegrationTests(unittest.TestCase):
                         io.BytesIO(project_body),
                         len(project_body),
                     )
-                    sync_server.save_snapshot(
-                        {
-                            "id": f"snap-{idx}",
-                            "device_id": "dev-ret",
-                            "created_at": f"2026-06-07T00:00:0{idx}+00:00",
-                        }
-                    )
 
                 conn = sync_server.connect_db()
                 try:
@@ -353,37 +267,32 @@ class HttpIntegrationTests(unittest.TestCase):
                         stamp = f"2026-06-07T00:00:0{idx}+00:00"
                         conn.execute("UPDATE full_backups SET received_at=? WHERE id=?", (stamp, f"full-{idx}"))
                         conn.execute("UPDATE project_backups SET received_at=? WHERE id=?", (stamp, f"proj-{idx}"))
-                        conn.execute("UPDATE snapshots SET received_at=? WHERE id=?", (stamp, f"snap-{idx}"))
                     conn.commit()
                 finally:
                     conn.close()
 
                 sync_server.RETENTION_FULL_BACKUP_KEEP = 2
                 sync_server.RETENTION_PROJECT_BACKUP_KEEP = 2
-                sync_server.RETENTION_SNAPSHOT_KEEP = 2
                 preview = sync_server.prune_retention(dry_run=True)
                 self.assertTrue(preview["success"])
-                self.assertEqual(preview["planned_count"], 3)
-                self.assertEqual({item["id"] for item in preview["planned"]}, {"full-0", "proj-0", "snap-0"})
+                self.assertEqual(preview["planned_count"], 2)
+                self.assertEqual({item["id"] for item in preview["planned"]}, {"full-0", "proj-0"})
 
                 pruned = sync_server.prune_retention(dry_run=False)
                 self.assertTrue(pruned["success"])
-                self.assertEqual(pruned["deleted_count"], 3)
+                self.assertEqual(pruned["deleted_count"], 2)
                 self.assertFalse((sync_server.full_backups_dir() / "full-0.zip").exists())
                 self.assertFalse((sync_server.project_backups_dir() / "repo-ret-proj-0.zip").exists())
                 self.assertTrue((sync_server.full_backups_dir() / "full-2.zip").exists())
 
                 self.assertEqual({row["id"] for row in sync_server.list_full_backups(limit=50)}, {"full-1", "full-2"})
                 self.assertEqual({row["id"] for row in sync_server.list_project_backups(limit=50)}, {"proj-1", "proj-2"})
-                self.assertEqual({row["id"] for row in sync_server.list_snapshots(limit=50)}, {"snap-1", "snap-2"})
             finally:
                 (
                     sync_server.RETENTION_FULL_BACKUP_KEEP,
                     sync_server.RETENTION_FULL_BACKUP_DAYS,
                     sync_server.RETENTION_PROJECT_BACKUP_KEEP,
                     sync_server.RETENTION_PROJECT_BACKUP_DAYS,
-                    sync_server.RETENTION_SNAPSHOT_KEEP,
-                    sync_server.RETENTION_SNAPSHOT_DAYS,
                     sync_server.RETENTION_MAX_BYTES,
                 ) = old_policy
                 sync_server.DATA_DIR = old_data_dir

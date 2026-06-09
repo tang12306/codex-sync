@@ -732,6 +732,38 @@ def restore_project_backup_from_server(
     return {"success": bool(restored.get("success")), "download": downloaded, "restore": restored, "error": restored.get("error")}
 
 
+def restore_latest_project_backup(
+    config: AppConfig,
+    repo_name: str,
+    target_dir: str | Path,
+    *,
+    overwrite: bool = True,
+) -> dict[str, Any]:
+    """挑该项目云端最新的完整备份（backup_kind=full）一键恢复到 target_dir。
+
+    用于「合上 A 机，在 B 机一键拿到最新完整代码」：无需手动选基线/补丁。
+    完整快照含工作树全部安全文件（不含 .git 历史），恢复即得可用源码目录。
+    """
+    if not repo_name:
+        return {"success": False, "error": "repo_name is required"}
+    listing = list_project_backups(config, repo_name=repo_name, limit=200)
+    if not isinstance(listing, dict) or listing.get("success") is False:
+        error = listing.get("error") if isinstance(listing, dict) else None
+        return {"success": False, "error": error or "无法获取云端项目备份列表", "repo_name": repo_name}
+    backups = listing.get("project_backups")
+    if not isinstance(backups, list) or not backups:
+        return {"success": False, "error": f"云端没有项目 {repo_name} 的备份", "repo_name": repo_name}
+    full = [b for b in backups if isinstance(b, dict) and b.get("backup_kind") == "full" and b.get("id")]
+    if not full:
+        return {"success": False, "error": f"项目 {repo_name} 在云端只有补丁备份、没有可独立恢复的完整包", "repo_name": repo_name}
+    chosen = max(full, key=lambda b: str(b.get("received_at") or b.get("created_at") or ""))
+    backup_id = str(chosen.get("id"))
+    result = restore_project_backup_from_server(config, backup_id, target_dir, confirm_backup_id=backup_id, overwrite=overwrite)
+    result.setdefault("backup_id", backup_id)
+    result["selected"] = chosen
+    return result
+
+
 def backup_to_github(cwd: str | Path | None, config: AppConfig) -> dict[str, Any]:
     snapshot = create_patch_snapshot(cwd, config)
     source_root = git_root(cwd)
