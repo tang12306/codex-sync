@@ -53,7 +53,7 @@ python -m pytest tests/test_config.py::test_load_config -v
 
 ```powershell
 # Windows 安装包：PyInstaller onedir → Inno Setup 安装向导（-Version 省略时读 __init__.py）
-powershell -File scripts/build_windows_release.ps1 -Version 0.4.0
+powershell -File scripts/build_windows_release.ps1 -Version 0.5.0
 ```
 
 需要 PyInstaller、pywebview 和 Inno Setup 6（`winget install JRSoftware.InnoSetup`）。打包入口是 `app_entry.py`，程序目录在 `dist/CodexSync/`，安装包为 `dist/CodexSyncSetup-vX.Y.Z-windows-x64.exe`。安装脚本在 `installer/CodexSync.iss`（中文语言文件、向导图片也在 `installer/`，图片由 `scripts/make_installer_images.py` 生成）。.iss 里的 AppId、互斥体名、Run 值名必须和 `app_install.py` / `SingleInstance` 一致，`tests/test_app_install.py` 会校验。
@@ -66,7 +66,7 @@ powershell -File scripts/build_windows_release.ps1 -Version 0.4.0
 app_entry.py          ← PyInstaller EXE 入口：无参数打开桌面端，有参数走 CLI（安装/卸载由 Inno Setup 负责）
 codex_sync/cli.py     ← CLI 入口，argparse 子命令 → 各模块函数
 codex_sync/sync_server.py  ← 独立同步服务器（SQLite + HTTP），部署到 Linux
-codex_sync/__init__.py     ← 版本号 __version__ = "0.4.0"
+codex_sync/__init__.py     ← 版本号 __version__ = "0.5.0"
 ```
 
 ### 桌面端架构 (web_desktop.py)
