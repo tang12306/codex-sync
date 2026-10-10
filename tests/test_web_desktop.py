@@ -237,6 +237,158 @@ class WebDesktopTests(unittest.TestCase):
         self.assertEqual(wsl_item["tone"], "")
         self.assertNotIn("Codex", result["summary"]["text"])
 
+    def test_status_reports_auto_upload_and_version(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                runtime.save_config({"full_backup_auto_upload": False})
+                status = runtime.status()
+                self.assertIs(status["config"]["full_backup_auto_upload"], False)
+                self.assertEqual(status["app_version"], __version__)
+                runtime.save_config({"full_backup_auto_upload": True})
+                self.assertIs(runtime.status()["config"]["full_backup_auto_upload"], True)
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_action_log_keeps_summary_without_conversation_text(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                secret_text = "这是一段私密的对话正文"
+                fake = {
+                    "success": True,
+                    "thread": {"id": "t1", "title": "标题"},
+                    "messages": [{"role": "user", "text": secret_text}] * 50,
+                    "message_count": 50,
+                }
+                with patch("codex_sync.web_desktop.read_conversation", return_value=fake):
+                    result = runtime.run_action("read-conversation", {"thread_id": "t1"})
+                self.assertEqual(len(result["messages"]), 50)  # 返回给前端的结果不受影响
+                entry = runtime.status()["logs"][-1]
+                self.assertEqual(entry["message"], "action completed: read-conversation")
+                self.assertTrue(entry["data"]["success"])
+                self.assertEqual(entry["data"]["message_count"], 50)
+                self.assertNotIn(secret_text, json.dumps(entry, ensure_ascii=False))
+                self.assertGreater(entry["id"], 0)
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_summarize_for_log_limits_size(self) -> None:
+        summary = web_desktop._summarize_for_log({
+            "long": "x" * 5000,
+            "items": list(range(100)),
+            "few": ["a", "b"],
+            "api_token": "secret-token",
+            "nested": {"a": {"b": {"c": {"d": 1}}}},
+        })
+        self.assertLessEqual(len(summary["long"]), web_desktop.LOG_STRING_LIMIT + 1)
+        self.assertEqual(summary["items"], "<100 项>")
+        self.assertEqual(summary["few"], ["a", "b"])
+        self.assertEqual(summary["api_token"], "<已省略>")
+        self.assertIsInstance(summary["nested"]["a"]["b"], str)
+
+    def test_successful_http_requests_are_not_logged(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            runtime = DesktopRuntime()
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(runtime))
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            try:
+                base = f"http://127.0.0.1:{httpd.server_port}"
+                request = urllib.request.Request(base + "/api/status", headers={"X-Codex-Sync-Desktop-Token": runtime.session_token})
+                for _ in range(3):
+                    urllib.request.urlopen(request, timeout=5).read()
+                with self.assertRaises(urllib.error.HTTPError):
+                    urllib.request.urlopen(base + "/api/status", timeout=5)
+                http_logs = [item for item in runtime.logs if item["level"] == "http"]
+                self.assertEqual(len(http_logs), 1)
+                self.assertIn("403", http_logs[0]["message"])
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+                thread.join(timeout=5)
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_test_server_connection_uses_unsaved_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                runtime.save_config({"server_url": "http://saved", "api_token": "saved-token"})
+                seen: list[AppConfig] = []
+
+                def fake_check(cfg: AppConfig) -> dict:
+                    seen.append(cfg)
+                    return {"success": True, "compatible": True}
+
+                with patch("codex_sync.web_desktop.check_server_compatibility", side_effect=fake_check):
+                    result = runtime.run_action("test-server-connection", {"server_url": "http://draft", "api_token": "draft-token"})
+                    fallback = runtime.run_action("test-server-connection", {})
+                self.assertTrue(result["success"])
+                self.assertEqual(result["server_url"], "http://draft")
+                self.assertIn("latency_ms", result)
+                self.assertEqual(seen[0].api_token, "draft-token")
+                self.assertEqual(seen[1].server_url, "http://saved")
+                self.assertEqual(seen[1].api_token, "saved-token")
+                # 测试连接不能改写已保存的配置
+                self.assertEqual(web_desktop.load_config().server_url, "http://saved")
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_test_server_connection_requires_url(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                with patch("codex_sync.web_desktop.check_server_compatibility") as check:
+                    result = runtime.run_action("test-server-connection", {})
+                self.assertFalse(result["success"])
+                self.assertIn("服务器地址", result["error"])
+                check.assert_not_called()
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
+    def test_open_exports_dir_only_opens_app_exports_folder(self) -> None:
+        with tempfile.TemporaryDirectory() as sync_home:
+            old_sync = os.environ.get("CODEX_SYNC_HOME")
+            os.environ["CODEX_SYNC_HOME"] = sync_home
+            try:
+                runtime = DesktopRuntime()
+                with patch("codex_sync.web_desktop._open_path") as opener:
+                    result = runtime.run_action("open-exports-dir", {"path": "C:\\Windows"})
+                self.assertTrue(result["success"])
+                opened = opener.call_args.args[0]
+                self.assertEqual(opened.name, "exports")
+                self.assertTrue(web_desktop.is_within(opened, web_desktop.Path(sync_home)))
+            finally:
+                if old_sync is None:
+                    os.environ.pop("CODEX_SYNC_HOME", None)
+                else:
+                    os.environ["CODEX_SYNC_HOME"] = old_sync
+
     @unittest.skipUnless(os.name == "nt", "Windows mutex behavior")
     def test_single_instance_rejects_second_owner(self) -> None:
         name = f"Local\\CodexSyncTest-{uuid.uuid4()}"

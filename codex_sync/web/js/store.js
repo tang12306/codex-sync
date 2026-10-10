@@ -48,6 +48,8 @@ export function initialState() {
     statusError: null,
     route: "overview",
     logs: { filter: "all", search: "", autoScroll: true, panelOpen: false },
+    // 服务器连接检查结果（由 connection.js 写入）：state 为 unknown / unconfigured / checking / ok / warn / down
+    connection: { state: "unknown", result: null, checkedAt: 0, serverUrl: "" },
     overview: {
       appUpdate: null,
       appUpdateLoadedAt: 0,
@@ -55,7 +57,7 @@ export function initialState() {
       compatibilityLoadedAt: 0,
       health: null,
       healthLoadedAt: 0,
-      healthExpanded: false,
+      healthExpanded: true,
     },
   };
 }

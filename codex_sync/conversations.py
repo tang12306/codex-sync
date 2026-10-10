@@ -48,10 +48,11 @@ def list_conversations(
             like = f"%{search}%"
             params += [like, like, like]
         wsql = ("WHERE " + " AND ".join(where)) if where else ""
+        effective_limit = max(1, min(int(limit or 500), 2000))
         rows = con.execute(
             "SELECT id,title,preview,first_user_message,cwd,model_provider,created_at,updated_at,"
             f"rollout_path,COALESCE(archived,0) AS archived FROM threads {wsql} ORDER BY updated_at DESC LIMIT ?",
-            [*params, max(1, min(int(limit or 500), 2000))],
+            [*params, effective_limit],
         ).fetchall()
         conversations: list[dict[str, Any]] = []
         for r in rows:
@@ -69,6 +70,8 @@ def list_conversations(
         "success": True,
         "conversations": conversations,
         "count": len(conversations),
+        "limit": effective_limit,
+        "truncated": len(conversations) >= effective_limit,
         "cwds": cwds,
         "providers": providers,
         "current_provider": current_codex_provider(),

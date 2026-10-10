@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ def _ensure_launcher() -> Path:
         "\n"
         "try:\n"
         "    from codex_sync.cli import main\n"
-        '    main(["sync-now", "--skip-unchanged-snapshot"])\n'
+        '    main(["sync-now"])\n'
         "except Exception:\n"
         "    import datetime\n"
         "    import traceback\n"
@@ -49,6 +50,9 @@ def _ensure_launcher() -> Path:
 
 
 def _task_command() -> str:
+    # 打包 exe 是无控制台窗口程序，直接调用自身即可；源码模式才需要 pythonw + .pyw 启动器
+    if getattr(sys, "frozen", False):
+        return f'"{Path(sys.executable).resolve()}" sync-now'
     launcher = _ensure_launcher()
     return f'"{pythonw_executable()}" "{launcher}"'
 

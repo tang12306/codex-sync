@@ -9,6 +9,7 @@ import threading
 import time
 import webbrowser
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -21,11 +22,11 @@ from .codex_channels import list_channels, merge_channels, merge_threads, restor
 from .collector import capture_event
 from .config import AppConfig, load_config, save_config
 from .daemon import run_daemon
-from .conversations import export_conversation, list_conversations, read_conversation
+from .conversations import export_conversation, exports_dir, list_conversations, read_conversation
 from .deploy import DeployConfig, deploy_config_path, deploy_status, install_server, load_deploy_config, save_deploy_config, update_server
 from .disaster_backup import create_disaster_backup
-from .app_install import app_install_status, install_app, set_startup_enabled
-from .app_update import check_app_update, download_latest_update, open_update_page
+from .app_install import app_install_status, set_startup_enabled
+from .app_update import check_app_update, download_latest_update, launch_update_installer, open_update_page
 from .git_backup import (
     backup_project_to_server,
     create_patch_snapshot,
@@ -745,6 +746,87 @@ def _realtime_projects_normalized(cfg: AppConfig) -> list[str]:
     return out
 
 
+LOG_STRING_LIMIT = 300
+LOG_MAX_KEYS = 30
+LOG_MAX_LIST_ITEMS = 5
+# 对话正文、密钥等不进入内存日志（日志会随 /api/status 返回给前端）
+LOG_REDACTED_KEYS = {
+    "messages",
+    "text",
+    "content",
+    "preview",
+    "first_user_message",
+    "api_token",
+    "token",
+    "passphrase",
+    "ssh_password",
+    "full_backup_encryption_passphrase",
+}
+
+
+def _summarize_for_log(value: Any, depth: int = 0) -> Any:
+    """把动作结果压缩成日志摘要：保留状态/计数/错误，省略正文和长列表。"""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= LOG_STRING_LIMIT else value[:LOG_STRING_LIMIT] + "…"
+    if isinstance(value, (list, tuple)):
+        if depth >= 2 or len(value) > LOG_MAX_LIST_ITEMS:
+            return f"<{len(value)} 项>"
+        return [_summarize_for_log(item, depth + 1) for item in value]
+    if isinstance(value, dict):
+        if depth >= 3:
+            return f"<{len(value)} 个字段>"
+        summary: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= LOG_MAX_KEYS:
+                summary["…"] = f"另有 {len(value) - LOG_MAX_KEYS} 个字段"
+                break
+            key = str(key)
+            summary[key] = "<已省略>" if key in LOG_REDACTED_KEYS and item else _summarize_for_log(item, depth + 1)
+        return summary
+    return _summarize_for_log(str(value), depth)
+
+
+def _config_with_server_overrides(cfg: AppConfig, payload: dict[str, Any]) -> AppConfig:
+    """测试连接时使用表单里尚未保存的地址/令牌，不写入配置文件。"""
+    updated = replace(cfg)
+    server_url = str(payload.get("server_url") or "").strip()
+    if server_url:
+        updated.server_url = server_url
+    api_token = str(payload.get("api_token") or "").strip()
+    if api_token:
+        updated.api_token = api_token
+    return updated
+
+
+def _test_server_connection(cfg: AppConfig, payload: dict[str, Any]) -> dict[str, Any]:
+    target = _config_with_server_overrides(cfg, payload)
+    if not target.server_url:
+        return {"success": False, "compatible": False, "error": "尚未填写服务器地址。"}
+    started = time.perf_counter()
+    result = check_server_compatibility(target)
+    result["server_url"] = target.server_url
+    result["latency_ms"] = int((time.perf_counter() - started) * 1000)
+    return result
+
+
+def _open_path(path: Path) -> None:
+    if os.name == "nt":
+        os.startfile(str(path))  # type: ignore[attr-defined]  # noqa: S606 - 只打开应用自己的导出目录
+    else:
+        webbrowser.open(path.as_uri())
+
+
+def _open_exports_dir() -> dict[str, Any]:
+    path = exports_dir()
+    try:
+        _open_path(path)
+    except OSError as exc:
+        return {"success": False, "path": str(path), "error": str(exc)}
+    return {"success": True, "path": str(path)}
+
+
 def _last_full_backup_uploaded_at() -> str | None:
     try:
         from .full_backup import state_path
@@ -1295,11 +1377,13 @@ def _list_conversations_for_scope(source_home: str, search: str, cwd: str, provi
         providers: set[str] = set()
         errors: list[dict[str, Any]] = []
         success_count = 0
+        truncated = False
         homes = _usable_homes()
         for home in homes:
             result = _list_conversations_for_home(home, search, cwd, provider, include_archived)
             if result.get("success"):
                 success_count += 1
+                truncated = truncated or bool(result.get("truncated"))
                 conversations.extend([item for item in result.get("conversations", []) or [] if isinstance(item, dict)])
                 cwds.update(str(item) for item in result.get("cwds", []) or [] if item)
                 providers.update(str(item) for item in result.get("providers", []) or [] if item)
@@ -1313,6 +1397,7 @@ def _list_conversations_for_scope(source_home: str, search: str, cwd: str, provi
             "homes": homes,
             "conversations": conversations[:2000],
             "count": len(conversations[:2000]),
+            "truncated": truncated or len(conversations) > 2000,
             "cwds": sorted(cwds),
             "providers": sorted(providers),
             "errors": errors,
@@ -1457,6 +1542,7 @@ def _workspace_conversations_for_scope(snapshot: dict[str, Any], source_home: st
         providers: set[str] = set()
         errors: list[dict[str, Any]] = []
         success_count = 0
+        truncated = False
         for entry in per_home.values():
             if not isinstance(entry, dict):
                 continue
@@ -1464,6 +1550,7 @@ def _workspace_conversations_for_scope(snapshot: dict[str, Any], source_home: st
             result = entry.get("conversations") if isinstance(entry.get("conversations"), dict) else {}
             if result.get("success"):
                 success_count += 1
+                truncated = truncated or bool(result.get("truncated"))
                 conversations.extend([item for item in result.get("conversations", []) or [] if isinstance(item, dict)])
                 cwds.update(str(item) for item in result.get("cwds", []) or [] if item)
                 providers.update(str(item) for item in result.get("providers", []) or [] if item)
@@ -1477,6 +1564,7 @@ def _workspace_conversations_for_scope(snapshot: dict[str, Any], source_home: st
             "homes": snapshot.get("usable_homes", []) or [],
             "conversations": conversations[:2000],
             "count": len(conversations[:2000]),
+            "truncated": truncated or len(conversations) > 2000,
             "cwds": sorted(cwds),
             "providers": sorted(providers),
             "errors": errors,
@@ -1577,6 +1665,7 @@ class DesktopRuntime:
     def __init__(self) -> None:
         self.session_token = secrets.token_urlsafe(32)
         self.logs: list[dict[str, Any]] = []
+        self.log_seq = 0
         self.lock = threading.Lock()
         self.daemon_stop = threading.Event()
         self.daemon_thread: threading.Thread | None = None
@@ -1588,15 +1677,19 @@ class DesktopRuntime:
         self.warmup_thread: threading.Thread | None = None
 
     def log(self, level: str, message: str, data: Any | None = None) -> None:
-        entry = {"time": utc_now(), "level": level, "message": message, "data": data}
         with self.lock:
+            self.log_seq += 1
+            entry = {"id": self.log_seq, "time": utc_now(), "level": level, "message": message, "data": _summarize_for_log(data)}
             self.logs.append(entry)
             self.logs = self.logs[-200:]
 
     def status(self) -> dict[str, Any]:
         cfg = load_config()
+        with self.lock:
+            logs = list(self.logs[-80:])
         return {
             "time": utc_now(),
+            "app_version": __version__,
             "cwd": str(Path.cwd()),
             "config": {
                 "server_url": cfg.server_url,
@@ -1613,6 +1706,7 @@ class DesktopRuntime:
                 "full_backup_encryption_passphrase_configured": bool(cfg.full_backup_encryption_passphrase),
                 "full_backup_encryption": encryption_status(cfg),
                 "full_backup_allow_plaintext_upload": cfg.full_backup_allow_plaintext_upload,
+                "full_backup_auto_upload": cfg.full_backup_auto_upload,
                 "full_backup_quiet_seconds": cfg.full_backup_quiet_seconds,
                 "full_backup_retention_count": cfg.full_backup_retention_count,
                 "full_backup_retention_max_bytes": cfg.full_backup_retention_max_bytes,
@@ -1627,7 +1721,7 @@ class DesktopRuntime:
             "git": _project_state(),
             "daemon_running": bool(self.daemon_thread and self.daemon_thread.is_alive()),
             "last_full_backup_uploaded_at": _last_full_backup_uploaded_at(),
-            "logs": self.logs[-80:],
+            "logs": logs,
         }
 
     def save_config(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1846,19 +1940,20 @@ class DesktopRuntime:
             result = list_remote_devices(cfg)
         elif name in {"server-compatibility", "server-version"}:
             result = check_server_compatibility(cfg)
+        elif name == "test-server-connection":
+            result = _test_server_connection(cfg, payload)
+        elif name == "open-exports-dir":
+            result = _open_exports_dir()
         elif name == "app-update-check":
             result = check_app_update(force=bool(payload.get("force", False)))
         elif name == "app-update-download":
             result = download_latest_update(force=bool(payload.get("force", False)))
+        elif name == "app-update-install":
+            result = launch_update_installer(str(payload.get("path") or ""))
         elif name == "app-update-open":
             result = open_update_page(force=bool(payload.get("force", False)))
         elif name == "app-install-status":
             result = app_install_status()
-        elif name == "app-install":
-            result = install_app(
-                create_shortcuts=bool(payload.get("create_shortcuts", True)),
-                enable_startup=bool(payload.get("enable_startup", False)),
-            )
         elif name == "app-startup-enable":
             result = set_startup_enabled(True)
         elif name == "app-startup-disable":
@@ -2339,6 +2434,15 @@ def make_handler(runtime: DesktopRuntime) -> type[BaseHTTPRequestHandler]:
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A002
             runtime.log("http", format % args)
+
+        def log_request(self, code: int | str = "-", size: int | str = "-") -> None:
+            # 前端每 5 秒轮询一次状态，成功请求全部记录会把日志面板刷满，只保留失败请求
+            try:
+                if int(code) < 400:
+                    return
+            except (TypeError, ValueError):
+                pass
+            super().log_request(code, size)
 
         def do_GET(self) -> None:
             parsed = urlparse(self.path)

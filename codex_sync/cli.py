@@ -10,7 +10,8 @@ from .config import AppConfig, load_config, save_config
 from .daemon import run_daemon
 from .disaster_backup import create_disaster_backup
 from .git_backup import backup_project_to_server, create_patch_snapshot, list_project_backups
-from .hooks import hook_status, install_hooks
+from .app_install import cleanup_before_uninstall
+from .hooks import hook_status, install_hooks, uninstall_hooks
 from .project_auto_backup import (
     enqueue_project_auto_backup,
     install_project_git_hook,
@@ -288,8 +289,17 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("install-hooks", help="Install global Codex hooks for sync capture.")
     p.set_defaults(func=lambda _args: print_json(install_hooks()))
 
+    p = sub.add_parser("uninstall-hooks", help="Remove Codex Sync entries from the global Codex hooks.")
+    p.set_defaults(func=lambda _args: print_json(uninstall_hooks()))
+
     p = sub.add_parser("hook-status", help="Show Codex hook installation status.")
     p.set_defaults(func=lambda _args: print_json(hook_status()))
+
+    p = sub.add_parser(
+        "uninstall-cleanup",
+        help="Called by the uninstaller: remove Codex hooks and the scheduled task that point to this executable.",
+    )
+    p.set_defaults(func=lambda _args: print_json(cleanup_before_uninstall()))
 
     p = sub.add_parser("preflight-backup", help="Create a local Codex disaster backup.")
     p.add_argument("--force", action="store_true")

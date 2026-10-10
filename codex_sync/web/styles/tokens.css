@@ -1,59 +1,136 @@
-/* 设计变量：现代极客精美暗色，融合微光渐变、玻璃拟态与发光动效 */
+/* 设计变量：默认深色；浅色主题由系统偏好或 <html data-theme="light"> 切换。
+   所有颜色都走变量，组件里不直接写 rgba(255,255,255,…)，保证两套主题都可读。 */
 :root {
-  /* HSL 调色底盘 (224° 深空蓝) */
-  --bg-h: 224;
+  color-scheme: dark;
 
-  /* 背景：深邃且有层次的暗色阶梯 */
-  --bg: hsl(var(--bg-h), 25%, 5%);
-  --bg-elev-1: hsl(var(--bg-h), 22%, 9%);
-  --bg-elev-2: hsl(var(--bg-h), 18%, 14%);
-  --bg-elev-3: hsl(var(--bg-h), 16%, 19%);
-  --bg-inset: hsl(var(--bg-h), 30%, 3%);
+  /* 背景层级 */
+  --bg: #0e1116;
+  --bg-elev-1: #151a21;
+  --bg-elev-2: #1c222b;
+  --bg-elev-3: #252c37;
+  --bg-inset: #0b0e12;
+  --hover: rgba(148, 163, 184, 0.08);
+  --overlay: rgba(5, 8, 12, 0.62);
 
-  /* 边框：高度精细的半透明细微描边 */
-  --border: rgba(255, 255, 255, 0.06);
-  --border-strong: rgba(255, 255, 255, 0.12);
-  --border-glow: rgba(99, 102, 241, 0.15);
+  /* 边框 */
+  --border: #262d38;
+  --border-strong: #364050;
 
-  /* 文本：对比度舒适的层次色 */
-  --text: #f8fafc;
-  --text-secondary: #cbd5e1;
-  --text-muted: #64748b;
+  /* 文本 */
+  --text: #e6e9ef;
+  --text-secondary: #b4bccb;
+  --text-muted: #8a95a7;
 
-  /* 强调色：蓝紫/青色霓虹渐变（现代 API 控制台风格） */
-  --accent: #6366f1;
-  --accent-hover: #818cf8;
-  --accent-soft: rgba(99, 102, 241, 0.08);
+  /* 强调色：填充用 --accent，深底上的文字/图标用 --accent-fg */
+  --accent: #2f6fe4;
+  --accent-hover: #4581ee;
+  --accent-fg: #7eaaff;
+  --accent-soft: rgba(79, 140, 255, 0.14);
+  --accent-border: rgba(79, 140, 255, 0.45);
   --on-accent: #ffffff;
-  
-  /* 渐变与阴影光晕 */
-  --accent-gradient: linear-gradient(135deg, #6366f1 0%, #06b6d4 100%);
-  --accent-gradient-hover: linear-gradient(135deg, #818cf8 0%, #22d3ee 100%);
-  --accent-glow: 0 0 20px rgba(99, 102, 241, 0.3);
-  --card-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4);
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px #5b93ff;
 
   /* 语义色 */
-  --ok: #10b981;
-  --ok-soft: rgba(16, 185, 129, 0.1);
-  --warn: #f59e0b;
-  --warn-soft: rgba(245, 158, 11, 0.1);
-  --danger: #ef4444;
-  --danger-hover: #f87171;
-  --danger-bg: rgba(239, 68, 68, 0.08);
+  --ok: #3fb67a;
+  --ok-soft: rgba(63, 182, 122, 0.12);
+  --ok-border: rgba(63, 182, 122, 0.38);
+  --warn: #e0a43a;
+  --warn-soft: rgba(224, 164, 58, 0.12);
+  --warn-border: rgba(224, 164, 58, 0.4);
+  --danger: #f0646b;
+  --danger-strong: #d9434b;
+  --danger-bg: rgba(240, 100, 107, 0.1);
+  --danger-border: rgba(240, 100, 107, 0.45);
 
-  /* 字体：Outfit + Inter 现代无衬线英文与系统优雅中文 */
-  --font-sans: 'Outfit', 'Inter', system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial,
-    "PingFang SC", "Microsoft YaHei", sans-serif;
-  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular",
-    "Liberation Mono", Menlo, monospace;
+  /* 滚动条与浮层阴影 */
+  --scroll-thumb: rgba(148, 163, 184, 0.22);
+  --scroll-thumb-hover: rgba(148, 163, 184, 0.4);
+  --shadow-pop: 0 12px 32px rgba(0, 0, 0, 0.45);
 
-  /* 形状/圆角/节奏 */
-  --radius: 12px;
-  --radius-sm: 8px;
-  --radius-lg: 16px;
-  --transition: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  /* 字体：只用系统字体，离线也一致，不依赖 Google Fonts */
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", "Microsoft YaHei", "PingFang SC",
+    system-ui, sans-serif;
+  --font-mono: "Cascadia Mono", "Cascadia Code", Consolas, "SFMono-Regular", "Liberation Mono", Menlo, monospace;
 
-  /* 尺寸限制 */
-  --sidebar-w: 260px;
-  --topbar-h: 75px;
+  /* 形状/节奏 */
+  --radius: 8px;
+  --radius-sm: 6px;
+  --radius-lg: 12px;
+  --transition: 0.16s ease;
+
+  /* 尺寸 */
+  --sidebar-w: 232px;
+  --topbar-h: 64px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #f3f5f8;
+    --bg-elev-1: #ffffff;
+    --bg-elev-2: #f0f3f7;
+    --bg-elev-3: #e5e9ef;
+    --bg-inset: #ffffff;
+    --hover: rgba(15, 23, 42, 0.05);
+    --overlay: rgba(15, 23, 42, 0.42);
+    --border: #dde2ea;
+    --border-strong: #c3ccd8;
+    --text: #18202b;
+    --text-secondary: #3d4757;
+    --text-muted: #5d6777;
+    --accent: #1f63d6;
+    --accent-hover: #1a56bb;
+    --accent-fg: #1a56bb;
+    --accent-soft: rgba(31, 99, 214, 0.09);
+    --accent-border: rgba(31, 99, 214, 0.4);
+    --focus-ring: 0 0 0 2px var(--bg-elev-1), 0 0 0 4px #1f63d6;
+    --ok: #17794a;
+    --ok-soft: rgba(23, 121, 74, 0.09);
+    --ok-border: rgba(23, 121, 74, 0.35);
+    --warn: #8f5d00;
+    --warn-soft: rgba(196, 132, 0, 0.11);
+    --warn-border: rgba(196, 132, 0, 0.4);
+    --danger: #c42b32;
+    --danger-strong: #a8232a;
+    --danger-bg: rgba(196, 43, 50, 0.07);
+    --danger-border: rgba(196, 43, 50, 0.4);
+    --scroll-thumb: rgba(15, 23, 42, 0.18);
+    --scroll-thumb-hover: rgba(15, 23, 42, 0.32);
+    --shadow-pop: 0 12px 32px rgba(15, 23, 42, 0.16);
+  }
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f3f5f8;
+  --bg-elev-1: #ffffff;
+  --bg-elev-2: #f0f3f7;
+  --bg-elev-3: #e5e9ef;
+  --bg-inset: #ffffff;
+  --hover: rgba(15, 23, 42, 0.05);
+  --overlay: rgba(15, 23, 42, 0.42);
+  --border: #dde2ea;
+  --border-strong: #c3ccd8;
+  --text: #18202b;
+  --text-secondary: #3d4757;
+  --text-muted: #5d6777;
+  --accent: #1f63d6;
+  --accent-hover: #1a56bb;
+  --accent-fg: #1a56bb;
+  --accent-soft: rgba(31, 99, 214, 0.09);
+  --accent-border: rgba(31, 99, 214, 0.4);
+  --focus-ring: 0 0 0 2px var(--bg-elev-1), 0 0 0 4px #1f63d6;
+  --ok: #17794a;
+  --ok-soft: rgba(23, 121, 74, 0.09);
+  --ok-border: rgba(23, 121, 74, 0.35);
+  --warn: #8f5d00;
+  --warn-soft: rgba(196, 132, 0, 0.11);
+  --warn-border: rgba(196, 132, 0, 0.4);
+  --danger: #c42b32;
+  --danger-strong: #a8232a;
+  --danger-bg: rgba(196, 43, 50, 0.07);
+  --danger-border: rgba(196, 43, 50, 0.4);
+  --scroll-thumb: rgba(15, 23, 42, 0.18);
+  --scroll-thumb-hover: rgba(15, 23, 42, 0.32);
+  --shadow-pop: 0 12px 32px rgba(15, 23, 42, 0.16);
 }

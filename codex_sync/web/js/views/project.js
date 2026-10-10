@@ -1,15 +1,33 @@
-// 项目备份：指定项目快照上传到自建同步服务器。
-import { h, asObject, shortId } from "../dom.js";
+// 项目备份：把指定项目的完整快照上传到同步服务器，设置自动备份，并按版本恢复到任意目录。
+import { h, asObject, shortId, fill } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
-import { makeRun, actionButton, formatDateTime } from "../ui.js";
+import { navigate } from "../router.js";
+import { makeRun, actionButton, serverMissingNotice, switchControl, switchRow } from "../ui.js";
+import { confirmDialog, showDialog } from "../dialog.js";
+import { facts, failureReason, formatBytes, formatCountdown, formatDateTime, isFailed, loadingSpinner, statusLine } from "../format.js";
 
 const PROJECT_PATH_KEY = "codexSync.project.selectedPath";
+const PAGE_SIZE = 200;
+const UNTRACKED_PREVIEW = 20;
+
+const TRIGGER_LABELS = {
+  realtime: "实时备份",
+  "codex-stop": "Codex 关闭时",
+  "git-post-commit": "Git 提交后",
+  manual: "手动",
+  manual_full: "手动",
+};
+const PLAN_STATUS = {
+  create: ["新建", "ok"],
+  overwrite: ["覆盖", "warn"],
+  same_size: ["大小相同", ""],
+};
 
 function loadSavedProjectPath() {
   try {
     return window.localStorage.getItem(PROJECT_PATH_KEY) || "";
-  } catch (e) {
+  } catch {
     return "";
   }
 }
@@ -17,482 +35,460 @@ function loadSavedProjectPath() {
 function saveProjectPath(path) {
   try {
     if (path) window.localStorage.setItem(PROJECT_PATH_KEY, path);
-  } catch (e) {
+  } catch {
     /* localStorage 不可用时忽略 */
   }
 }
 
 export function mount(root, store) {
   const run = makeRun(store);
-  const projectBackupPageSize = 200;
-  let projectStatus = asObject(store.getState().status?.git);
-  let selectedPath = loadSavedProjectPath() || projectStatus.root || projectStatus.selected_path || store.getState().status?.cwd || "";
+  let alive = true;
+  const initialStatus = store.getState().status || {};
+  let projectState = asObject(initialStatus.git);
+  let autoState = null;
   let serverBackups = null;
-  let expandedKeys = new Set();
-  let serverBackupsHasMore = false;
-  let autoBackupStatus = null;
-  let loadingStatus = false;
+  let hasMore = false;
+  let loadingState = false;
   let loadingBackups = false;
-  let loadingMoreBackups = false;
-  let loadingAutoBackup = false;
+  let stateSeq = 0;
+  const expandedKeys = new Set();
 
-  const projectPathInput = h("input", {
-    class: "input project-path-input",
-    type: "text",
-    placeholder: "留空则使用当前目录",
-    value: selectedPath,
+  const startPath = loadSavedProjectPath() || projectState.root || projectState.selected_path || initialStatus.cwd || "";
+  const pathInput = h("input", { class: "input", type: "text", placeholder: "项目文件夹路径，留空则使用当前目录", "aria-label": "项目文件夹", spellcheck: "false" });
+  pathInput.value = startPath;
+  const restoreInput = h("input", { class: "input", type: "text", placeholder: "恢复到哪个文件夹（可以是新文件夹）", spellcheck: "false" });
+  restoreInput.value = startPath;
+  const searchInput = h("input", { class: "input", type: "search", placeholder: "搜索项目名、设备或原始路径", "aria-label": "搜索项目" });
+
+  const stateCard = h("div", { class: "card" });
+  const autoCard = h("div", { class: "card" });
+  const libraryCard = h("div", { class: "card section" });
+
+  const projectPath = () => pathInput.value.trim();
+  const restoreTarget = () => restoreInput.value.trim() || projectPath();
+  const serverReady = () => Boolean(store.getState().status?.config?.server_url);
+
+  let lastPath = projectPath();
+  const onPathCommitted = () => {
+    const path = projectPath();
+    if (path === lastPath) return;
+    lastPath = path;
+    saveProjectPath(path);
+    refreshProjectState();
+  };
+  pathInput.addEventListener("change", onPathCommitted);
+  pathInput.addEventListener("keydown", (event) => {
+    if (event.key === "Enter") onPathCommitted();
   });
-  projectPathInput.addEventListener("input", () => {
-    selectedPath = projectPathInput.value.trim();
-    saveProjectPath(selectedPath);
-  });
-  const restorePathInput = h("input", {
-    class: "input project-path-input",
-    type: "text",
-    placeholder: "选择本机文件夹后自动填入；也可粘贴或输入新目录",
-    value: selectedPath,
-  });
-  const projectSearchInput = h("input", {
-    class: "input",
-    type: "search",
-    placeholder: "搜索项目名、设备或原始路径",
-  });
-  projectSearchInput.addEventListener("input", () => renderServerBackups());
+  searchInput.addEventListener("input", () => renderLibrary());
 
-  const projectStatusCard = h("div", { class: "card" });
-  const autoBackupCard = h("div", { class: "card" });
-  const serverBackupsCard = h("div", { class: "card" });
+  function setProjectPath(path) {
+    pathInput.value = path;
+    lastPath = path;
+    saveProjectPath(path);
+  }
 
-  const currentProjectPath = () => projectPathInput.value.trim();
-  const restoreTargetPath = () => restorePathInput.value.trim() || currentProjectPath();
-
-  const refreshProjectStatus = async (notify = true) => {
-    loadingStatus = true;
-    renderProjectStatus();
-    try {
-      projectStatus = notify
-        ? await run("git-state", { payload: { project_path: currentProjectPath() }, refresh: false, okMsg: "项目状态已更新" })
-        : await runAction("git-state", { project_path: currentProjectPath() });
-      if (projectStatus.root && !currentProjectPath()) {
-        projectPathInput.value = projectStatus.root;
-        selectedPath = projectStatus.root;
-        saveProjectPath(selectedPath);
-        if (!restorePathInput.value.trim()) restorePathInput.value = projectStatus.root;
-      }
-      await refreshAutoBackupStatus(false);
-    } finally {
-      loadingStatus = false;
-      renderProjectStatus();
-    }
-  };
-
-  const refreshServerBackups = async (notify = true) => {
-    loadingBackups = true;
-    renderServerBackups();
-    try {
-      serverBackups = notify
-        ? await run("list-project-backups", { payload: { limit: projectBackupPageSize, offset: 0 }, refresh: false, okMsg: "服务器项目库已更新" })
-        : await runAction("list-project-backups", { limit: projectBackupPageSize, offset: 0 });
-      const rows = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
-      serverBackupsHasMore = rows.length >= projectBackupPageSize;
-      ensureExpanded();
-    } finally {
-      loadingBackups = false;
-      renderServerBackups();
-    }
-  };
-
-  const loadMoreServerBackups = async () => {
-    const current = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
-    if (!current.length) {
-      await refreshServerBackups(true);
-      return;
-    }
-    loadingMoreBackups = true;
-    renderServerBackups();
-    try {
-      const result = await runAction("list-project-backups", { limit: projectBackupPageSize, offset: current.length });
-      if (result?.success === false || result?.error) {
-        showToast(result.error || "加载更多项目备份失败", "error");
-        return;
-      }
-      const next = Array.isArray(result.project_backups) ? result.project_backups : [];
-      const seen = new Set(current.map((item) => asObject(item).id).filter(Boolean));
-      const merged = current.concat(next.filter((item) => {
-        const id = asObject(item).id;
-        return !id || !seen.has(id);
-      }));
-      serverBackups = { ...result, project_backups: merged, offset: 0, loaded_count: merged.length };
-      serverBackupsHasMore = next.length >= projectBackupPageSize;
-      showToast(next.length ? `已加载更多：${next.length} 份` : "没有更多项目备份", "success");
-      ensureExpanded();
-    } finally {
-      loadingMoreBackups = false;
-      renderServerBackups();
-    }
-  };
-
-  const uploadProject = async () => {
-    const result = await run("project-backup", { payload: { project_path: currentProjectPath() }, okMsg: "项目备份已上传到服务器", refresh: false });
-    if (result?.success) await refreshServerBackups();
-  };
-
-  const refreshAutoBackupStatus = async (notify = true) => {
-    loadingAutoBackup = true;
-    renderAutoBackupStatus();
-    try {
-      autoBackupStatus = notify
-        ? await run("project-auto-backup-status", { payload: { project_path: currentProjectPath() }, refresh: false, okMsg: "自动备份状态已更新" })
-        : await runAction("project-auto-backup-status", { project_path: currentProjectPath() });
-    } finally {
-      loadingAutoBackup = false;
-      renderAutoBackupStatus();
-    }
-  };
-
-  const installGitAutoBackup = async () => {
-    await run("project-auto-backup-install-git-hook", {
-      payload: { project_path: currentProjectPath() },
-      refresh: false,
-      okMsg: "Git 提交自动备份已安装",
-      errMsg: "安装失败",
-      label: "项目自动备份",
-    });
-    await refreshAutoBackupStatus(false);
-  };
-
-  const uninstallGitAutoBackup = async () => {
-    await run("project-auto-backup-uninstall-git-hook", {
-      payload: { project_path: currentProjectPath() },
-      refresh: false,
-      okMsg: "Git 提交自动备份已关闭",
-      errMsg: "关闭失败",
-      label: "项目自动备份",
-    });
-    await refreshAutoBackupStatus(false);
-  };
-
-  const processAutoBackupQueue = async () => {
-    const result = await run("project-auto-backup-process", {
-      payload: { limit: 5 },
-      refresh: false,
-      okMsg: "自动备份队列已处理",
-      errMsg: "处理失败",
-      label: "项目自动备份",
-    });
-    if (result?.success) {
-      await refreshAutoBackupStatus(false);
-      await refreshServerBackups();
-    }
-  };
-
-  const toggleRealtime = async (enable) => {
-    await run(enable ? "realtime-backup-add" : "realtime-backup-remove", {
-      payload: { project_path: currentProjectPath() },
-      refresh: false,
-      okMsg: enable ? "已加入实时备份：后台约每 5 分钟自动备份该项目工作区（含未提交改动）" : "已移出实时备份",
-      errMsg: "操作失败",
-      label: "实时备份",
-    });
-    await refreshAutoBackupStatus(false);
-  };
-
-  const previewProjectRestore = async (backup) => {
-    const backupId = backup.id || "";
-    const target = restoreTargetPath();
-    if (!backupId) {
-      showToast("备份 ID 缺失", "warning");
-      return;
-    }
-    if (!target) {
-      showToast("请先填写恢复目标目录", "warning");
-      return;
-    }
-    await run("preview-project-restore", {
-      payload: { backup_id: backupId, project_path: target },
-      refresh: false,
-      okMsg: "项目恢复预览已生成",
-      errMsg: "项目恢复预览失败",
-      label: "项目恢复预览",
-    });
-  };
-
-  const restoreProjectBackup = async (backup) => {
-    const backupId = backup.id || "";
-    const target = restoreTargetPath();
-    if (!backupId) {
-      showToast("备份 ID 缺失", "warning");
-      return;
-    }
-    if (!target) {
-      showToast("请先填写恢复目标目录", "warning");
-      return;
-    }
-    const kind = projectBackupKindLabel(backup);
-    if (!window.confirm(`将把服务器项目备份「${kind} / ${shortId(backupId)}」恢复到：\n${target}\n\n如果目标目录已有文件，会先创建本地预飞备份，再覆盖同名文件。继续吗？`)) return;
-    const result = await run("restore-project-backup", {
-      payload: { backup_id: backupId, confirm_backup_id: backupId, project_path: target, overwrite: true },
-      refresh: false,
-      okMsg: "项目备份已恢复",
-      errMsg: "项目备份恢复失败",
-      label: "项目恢复",
-    });
-    if (result?.success) {
-      await refreshProjectStatus(false);
-    }
-  };
-
-  const restoreLatestProjectBackup = async (group) => {
-    const repoName = group?.repoName || "";
-    const target = restoreTargetPath();
-    if (!repoName) {
-      showToast("项目名缺失", "warning");
-      return;
-    }
-    if (!target) {
-      showToast("请先填写恢复目标目录", "warning");
-      return;
-    }
-    if (!window.confirm(`将把项目「${repoName}」云端最新的完整版恢复到：\n${target}\n\n如果目标目录已有文件，会先创建本地预飞备份，再覆盖同名文件。继续吗？`)) return;
-    const result = await run("restore-latest-project-backup", {
-      payload: { repo_name: repoName, project_path: target, overwrite: true },
-      refresh: false,
-      okMsg: "已恢复该项目最新完整版",
-      errMsg: "一键恢复失败",
-      label: "一键恢复",
-    });
-    if (result?.success) {
-      await refreshProjectStatus(false);
-    }
-  };
-
-  const chooseProjectDir = async () => {
-    try {
-      const result = await runAction("choose-project-dir", { project_path: currentProjectPath(), purpose: "project" });
-      if (result?.success && result.path) {
-        projectPathInput.value = result.path;
-        selectedPath = result.path;
-        saveProjectPath(selectedPath);
-        showToast("已选择项目文件夹", "success");
-        await refreshProjectStatus();
-      }
-    } catch (e) {
-      showToast(String(e.message || e), "error");
-    }
-  };
-
-  const chooseRestoreDir = async () => {
-    try {
-      const result = await runAction("choose-project-dir", { project_path: restoreTargetPath(), purpose: "restore" });
-      if (result?.success && result.path) {
-        restorePathInput.value = result.path;
-        showToast("已选择恢复目标文件夹", "success");
-        renderServerBackups();
-      }
-    } catch (e) {
-      showToast(String(e.message || e), "error");
-    }
-  };
-
-  const useCurrentDir = async () => {
-    const cwd = store.getState().status?.cwd || "";
-    projectPathInput.value = cwd;
-    selectedPath = cwd;
-    saveProjectPath(selectedPath);
-    await refreshProjectStatus();
-  };
-
-  const useCurrentAsRestoreTarget = async () => {
-    restorePathInput.value = currentProjectPath() || store.getState().status?.cwd || "";
-    renderServerBackups();
-  };
-
-  const primary = h(
-    "div",
-    { class: "task-panel project-task-panel" },
-    h("div", { class: "task-panel-main" },
-      h("span", { class: "task-kicker" }, "项目保护"),
-      h("h2", {}, "把指定项目备份到同步服务器"),
+  fill(root,
+    h(
+      "div",
+      { class: "task-panel section" },
+      h("h2", {}, "要备份的项目"),
       h(
         "p",
         {},
-        "选择一个项目目录上传完整安全基线；服务器项目库可按项目选择备份版本，并恢复到本机任意目标目录。"
+        "选一个项目文件夹，把它的完整快照上传到同步服务器。会自动排除 .git、node_modules、构建产物、缓存和密钥等文件；内容没有变化时不会重复保存。"
+      ),
+      h(
+        "div",
+        { class: "path-bar" },
+        pathInput,
+        actionButton("选择文件夹", "btn-ghost", chooseProjectDir),
+        actionButton("使用当前目录", "btn-ghost", useCurrentDir, { title: "使用 Codex Sync 启动时所在的目录" }),
+        actionButton("上传项目备份", "btn-primary", uploadProject)
       )
     ),
-    h(
-      "div",
-      { class: "task-panel-actions" },
-      projectPathInput,
-      actionButton("选择文件夹", "btn-ghost", chooseProjectDir),
-      actionButton("使用当前目录", "btn-ghost", useCurrentDir),
-      actionButton("上传完整基线", "btn-primary", uploadProject),
-      actionButton("刷新项目库", "btn-ghost", refreshServerBackups),
-      actionButton("检测项目状态", "btn-ghost", refreshProjectStatus)
-    )
+    h("div", { class: "section grid grid-2" }, stateCard, autoCard),
+    libraryCard
   );
 
-  root.replaceChildren(
-    h("div", { class: "section" }, primary),
-    h("div", { class: "section grid grid-2" }, projectStatusCard, autoBackupCard),
-    h("div", { class: "section" }, serverBackupsCard)
-  );
+  // ---------- 项目状态 ----------
+  async function refreshProjectState() {
+    const seq = (stateSeq += 1);
+    loadingState = true;
+    renderState();
+    renderAuto();
+    const path = projectPath();
+    try {
+      const [state, auto] = await Promise.all([
+        runAction("git-state", { project_path: path }),
+        runAction("project-auto-backup-status", { project_path: path }),
+      ]);
+      if (!alive || seq !== stateSeq) return;
+      projectState = asObject(state);
+      autoState = asObject(auto);
+      if (!path && projectState.root) {
+        setProjectPath(projectState.root);
+        if (!restoreInput.value.trim()) restoreInput.value = projectState.root;
+      }
+    } catch (e) {
+      if (!alive || seq !== stateSeq) return;
+      projectState = { success: false, error: String(e.message || e) };
+      autoState = null;
+    }
+    loadingState = false;
+    renderState();
+    renderAuto();
+  }
 
-  function renderProjectStatus() {
-    const state = asObject(projectStatus);
+  async function refreshAutoState() {
+    try {
+      const auto = await runAction("project-auto-backup-status", { project_path: projectPath() });
+      if (alive) autoState = asObject(auto);
+    } catch {
+      /* 保留旧状态 */
+    }
+    if (alive) renderAuto();
+  }
+
+  function pathValid(state) {
+    return state.exists !== false && state.is_dir !== false && !state.error;
+  }
+
+  function renderState() {
+    const state = asObject(projectState);
+    const valid = pathValid(state);
     const isRepo = Boolean(state.is_repo);
-    const exists = state.exists !== false;
-    const valid = exists && state.is_dir !== false;
-    const statusLines = String(state.status || "").split("\n").filter((l) => l.trim());
-    const untrackedCount = Array.isArray(state.untracked) ? state.untracked.length : 0;
-    const trackedCount = statusLines.filter((l) => !l.startsWith("??")).length;
-    const explain = !valid
-      ? ""
-      : !isRepo
-        ? "非 Git 目录：上传时按安全排除规则打包普通项目文件。"
-        : state.dirty
-          ? `${trackedCount} 处已跟踪改动 / ${untrackedCount} 个未跟踪文件，都会纳入下次备份。`
-          : "工作区干净，与上次提交一致。";
-    const nodes = [
+    const statusLines = String(state.status || "")
+      .split("\n")
+      .filter((line) => line.trim());
+    const untracked = Array.isArray(state.untracked) ? state.untracked : [];
+    const tracked = statusLines.filter((line) => !line.startsWith("??")).length;
+
+    let badge;
+    if (loadingState) badge = h("span", { class: "badge" }, "检查中");
+    else if (!valid) badge = h("span", { class: "badge danger" }, "路径不可用");
+    else if (!isRepo) badge = h("span", { class: "badge info" }, "普通文件夹");
+    else badge = h("span", { class: `badge ${state.dirty ? "warn" : "ok"}` }, state.dirty ? "有未提交改动" : "工作区干净");
+
+    let explain = "";
+    if (valid && !isRepo) explain = "不是 Git 仓库：备份时按排除规则打包文件夹里的文件。";
+    else if (valid && state.dirty) explain = `${tracked} 处已跟踪的改动、${untracked.length} 个未跟踪文件，都会包含在下次备份里。`;
+    else if (valid) explain = "工作区与最近一次提交一致。";
+
+    fill(stateCard,
+      h("div", { class: "card-title" }, h("span", {}, "项目状态"), badge),
+      loadingState && !state.root
+        ? loadingSpinner("正在读取项目状态…", { compact: true })
+        : h(
+            "div",
+            {},
+            valid
+              ? facts([
+                  ["备份方式", isRepo ? "Git 仓库完整快照" : "文件夹完整快照"],
+                  ["分支", state.branch || "-"],
+                  ["提交", state.commit ? shortId(state.commit) : "-"],
+                  ["未跟踪文件", isRepo ? `${untracked.length} 个` : "-"],
+                ])
+              : statusLine(state.error ? `读取失败：${state.error}` : "这个路径不存在或不是文件夹，请重新选择。", "error"),
+            explain ? h("p", { class: "card-desc" }, explain) : null,
+            state.root ? h("p", { class: "card-desc mono", title: state.root }, state.root) : null,
+            untracked.length
+              ? h(
+                  "details",
+                  { class: "collapse" },
+                  h("summary", {}, `未跟踪文件（${untracked.length} 个）`),
+                  h(
+                    "div",
+                    { class: "collapse-body" },
+                    h("p", { class: "card-desc" }, "这些文件不在排除规则里，会和项目一起备份。"),
+                    h(
+                      "div",
+                      { class: "project-file-list" },
+                      ...untracked.slice(0, UNTRACKED_PREVIEW).map((name) => h("span", { title: name }, name)),
+                      untracked.length > UNTRACKED_PREVIEW ? h("span", {}, `另外 ${untracked.length - UNTRACKED_PREVIEW} 个…`) : null
+                    )
+                  )
+                )
+              : null
+          )
+    );
+  }
+
+  // ---------- 自动备份 ----------
+  function nextRealtimeText(state) {
+    const last = asObject(state.last);
+    const interval = Number(state.realtime_interval_seconds) || 300;
+    if (!last.last_backup_at) return `约每 ${Math.max(1, Math.round(interval / 60))} 分钟检查一次`;
+    const due = new Date(/Z|[+-]\d{2}:\d{2}$/.test(last.last_backup_at) ? last.last_backup_at : `${last.last_backup_at}Z`).getTime() + interval * 1000;
+    const seconds = (due - Date.now()) / 1000;
+    if (!Number.isFinite(seconds)) return "-";
+    return seconds <= 0 ? "下个检查周期" : formatCountdown(seconds);
+  }
+
+  function renderAuto() {
+    const state = asObject(autoState);
+    const loaded = autoState != null;
+    const supported = loaded && state.auto_supported !== false && !isFailed(state);
+    const isRepo = Boolean(state.is_repo);
+    const hookOn = Boolean(state.enabled_for_git_commit);
+    const realtimeOn = Boolean(state.in_realtime);
+    const stopOn = Boolean(state.codex_stop_enabled);
+    const last = asObject(state.last);
+    const lastResult = asObject(last.last_result);
+    const enabledCount = [hookOn, realtimeOn, stopOn].filter(Boolean).length;
+    const interval = Math.max(1, Math.round((Number(state.realtime_interval_seconds) || 300) / 60));
+
+    let badge;
+    if (!loaded || loadingState) badge = h("span", { class: "badge" }, "检查中");
+    else if (!supported) badge = h("span", { class: "badge warn" }, "不可用");
+    else badge = h("span", { class: `badge ${enabledCount ? "ok" : ""}` }, enabledCount ? `已开启 ${enabledCount} 项` : "未开启");
+
+    const hookSwitch = switchControl({
+      checked: hookOn,
+      disabled: !supported || !isRepo,
+      label: "Git 提交后自动备份",
+      onChange: (checked, input) =>
+        toggle(input, checked ? "project-auto-backup-install-git-hook" : "project-auto-backup-uninstall-git-hook", checked ? "已开启：每次 Git 提交后自动备份" : "已关闭 Git 提交后自动备份"),
+    });
+    const realtimeSwitch = switchControl({
+      checked: realtimeOn,
+      disabled: !supported,
+      label: "实时备份",
+      onChange: (checked, input) =>
+        toggle(input, checked ? "realtime-backup-add" : "realtime-backup-remove", checked ? `已开启实时备份：后台约每 ${interval} 分钟检查一次` : "已关闭实时备份"),
+    });
+
+    const lastText = last.last_backup_at
+      ? `${formatDateTime(last.last_backup_at)}（${TRIGGER_LABELS[last.last_reason] || last.last_reason || "自动"}，${lastResult.success === false ? "失败" : "成功"}）`
+      : "还没有自动备份过";
+    const queueCount = Number(state.queue_count || 0);
+
+    fill(autoCard,
+      h("div", { class: "card-title" }, h("span", {}, "自动备份"), badge),
+      h("p", { class: "card-desc" }, "开启后会在后台自动生成完整快照，每一份都可以单独恢复；没有改动时自动跳过。"),
       h(
         "div",
-        { class: "card-title" },
-        h("span", {}, "项目状态"),
-        h("span", { class: `badge ${!valid ? "danger" : isRepo ? (state.dirty ? "warn" : "ok") : ""}` }, loadingStatus ? "检查中" : !valid ? "路径不可用" : isRepo ? (state.dirty ? "有改动" : "干净") : "非 Git")
+        {},
+        switchRow("Git 提交后备份", isRepo || !loaded ? "每次在这个仓库里提交后备份一次" : "只有 Git 仓库支持", hookSwitch.el),
+        switchRow("实时备份", `后台约每 ${interval} 分钟检查一次，包含未提交的改动`, realtimeSwitch.el),
+        switchRow(
+          "Codex 关闭时备份",
+          stopOn ? "已在系统设置里开启，对所有项目生效" : "在系统设置里开启，对所有项目生效",
+          h("button", { class: "btn btn-ghost btn-sm", type: "button", onClick: () => navigate("settings", "policy") }, stopOn ? "查看设置" : "去开启")
+        )
       ),
-      h(
-        "div",
-        { class: "result-facts" },
-        fact("模式", valid ? (isRepo ? "完整基线 + 增量补丁" : "完整目录快照") : "-"),
-        fact("分支", state.branch || "-"),
-        fact("提交", state.commit ? shortId(state.commit) : "-"),
-        fact("未跟踪", Array.isArray(state.untracked) ? `${state.untracked.length} 个` : "-")
-      ),
-      explain ? h("p", { class: "card-desc" }, explain) : null,
-      h("p", { class: "card-desc" }, state.root || currentProjectPath() || "当前目录不是 Git 仓库；上传时会按安全排除规则打包普通项目文件。"),
-      !valid ? h("div", { class: "status-line error" }, "请选择一个存在的项目文件夹。") : null,
-      Array.isArray(state.untracked) && state.untracked.length
+      loaded && supported
+        ? facts([
+            ["最近一次自动备份", lastText],
+            realtimeOn ? ["下次实时备份", nextRealtimeText(state)] : null,
+          ])
+        : null,
+      loaded && !supported ? statusLine(failureReason(state, "当前路径不能开启自动备份，请先选择一个存在的项目文件夹。"), "warn") : null,
+      queueCount
         ? h(
-            "details",
-            { class: "collapse" },
-            h("summary", {}, `未跟踪文件（${state.untracked.length} 个）`),
-            h(
-              "div",
-              { class: "collapse-body" },
-              h("p", { class: "card-desc" }, "不在安全排除规则（.git / node_modules / dist / build / 缓存 / 密钥等）内的未跟踪文件，会随备份一起保存。"),
-              h("div", { class: "project-file-list" }, ...state.untracked.slice(0, 20).map((name) => h("span", {}, name)))
-            )
+            "div",
+            { class: "status-line warn spread" },
+            h("span", {}, `有 ${queueCount} 个项目在等待自动备份（服务器暂时不可用或间隔未到）。`),
+            actionButton("立即处理", "btn-ghost btn-sm", processQueue)
           )
         : null
-    ];
-    projectStatusCard.replaceChildren(...nodes.filter(Boolean));
+    );
   }
 
-  function renderAutoBackupStatus() {
-    const state = asObject(autoBackupStatus);
-    const isRepo = Boolean(state.is_repo);
-    const autoSupported = state.auto_supported !== false;
-    const enabled = Boolean(state.enabled_for_git_commit);
-    const last = asObject(state.last);
-    const intervalSec = state.realtime_interval_seconds || 300;
-    const REASON_LABELS = { realtime: "实时", "codex-stop": "Codex 关闭", "git-post-commit": "Git 提交", manual: "手动" };
-    let nextText = "未开启";
-    if (state.in_realtime) {
-      if (last.last_backup_at) {
-        const diff = new Date(last.last_backup_at).getTime() + intervalSec * 1000 - Date.now();
-        nextText = diff <= 0 ? "即将（下个轮询周期）" : `约 ${Math.max(1, Math.round(diff / 60000))} 分钟后`;
+  async function toggle(input, action, okMsg) {
+    input.disabled = true;
+    try {
+      await run(action, { payload: { project_path: projectPath() }, refresh: false, okMsg, label: "自动备份设置" });
+    } catch {
+      /* 已提示 */
+    }
+    await refreshAutoState();
+  }
+
+  async function processQueue() {
+    const result = await run("project-auto-backup-process", {
+      payload: { limit: 5 },
+      refresh: false,
+      okMsg: "等待中的自动备份已处理",
+      label: "处理自动备份",
+    });
+    if (!alive) return;
+    await refreshAutoState();
+    if (!isFailed(result)) loadBackups();
+  }
+
+  // ---------- 上传 / 选择目录 ----------
+  async function uploadProject() {
+    if (!serverReady()) {
+      showToast("还没有配置同步服务器", "warning", { action: { label: "去配置", onClick: () => navigate("settings", "server") } });
+      return;
+    }
+    const name = projectState.root ? projectState.root.split(/[\\/]/).filter(Boolean).pop() : "项目";
+    const result = await run("project-backup", {
+      payload: { project_path: projectPath() },
+      refresh: false,
+      label: "上传项目备份",
+      okMsg: `「${name}」已备份到服务器`,
+    });
+    if (alive && !isFailed(result)) loadBackups();
+  }
+
+  async function pickDir(current, purpose) {
+    try {
+      const result = await runAction("choose-project-dir", { project_path: current, purpose });
+      if (result?.success && result.path) return result.path;
+      if (result && !result.cancelled && result.error) showToast(result.error, "error");
+    } catch (e) {
+      showToast(String(e.message || e), "error");
+    }
+    return "";
+  }
+
+  async function chooseProjectDir() {
+    const path = await pickDir(projectPath(), "project");
+    if (!path || !alive) return;
+    setProjectPath(path);
+    await refreshProjectState();
+  }
+
+  async function useCurrentDir() {
+    setProjectPath(store.getState().status?.cwd || "");
+    await refreshProjectState();
+  }
+
+  async function chooseRestoreDir() {
+    const path = await pickDir(restoreTarget(), "restore");
+    if (path && alive) restoreInput.value = path;
+  }
+
+  // ---------- 服务器项目库 ----------
+  async function loadBackups({ more = false, notify = false } = {}) {
+    if (!serverReady()) {
+      renderLibrary();
+      return;
+    }
+    const current = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
+    loadingBackups = true;
+    renderLibrary();
+    let result;
+    try {
+      result = await runAction("list-project-backups", { limit: PAGE_SIZE, offset: more ? current.length : 0 });
+    } catch (e) {
+      result = { success: false, error: String(e.message || e) };
+    }
+    if (!alive) return;
+    loadingBackups = false;
+    if (isFailed(result)) {
+      if (more) showToast(`加载更多失败：${failureReason(result)}`, "error");
+      else serverBackups = result;
+    } else {
+      const rows = Array.isArray(result.project_backups) ? result.project_backups : [];
+      if (more) {
+        const seen = new Set(current.map((item) => asObject(item).id).filter(Boolean));
+        serverBackups = { ...result, project_backups: current.concat(rows.filter((item) => !seen.has(asObject(item).id))) };
       } else {
-        nextText = `约每 ${Math.max(1, Math.round(intervalSec / 60))} 分钟`;
+        serverBackups = result;
       }
+      hasMore = rows.length >= PAGE_SIZE;
+      ensureExpanded();
     }
-    let resultText = "尚无";
-    if (last.last_backup_at) {
-      const ok = asObject(last.last_result).success;
-      resultText = (ok === false ? "失败" : ok ? "成功" : "已执行") + (last.last_reason ? `（${REASON_LABELS[last.last_reason] || last.last_reason}）` : "");
+    renderLibrary();
+    if (notify && !more) {
+      if (isFailed(result)) showToast(`读取项目库失败：${failureReason(result)}`, "error");
+      else showToast("项目库已刷新", "success");
     }
-    const nodes = [
-      h(
-        "div",
-        { class: "card-title" },
-        h("span", {}, "自动备份"),
-        h("span", { class: `badge ${loadingAutoBackup ? "" : !autoSupported ? "warn" : enabled || (!isRepo && state.codex_stop_enabled) ? "ok" : ""}` }, loadingAutoBackup ? "检查中" : !autoSupported ? "路径不可用" : isRepo ? (enabled ? "已开启" : "未开启") : "非 Git 可入队")
-      ),
-      h("p", { class: "card-desc" }, "自动备份现在每次都生成完整快照（含工作树全部源码文件，按内容去重、无改动自动跳过），每一份都可独立一键恢复。可安装 Git 提交 hook、开启 Codex 关闭触发，或把项目加入实时备份。"),
-      h(
-        "div",
-        { class: "result-facts" },
-        fact("Git 提交触发", enabled ? "已安装" : "未安装"),
-        fact("待处理队列", state.queue_count != null ? `${state.queue_count} 个` : "-"),
-        fact("Codex 关闭触发", state.codex_stop_enabled ? "已在设置中开启" : "未开启"),
-        fact("实时备份", state.in_realtime ? `已开启（约每 ${Math.max(1, Math.round(intervalSec / 60))} 分钟）` : "未开启"),
-        fact("最近备份", formatDateTime(last.last_backup_at)),
-        fact("实时下次", nextText),
-        fact("上次结果", resultText)
-      ),
-      !isRepo && autoSupported ? h("div", { class: "status-line warn" }, "非 Git 目录不支持提交后 hook，但支持 Codex 关闭触发和手动入队。") : null,
-      h(
-        "div",
-        { class: "card-actions" },
-        actionButton("安装提交后自动备份", "btn-primary", installGitAutoBackup),
-        actionButton("关闭提交后自动备份", "btn-ghost", uninstallGitAutoBackup),
-        state.in_realtime
-          ? actionButton("移出实时备份", "btn-ghost", () => toggleRealtime(false))
-          : actionButton("加入实时备份", "btn-primary", () => toggleRealtime(true)),
-        actionButton("处理待备份队列", "btn-ghost", processAutoBackupQueue),
-        actionButton("刷新自动备份状态", "btn-ghost", () => refreshAutoBackupStatus(true))
-      )
-    ];
-    autoBackupCard.replaceChildren(...nodes.filter(Boolean));
   }
 
-  function renderServerBackups() {
-    const backups = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
+  function allBackups() {
+    return Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
+  }
+
+  function ensureExpanded() {
+    const groups = buildProjectGroups(allBackups());
+    const valid = new Set(groups.map((group) => group.key));
+    for (const key of [...expandedKeys]) if (!valid.has(key)) expandedKeys.delete(key);
+    if (!expandedKeys.size && groups.length) expandedKeys.add(groups[0].key);
+  }
+
+  function renderLibrary() {
+    const backups = allBackups();
     const groups = buildProjectGroups(backups);
-    const query = groups.length > 1 ? projectSearchInput.value.trim().toLowerCase() : "";
-    const visibleGroups = query
-      ? groups.filter((group) => projectGroupSearchText(group).includes(query))
-      : groups;
-    serverBackupsCard.replaceChildren(
+    const failed = Boolean(serverBackups) && isFailed(serverBackups);
+    const query = searchInput.value.trim().toLowerCase();
+    const visible = query ? groups.filter((group) => projectGroupSearchText(group).includes(query)) : groups;
+
+    let badge = null;
+    if (loadingBackups) badge = h("span", { class: "badge" }, "读取中");
+    else if (failed) badge = h("span", { class: "badge danger" }, "读取失败");
+    else if (serverBackups) badge = h("span", { class: "badge info" }, `${groups.length} 个项目 · ${backups.length} 份`);
+
+    let body;
+    if (!serverReady()) body = serverMissingNotice("还没有配置同步服务器，无法读取项目库。");
+    else if (failed) body = statusLine(`读取项目库失败：${failureReason(serverBackups)}`, "error");
+    else if (!serverBackups) body = loadingSpinner("正在读取服务器上的项目备份…");
+    else if (!backups.length) body = h("div", { class: "empty compact" }, "服务器上还没有项目备份。在上方选择项目后点「上传项目备份」。");
+    else {
+      body = h(
+        "div",
+        { class: "project-panels" },
+        groups.length > 1 ? searchInput : null,
+        h(
+          "div",
+          { class: "project-panel-list" },
+          ...(visible.length ? visible.map(projectPanel) : [h("div", { class: "empty compact" }, "没有匹配的项目")])
+        ),
+        hasMore
+          ? h(
+              "div",
+              { class: "list-more" },
+              actionButton("加载更早的备份", "btn-ghost btn-sm", () => loadBackups({ more: true }))
+            )
+          : null
+      );
+    }
+
+    const ready = serverReady();
+    fill(libraryCard,
       h(
         "div",
         { class: "card-title" },
         h("span", {}, "服务器项目库"),
-        h("span", { class: `badge ${serverBackups?.error ? "danger" : backups.length ? "ok" : ""}` }, loadingBackups ? "加载中" : serverBackups?.error ? "失败" : `${groups.length} 个项目 / ${backups.length} 份`)
+        ready
+          ? h("div", { class: "card-title-actions" }, badge, actionButton("刷新", "btn-ghost btn-sm", () => loadBackups({ notify: true })))
+          : null
       ),
-      h("p", { class: "card-desc" }, "选择项目，点「一键恢复最新完整版」即可把该项目云端最新完整快照恢复到目标目录。每份备份都是完整快照（含工作树源码、不含 .git 历史），恢复即得可用源码目录；换台电脑接着写足够了，需要 Git 历史可另接远程仓库。"),
       h(
+        "p",
+        { class: "card-desc" },
+        "每份备份都是完整的源码快照（不含 .git 历史），恢复后就是一个可以直接使用的项目目录，适合换一台电脑接着写。"
+      ),
+      ready && h(
         "div",
         { class: "project-restore-controls" },
         h(
           "div",
-          { class: "field project-restore-field" },
-          h("label", { class: "field-label" }, h("span", {}, "恢复目标目录"), h("span", { class: "field-hint" }, "优先从本机选择，可粘贴新目录")),
-          restorePathInput
+          { class: "field" },
+          h("label", { class: "field-label" }, h("span", {}, "恢复到"), h("span", { class: "field-hint" }, "可以选一个空文件夹，也可以直接输入新路径")),
+          restoreInput
         ),
-        h("div", { class: "card-actions" },
-          actionButton("选择本机文件夹", "btn-primary", chooseRestoreDir),
-          actionButton("使用当前项目目录", "btn-ghost", useCurrentAsRestoreTarget),
-          actionButton("刷新项目库", "btn-ghost", refreshServerBackups),
-          serverBackupsHasMore ? actionButton(loadingMoreBackups ? "加载中…" : "加载更多", "btn-ghost", loadMoreServerBackups) : null
+        h(
+          "div",
+          { class: "card-actions" },
+          actionButton("选择文件夹", "btn-ghost", chooseRestoreDir),
+          h(
+            "button",
+            {
+              class: "btn btn-ghost",
+              type: "button",
+              onClick: () => {
+                restoreInput.value = projectPath() || store.getState().status?.cwd || "";
+              },
+            },
+            "使用上面的项目目录"
+          )
         )
       ),
-      serverBackups?.error
-        ? h("div", { class: "status-line error" }, serverBackups.error)
-        : backups.length
-          ? h(
-              "div",
-              { class: "project-panels" },
-              groups.length > 1
-                ? h("div", { class: "field project-search-field" }, h("label", { class: "field-label" }, h("span", {}, "搜索项目")), projectSearchInput)
-                : null,
-              h(
-                "div",
-                { class: "project-panel-list" },
-                visibleGroups.length
-                  ? visibleGroups.map((group) => projectPanel(group))
-                  : h("div", { class: "empty compact" }, "没有匹配的项目")
-              )
-            )
-          : h("div", { class: "empty compact" }, loadingBackups ? "正在读取服务器备份…" : "还没有加载服务器备份，点击“刷新项目库”。")
+      body
     );
   }
 
@@ -500,98 +496,266 @@ export function mount(root, store) {
     const expanded = expandedKeys.has(group.key);
     const head = h(
       "button",
-      { class: `project-panel-head ${expanded ? "expanded" : ""}`, type: "button", "aria-expanded": expanded ? "true" : "false" },
-      h("span", { class: "project-panel-caret" }, expanded ? "▾" : "▸"),
+      { class: "project-panel-head", type: "button", "aria-expanded": expanded ? "true" : "false" },
+      h("span", { class: "project-panel-caret", "aria-hidden": "true" }, expanded ? "▾" : "▸"),
       h("span", { class: "project-panel-name", title: group.rootsText || group.repoName }, group.repoName),
       h("span", { class: "project-panel-meta" }, `${group.backups.length} 份 · ${group.devices.size} 台设备 · 最新 ${formatDateTime(group.latestAt)}`)
     );
     head.addEventListener("click", () => {
       if (expandedKeys.has(group.key)) expandedKeys.delete(group.key);
       else expandedKeys.add(group.key);
-      renderServerBackups();
+      renderLibrary();
     });
     return h(
       "div",
-      { class: `project-panel ${expanded ? "expanded" : ""}` },
+      { class: `project-panel${expanded ? " expanded" : ""}` },
       head,
-      expanded ? h("div", { class: "project-panel-body" }, renderProjectVersions(group)) : null
+      expanded ? h("div", { class: "project-panel-body" }, projectVersions(group)) : null
     );
   }
 
-  function renderProjectVersions(group) {
-    const hasFull = group.backups.some((backup) => asObject(backup).backup_kind === "full");
+  function projectVersions(group) {
+    const hasFull = group.backups.some((backup) => backup.backup_kind === "full");
     return h(
       "div",
       { class: "project-version-stack" },
-      group.rootsText
-        ? h("div", { class: "project-roots mono cell-ellipsis", title: group.rootsText }, group.rootsText)
-        : null,
-      !hasFull
-        ? h("div", { class: "status-line warn" }, "该项目当前列表里只有补丁备份。恢复到新电脑时，建议先选择一份完整基线；补丁只适合同一 Git 仓库继续应用。")
-        : h("div", { class: "card-actions" }, actionButton("⭐ 一键恢复最新完整版", "btn-primary", () => restoreLatestProjectBackup(group))),
+      group.rootsText ? h("div", { class: "project-roots mono cell-ellipsis", title: group.rootsText }, `原始路径：${group.rootsText}`) : null,
+      hasFull
+        ? h("div", { class: "card-actions" }, actionButton("恢复最新的完整备份", "btn-primary", () => restoreLatest(group)))
+        : statusLine("这个项目只有补丁备份。补丁只能应用到同一个 Git 仓库上；换电脑恢复需要先有一份完整备份。", "warn"),
       h(
         "div",
         { class: "table-wrap" },
         h(
           "table",
           { class: "table" },
-          h("thead", {}, h("tr", {}, h("th", {}, "版本"), h("th", {}, "设备"), h("th", {}, "分支/提交"), h("th", {}, "本机时间"), h("th", {}, "大小"), h("th", {}, "操作"))),
-          h("tbody", {}, ...group.backups.map((backup) => backupRow(backup, previewProjectRestore, restoreProjectBackup)))
+          h(
+            "thead",
+            {},
+            h("tr", {}, h("th", {}, "类型"), h("th", {}, "设备"), h("th", {}, "分支 / 提交"), h("th", {}, "上传时间"), h("th", {}, "大小"), h("th", {}, "操作"))
+          ),
+          h("tbody", {}, ...group.backups.map(backupRow))
         )
       )
     );
   }
 
-  function ensureExpanded() {
-    const backups = Array.isArray(serverBackups?.project_backups) ? serverBackups.project_backups : [];
-    const groups = buildProjectGroups(backups);
-    const validKeys = new Set(groups.map((group) => group.key));
-    for (const key of Array.from(expandedKeys)) {
-      if (!validKeys.has(key)) expandedKeys.delete(key);
-    }
-    if (!expandedKeys.size && groups.length) expandedKeys.add(groups[0].key);
+  function backupRow(backup) {
+    const time = backup.received_at || backup.created_at || "";
+    const branch = backup.branch || "-";
+    const commit = backup.commit_sha ? shortId(backup.commit_sha) : "-";
+    return h(
+      "tr",
+      {},
+      h(
+        "td",
+        {},
+        h(
+          "div",
+          { class: "badge-row" },
+          h("span", { class: `badge ${backup.backup_kind === "full" ? "ok" : ""}` }, projectBackupKindLabel(backup)),
+          h("span", { class: "mono text-dim", title: backup.id || "" }, shortId(backup.id))
+        )
+      ),
+      h("td", { class: "cell-ellipsis", title: backup.device_id || "" }, backup.device_id || "-"),
+      h("td", { class: "cell-ellipsis", title: `${branch} / ${commit}` }, `${branch} / ${commit}`),
+      h("td", { title: time ? `UTC ${time}` : "" }, formatDateTime(time)),
+      h("td", {}, formatBytes(backup.size_bytes)),
+      h(
+        "td",
+        {},
+        h(
+          "div",
+          { class: "row-actions" },
+          actionButton("预览", "btn-ghost btn-sm", () => previewRestore(backup), { title: "下载并查看恢复后会新建、覆盖哪些文件" }),
+          actionButton("恢复", "btn-ghost btn-sm", () => restoreBackup(backup))
+        )
+      )
+    );
   }
 
-  renderProjectStatus();
-  renderAutoBackupStatus();
-  renderServerBackups();
-  refreshProjectStatus(false);
-  refreshServerBackups(false);
-  const unsubStatus = store.select((s) => s.status?.cwd, () => {
-    if (!projectPathInput.value.trim()) {
-      const status = store.getState().status || {};
-      const rootPath = status.git?.root || status.cwd || "";
-      projectPathInput.value = rootPath;
-      selectedPath = rootPath;
-      if (!restorePathInput.value.trim()) restorePathInput.value = rootPath;
+  // ---------- 恢复 ----------
+  function requireTarget() {
+    const target = restoreTarget();
+    if (!target) showToast("请先填写或选择要恢复到的文件夹", "warning");
+    return target;
+  }
+
+  function previewBody(preview, target) {
+    if (preview.restore_type === "patch") {
+      const untracked = Array.isArray(preview.untracked) ? preview.untracked : [];
+      return h(
+        "div",
+        {},
+        h("p", { class: "dialog-message" }, `恢复到：${target}`),
+        statusLine(
+          preview.patch_ok ? "补丁可以干净地应用到目标目录。" : `补丁无法应用到目标目录：${preview.error || preview.patch_stderr || "git apply --check 失败"}`,
+          preview.patch_ok ? "ok" : "error"
+        ),
+        untracked.length
+          ? h(
+              "div",
+              {},
+              h("p", { class: "card-desc" }, `还会写入 ${preview.untracked_count || untracked.length} 个未跟踪文件：`),
+              h("div", { class: "plan-list" }, ...untracked.map((path) => h("div", { class: "plan-row" }, h("span", { class: "badge" }, "文件"), h("span", { class: "plan-path", title: path }, path), h("span", {}, ""))))
+            )
+          : null
+      );
     }
-  });
+    const planned = Array.isArray(preview.planned) ? preview.planned : [];
+    const total = Number(preview.file_count || planned.length);
+    const overwrite = Number(preview.overwrite_count || 0);
+    const skipped = Array.isArray(preview.skipped) ? preview.skipped : [];
+    return h(
+      "div",
+      {},
+      h("p", { class: "dialog-message" }, `恢复到：${target}`),
+      h(
+        "div",
+        { class: "plan-summary" },
+        h("span", { class: "badge info" }, `共 ${total} 个文件`),
+        h("span", { class: "badge ok" }, `新建 ${Math.max(0, total - overwrite)}`),
+        h("span", { class: `badge ${overwrite ? "warn" : ""}` }, `覆盖 ${overwrite}`),
+        skipped.length ? h("span", { class: "badge danger" }, `跳过 ${skipped.length}`) : null
+      ),
+      overwrite ? statusLine("目标文件夹里已有同名文件。恢复前会先把目标文件夹当前的内容备份一份，再覆盖这些文件。", "warn") : null,
+      planned.length
+        ? h(
+            "div",
+            { class: "plan-list" },
+            ...planned.map((item) => {
+              const [label, tone] = PLAN_STATUS[item.status] || [item.status, ""];
+              return h(
+                "div",
+                { class: "plan-row" },
+                h("span", { class: `badge ${tone}` }, label),
+                h("span", { class: "plan-path", title: item.path }, item.path),
+                h("span", { class: "text-dim" }, formatBytes(item.bytes))
+              );
+            })
+          )
+        : h("div", { class: "empty compact" }, "这个备份里没有文件"),
+      total > planned.length ? h("p", { class: "card-desc" }, `只列出前 ${planned.length} 个文件。`) : null
+    );
+  }
+
+  async function previewRestore(backup) {
+    const target = requireTarget();
+    if (!target) return;
+    let result;
+    try {
+      result = await runAction("preview-project-restore", { backup_id: backup.id, project_path: target });
+    } catch (e) {
+      showToast(`生成预览失败：${e.message || e}`, "error");
+      return;
+    }
+    if (!alive) return;
+    const preview = asObject(result.preview);
+    if (isFailed(result) && !preview.restore_type) {
+      showToast(`生成预览失败：${failureReason(result)}`, "error");
+      return;
+    }
+    const canRestore = preview.restore_type !== "patch" || Boolean(preview.patch_ok);
+    const choice = await showDialog({
+      title: `恢复预览 · ${projectBackupKindLabel(backup)}`,
+      body: previewBody(preview, target),
+      wide: true,
+      actions: [
+        { label: "关闭", value: false, class: "btn-ghost", autofocus: !canRestore },
+        canRestore ? { label: "恢复这个版本", value: true, class: "btn-primary" } : null,
+      ].filter(Boolean),
+      dismissValue: false,
+    });
+    if (choice && alive) await restoreBackup(backup, { confirmed: true, target });
+  }
+
+  async function restoreBackup(backup, { confirmed = false, target = "" } = {}) {
+    const dest = target || requireTarget();
+    if (!dest) return;
+    const patch = backup.backup_kind !== "full";
+    if (!confirmed) {
+      const ok = await confirmDialog({
+        title: "恢复这个项目备份？",
+        message: `把「${backup.repo_name || "项目"}」${formatDateTime(backup.received_at || backup.created_at)} 的${projectBackupKindLabel(backup)}恢复到：${dest}`,
+        details: [
+          "目标文件夹里已有文件时，会先把当前内容备份一份，再覆盖同名文件",
+          "目标文件夹里多出来的文件不会被删除",
+          patch ? "这是补丁备份，只能应用到同一个 Git 仓库上" : null,
+        ],
+        confirmLabel: "恢复",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    const result = await run("restore-project-backup", {
+      payload: { backup_id: backup.id, confirm_backup_id: backup.id, project_path: dest, overwrite: true },
+      refresh: false,
+      label: "恢复项目",
+      okMsg: (r) => `已恢复 ${asObject(r.restore).restored_count ?? 0} 个文件到 ${dest}`,
+    });
+    if (alive && !isFailed(result) && samePath(dest, projectPath())) refreshProjectState();
+  }
+
+  async function restoreLatest(group) {
+    const dest = requireTarget();
+    if (!dest) return;
+    const ok = await confirmDialog({
+      title: `恢复「${group.repoName}」的最新完整备份？`,
+      message: `会下载这个项目在服务器上最新的一份完整备份，恢复到：${dest}`,
+      details: ["目标文件夹里已有文件时，会先把当前内容备份一份，再覆盖同名文件", "目标文件夹里多出来的文件不会被删除"],
+      confirmLabel: "恢复",
+      danger: true,
+    });
+    if (!ok) return;
+    const result = await run("restore-latest-project-backup", {
+      payload: { repo_name: group.repoName, project_path: dest, overwrite: true },
+      refresh: false,
+      label: "恢复项目",
+      okMsg: (r) => `已恢复 ${asObject(r.restore).restored_count ?? 0} 个文件到 ${dest}`,
+    });
+    if (alive && !isFailed(result) && samePath(dest, projectPath())) refreshProjectState();
+  }
+
+  renderState();
+  renderAuto();
+  renderLibrary();
+  refreshProjectState();
+  loadBackups();
+
+  const unsubCwd = store.select(
+    (s) => s.status?.cwd,
+    (cwd) => {
+      if (projectPath() || !cwd) return;
+      setProjectPath(cwd);
+      if (!restoreInput.value.trim()) restoreInput.value = cwd;
+      refreshProjectState();
+    }
+  );
+  const unsubServer = store.select(
+    (s) => s.status?.config?.server_url,
+    () => loadBackups()
+  );
+
   return () => {
-    unsubStatus();
+    alive = false;
+    unsubCwd();
+    unsubServer();
   };
 }
 
-function fact(label, value) {
-  return h("div", { class: "result-fact" }, h("span", {}, label), h("b", {}, value || "-"));
+function samePath(a, b) {
+  const norm = (p) => String(p || "").replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
+  return Boolean(a) && norm(a) === norm(b);
 }
 
 function buildProjectGroups(items) {
   const map = new Map();
   for (const item of items) {
     const backup = asObject(item);
-    const repoName = backup.repo_name || "unknown-project";
+    const repoName = backup.repo_name || "未命名项目";
     const key = repoName.toLowerCase();
     if (!map.has(key)) {
-      map.set(key, {
-        key,
-        repoName,
-        backups: [],
-        devices: new Set(),
-        roots: new Set(),
-        latestAt: "",
-        latestMs: 0,
-        rootsText: "",
-      });
+      map.set(key, { key, repoName, backups: [], devices: new Set(), roots: new Set(), latestAt: "", latestMs: 0, rootsText: "" });
     }
     const group = map.get(key);
     group.backups.push(backup);
@@ -603,10 +767,10 @@ function buildProjectGroups(items) {
       group.latestAt = backup.received_at || backup.created_at || "";
     }
   }
-  const groups = Array.from(map.values());
+  const groups = [...map.values()];
   for (const group of groups) {
     group.backups.sort((a, b) => backupTimeMs(b) - backupTimeMs(a));
-    const roots = Array.from(group.roots);
+    const roots = [...group.roots];
     group.rootsText = roots.slice(0, 3).join(" | ");
     if (roots.length > 3) group.rootsText += ` | 另 ${roots.length - 3} 个路径`;
   }
@@ -615,8 +779,7 @@ function buildProjectGroups(items) {
 }
 
 function backupTimeMs(backup) {
-  const raw = backup.received_at || backup.created_at || "";
-  const text = String(raw || "").trim();
+  const text = String(backup.received_at || backup.created_at || "").trim();
   if (!text) return 0;
   const normalized = /^\d{4}-\d{2}-\d{2}T/.test(text) && !/(Z|[+-]\d{2}:\d{2})$/.test(text) ? `${text}Z` : text;
   const ms = Date.parse(normalized);
@@ -624,48 +787,16 @@ function backupTimeMs(backup) {
 }
 
 function projectGroupSearchText(group) {
-  return [
-    group.repoName,
-    Array.from(group.devices).join(" "),
-    Array.from(group.roots).join(" "),
-  ].join(" ").toLowerCase();
+  return [group.repoName, [...group.devices].join(" "), [...group.roots].join(" ")].join(" ").toLowerCase();
 }
 
 function projectBackupKindLabel(item) {
   const backup = asObject(item);
   const mode = backup.source_mode || "";
-  if (mode === "git_full") return "完整基线";
-  if (mode === "filesystem") return "完整目录";
-  if (mode === "git_patch") return "未提交改动";
+  if (mode === "git_full") return "完整备份";
+  if (mode === "filesystem") return "完整备份（文件夹）";
+  if (mode === "git_patch") return "未提交改动补丁";
   if (mode === "git_commit") return "提交补丁";
-  return backup.backup_kind === "full" ? "完整备份" : backup.backup_kind === "patch" ? "增量补丁" : "-";
-}
-
-function backupRow(item, onPreview, onRestore) {
-  const backup = asObject(item);
-  const time = backup.received_at || backup.created_at || "";
-  const previewBtn = h("button", { class: "btn btn-ghost btn-sm", type: "button" }, "预览");
-  const restoreBtn = h("button", { class: "btn btn-primary btn-sm", type: "button" }, "恢复");
-  previewBtn.addEventListener("click", () => onPreview(backup));
-  restoreBtn.addEventListener("click", () => onRestore(backup));
-  const branch = backup.branch || "-";
-  const commit = backup.commit_sha ? shortId(backup.commit_sha) : "-";
-  return h(
-    "tr",
-    {},
-    h("td", {}, h("div", { class: "row row-wrap" }, h("span", { class: `badge ${backup.backup_kind === "full" ? "ok" : ""}` }, projectBackupKindLabel(backup)), h("span", { class: "mono", title: backup.id || "" }, shortId(backup.id)))),
-    h("td", { class: "cell-ellipsis", title: backup.device_id || "" }, backup.device_id || "-"),
-    h("td", { class: "cell-ellipsis", title: `${branch} / ${commit}` }, `${branch} / ${commit}`),
-    h("td", { title: time ? `UTC: ${time}` : "" }, formatDateTime(time)),
-    h("td", {}, formatBytes(backup.size_bytes)),
-    h("td", {}, h("div", { class: "row-actions" }, previewBtn, restoreBtn))
-  );
-}
-
-function formatBytes(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return "-";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  return `${(n / 1024 / 1024).toFixed(1)} MB`;
+  if (backup.backup_kind === "full") return "完整备份";
+  return backup.backup_kind === "patch" ? "补丁" : "备份";
 }

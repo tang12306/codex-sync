@@ -132,6 +132,14 @@ class ConversationTests(unittest.TestCase):
         # 默认按 updated_at 倒序：a1(202) 在最前
         self.assertEqual(res["conversations"][0]["id"], "a1")
 
+    def test_list_reports_truncation(self) -> None:
+        full = conversations.list_conversations()
+        self.assertFalse(full["truncated"])
+        limited = conversations.list_conversations(limit=2)
+        self.assertEqual(limited["count"], 2)
+        self.assertEqual(limited["limit"], 2)
+        self.assertTrue(limited["truncated"])
+
     def test_list_search(self) -> None:
         res = conversations.list_conversations(search="加密")
         self.assertEqual([c["id"] for c in res["conversations"]], ["c2"])

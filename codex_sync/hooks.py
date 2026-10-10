@@ -92,6 +92,43 @@ def install_hooks() -> dict[str, Any]:
     return {"path": str(path), "installed": installed, "updated": updated, "preflight_backup": protection}
 
 
+def uninstall_hooks(match: str | None = None) -> dict[str, Any]:
+    """移除 hooks.json 里本工具的条目；match 不为空时，只移除命令里包含该字符串（如某个 exe 路径）的条目。"""
+    path = hooks_path()
+    if not path.exists():
+        return {"success": True, "path": str(path), "removed": []}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return {"success": False, "path": str(path), "removed": [], "error": "hooks.json 不是有效的 JSON，没有修改。"}
+    needle = (match or "").lower()
+
+    def ours(entry: Any) -> bool:
+        if not isinstance(entry, dict) or not _contains_codex_sync(entry):
+            return False
+        if not needle:
+            return True
+        return any(needle in (hook.get("commandWindows") or hook.get("command") or "").lower() for hook in entry.get("hooks", []))
+
+    hooks = data.get("hooks") if isinstance(data, dict) else None
+    removed: list[str] = []
+    if isinstance(hooks, dict):
+        for event, entries in list(hooks.items()):
+            if not isinstance(entries, list):
+                continue
+            kept = [entry for entry in entries if not ours(entry)]
+            if len(kept) == len(entries):
+                continue
+            removed.append(event)
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+    if removed:
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    return {"success": True, "path": str(path), "removed": removed}
+
+
 def hook_status() -> dict[str, Any]:
     path = hooks_path()
     if not path.exists():

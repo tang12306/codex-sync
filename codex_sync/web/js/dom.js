@@ -53,6 +53,9 @@ export function mount(root, ...nodes) {
   root.replaceChildren(...nodes.flat(Infinity).filter((n) => n != null && n !== false));
 }
 
+// 视图模块自己导出了 mount，视图里用 fill 这个名字（会跳过 null / false）。
+export { mount as fill };
+
 export function clear(el) {
   if (el) el.replaceChildren();
 }
