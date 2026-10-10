@@ -31,12 +31,14 @@ export function startStatusPolling(store, intervalMs = 5000) {
   return () => clearTimeout(timer);
 }
 
-// 拉取一次 status 写入 store（顶栏「刷新」、动作完成后复用）。
+// 拉取一次 status 写入 store（顶栏「刷新」、动作完成后复用）。成功返回 true，失败返回 false。
 export async function refreshStatus(store) {
   try {
     const status = await getStatus();
     store.setState({ status, statusError: null });
+    return true;
   } catch (err) {
     store.setState({ statusError: String(err.message || err) });
+    return false;
   }
 }

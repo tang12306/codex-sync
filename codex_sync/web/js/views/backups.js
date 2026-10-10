@@ -1,862 +1,1366 @@
-// 数据备份与恢复控制中心：完整备份与灾备、云端备份、本地备份导入、服务器留存策略。
-import { h, asObject, shortId } from "../dom.js";
+// 对话备份与恢复：完整备份与本地灾难备份、云端备份、从备份导入对话、服务器留存。
+import { h, asObject, shortId, fill } from "../dom.js";
 import { runAction } from "../api.js";
 import { showToast } from "../toast.js";
 import { refreshStatus } from "../poller.js";
-import { makeRun, actionButton, formatDateTime } from "../ui.js";
+import { navigate } from "../router.js";
+import { makeRun, actionButton, createSubTabs, serverMissingNotice } from "../ui.js";
+import { confirmDialog, confirmCloseCodex } from "../dialog.js";
+import { renderMessage } from "../markdown.js";
+import { facts, failureReason, formatBytes, formatDateTime, formatEpoch, isFailed, loadingSpinner, statusLine } from "../format.js";
 
-const ROLE_LABEL = { user: "用户", assistant: "助手", developer: "系统注入", reasoning: "思考", tool_call: "工具调用", tool_output: "工具输出" };
-const ROW_STYLE = { display: "flex", gap: "10px", padding: "10px 0", borderBottom: "1px solid var(--border)" };
+const CLOUD_PAGE = 12;
+const LIST_PAGE = 100;
+const PLAN_PREVIEW = 50;
 
-const CONFIRM_MSG =
-  "检测到 Codex 正在运行。\n\n这步会修改 Codex 的对话数据库，需要先关闭它的后台进程（codex.exe）——" +
-  "它会在你下次使用 Codex 时自动重启，不影响编辑器和本页面。\n\n确认关闭 Codex 并继续吗？";
+const ENC_SOURCE_LABELS = { env: "环境变量", config: "口令", key_file: "私有密钥文件", generated_key_file: "自动生成的私有密钥文件" };
+const SYNC_STATE_LABELS = { clean: "已同步", dirty: "有未上传改动", diverged: "已分叉", incremental: "增量", root: "基线" };
+const RETENTION_REASONS = {
+  "full backup count limit": "超出每个设备的保留份数",
+  "full backup age limit": "超过保留天数",
+  "project backup count limit": "超出每个项目的保留份数",
+  "project backup age limit": "超过保留天数",
+  "server total size limit": "超出服务器容量上限",
+};
+const RETENTION_WARNINGS = {
+  "Retention could not reduce server storage below the total limit without deleting protected latest/head backups.":
+    "即使清理掉所有可删除的备份，服务器占用仍高于容量上限（各设备、各项目最新的一份受保护，不会删除）。",
+};
 
-const WSL_CONFIRM_MSG =
-  "检测到目标 WSL 里 Codex 正在运行。\n\n导入会写入该发行版的 ~/.codex 状态库，需要先关闭它的 Codex 后台进程。\n\n确认关闭并导入吗？";
+const RESTORE_NOTES = [
+  "恢复前会自动创建一次本地灾难备份，出问题可以找回",
+  "config.toml、AGENTS.md 等配置文件不会被覆盖",
+  "加密备份需要本机设置了相同的加密口令，或已导入对应的密钥",
+  "建议先关闭 Codex，避免恢复时文件被占用",
+];
 
+const FALLBACK_HOMES = [{ id: "windows", kind: "windows", label: "Windows", ok: true, has_codex: true }];
+
+// 页签之间共用：切换页签时不必重新扫描环境、重新拉列表。
 const backupCache = {
   homes: null,
   targetChannelsByHome: new Map(),
+  cloud: null,
 };
 
-function formatBytes(value) {
-  const n = Number(value || 0);
-  if (!Number.isFinite(n) || n <= 0) return "-";
-  if (n < 1024) return `${n} B`;
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`;
-  return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+async function fetchHomes(force = false) {
+  if (!force && Array.isArray(backupCache.homes)) return backupCache.homes;
+  if (force) backupCache.targetChannelsByHome.clear();
+  try {
+    const result = await runAction("list-codex-homes");
+    const homes = Array.isArray(result.homes) && result.homes.length ? result.homes : FALLBACK_HOMES;
+    backupCache.homes = homes;
+    return homes;
+  } catch {
+    return FALLBACK_HOMES;
+  }
 }
 
-function fact(label, value) {
-  return h("div", { class: "result-fact" }, h("span", {}, label), h("b", {}, value == null || value === "" ? "-" : String(value)));
+function usableHome(home) {
+  return Boolean(home && home.ok && home.has_codex);
 }
 
-function loadingSpinner(text = "加载中…") {
-  return h("div", { class: "spinner-wrap" }, h("span", { class: "spinner" }), h("span", {}, text));
+function pickHome(homes, preferred) {
+  if (homes.some((home) => home.id === preferred && usableHome(home))) return preferred;
+  return (homes.find(usableHome) || homes[0] || FALLBACK_HOMES[0]).id;
 }
 
-function msgStyle(role) {
-  const color = role === "user" ? "var(--accent)" : role === "assistant" ? "var(--ok)" : "var(--border-strong)";
-  return { borderLeft: `3px solid ${color}`, padding: "6px 10px", margin: "8px 0", background: "rgba(255,255,255,0.02)", borderRadius: "var(--radius-sm)" };
+function homeLabelFor(homes, homeId) {
+  const home = homes.find((item) => item.id === homeId);
+  if (home) return home.label || home.id;
+  if (String(homeId || "").startsWith("wsl:")) return `WSL · ${String(homeId).split(":", 2)[1]}`;
+  return "Windows";
 }
 
-export function mount(root, store) {
-  const run = makeRun(store);
+function backupEnvLabel(deviceId) {
+  const device = String(deviceId || "");
+  if (device.startsWith("wsl:")) return `WSL · ${device.slice(4) || "未知发行版"}`;
+  return device ? `Windows · ${device}` : "Windows";
+}
 
-  let currentTab = "full"; // full | cloud | import | retention
-  const tabContainer = h("div", { class: "sub-tabs" });
-  const viewContainer = h("div", { class: "tab-view-root" });
+function serverConfigured(store) {
+  return Boolean(store.getState().status?.config?.server_url);
+}
 
-  const tabs = [
-    { id: "full", label: "完整备份与灾备" },
-    { id: "cloud", label: "云端备份" },
-    { id: "import", label: "本地备份导入" },
-    { id: "retention", label: "服务器留存策略" }
-  ];
+function encryptionState(store) {
+  const cfg = asObject(store.getState().status?.config);
+  const enc = asObject(cfg.full_backup_encryption);
+  return {
+    enc,
+    encrypted: enc.enabled !== false && Boolean(enc.configured),
+    allowPlain: Boolean(cfg.full_backup_allow_plaintext_upload),
+  };
+}
 
+// 只显示有值的条目，避免一排「-」。
+function factsOf(pairs) {
+  return facts(pairs.filter((pair) => pair && pair[1] != null && pair[1] !== ""));
+}
+
+function resultSection(title, ...children) {
+  return h("div", { class: "result-section" }, h("div", { class: "result-section-head" }, h("strong", {}, title)), ...children);
+}
+
+export function mount(root, store, { sub } = {}) {
+  const viewContainer = h("div");
   let unmountCurrent = null;
+  let importPreset = "";
 
-  function switchTab(tabId) {
-    currentTab = tabId;
-    renderTabs();
+  const tabs = createSubTabs(
+    [
+      { key: "full", label: "完整备份" },
+      { key: "cloud", label: "云端备份" },
+      { key: "import", label: "从备份导入对话" },
+      { key: "retention", label: "服务器留存" },
+    ],
+    { initial: sub, onChange: show, label: "备份页面分区" }
+  );
+
+  const ctx = {
+    store,
+    run: makeRun(store),
+    // 云端备份行的「导入对话」：切到导入页并预选这个备份
+    openImport(backupId) {
+      importPreset = backupId || "";
+      tabs.select("import");
+    },
+    takeImportPreset() {
+      const id = importPreset;
+      importPreset = "";
+      return id;
+    },
+  };
+
+  function show(key) {
     if (unmountCurrent) {
-      try { unmountCurrent(); } catch(e) {}
+      try {
+        unmountCurrent();
+      } catch {
+        /* ignore */
+      }
       unmountCurrent = null;
     }
     viewContainer.replaceChildren();
-
-    if (tabId === "full") {
-      unmountCurrent = mountFullBackups(viewContainer, run, store);
-    } else if (tabId === "cloud") {
-      unmountCurrent = mountCloudBackups(viewContainer, run, store);
-    } else if (tabId === "import") {
-      unmountCurrent = mountImportArchive(viewContainer, run, store);
-    } else if (tabId === "retention") {
-      unmountCurrent = mountRetentionPolicy(viewContainer, run, store);
-    }
+    const mountTab = { full: mountFull, cloud: mountCloud, import: mountImport, retention: mountRetention }[key] || mountFull;
+    unmountCurrent = mountTab(viewContainer, ctx) || null;
   }
 
-  function renderTabs() {
-    tabContainer.replaceChildren(
-      ...tabs.map(t => h("button", {
-        class: `sub-tab-btn ${t.id === currentTab ? "active" : ""}`,
-        type: "button",
-        onClick: () => switchTab(t.id)
-      }, t.label))
-    );
-  }
-
-  root.replaceChildren(
-    tabContainer,
-    viewContainer
-  );
-
-  renderTabs();
-  switchTab(currentTab);
+  fill(root, tabs.el, viewContainer);
+  show(tabs.active);
 
   return () => {
     if (unmountCurrent) unmountCurrent();
   };
 }
 
-// ==================== TAB 1: 完整备份与灾备 ====================
-function mountFullBackups(container, run, store) {
-  let homes = [];
-  let selectedHome = "windows";
-  const homeTabs = h("div", { class: "home-tabs" });
+// ==================== 完整备份 ====================
+function mountFull(container, { store, run }) {
+  let alive = true;
+  let homes = Array.isArray(backupCache.homes) ? backupCache.homes : [];
+  let selectedHome = pickHome(homes, "windows");
 
-  const uploadBtn = h("button", { class: "btn btn-danger", type: "button" }, "生成并上传到服务器（明文）");
-  uploadBtn.addEventListener("click", async () => {
-    const cfg = asObject(store.getState().status?.config);
-    if (!cfg.full_backup_allow_plaintext_upload) {
-      showToast("请先到「系统设置 → 备份参数策略」开启「允许云端明文上传」", "warning");
-      return;
-    }
-    const home = selected();
-    if (!window.confirm(`${home.label || home.id} 的完整对话备份包含真实对话内容，且当前未加密。确认以明文上传到服务器？`)) return;
-    uploadBtn.disabled = true;
-    try {
-      if (home.kind === "wsl") {
-        await run("wsl-full-backup", {
-          payload: { distro: home.distro, include_config: true, include_memories: true, upload: true, allow_plaintext_upload: true },
-          okMsg: `${home.label || "WSL"} 完整备份已生成并上传`,
-        });
-      } else {
-        await run("full-backup-now", {
-          payload: { upload: true, allow_plaintext_upload: true },
-          okMsg: "Windows 完整备份已生成并上传",
-        });
-      }
-    } catch(e) {} finally {
-      uploadBtn.disabled = false;
-    }
-  });
-
+  const homeTabs = h("div", { class: "home-tabs", role: "group", "aria-label": "选择 Codex 环境" });
   const encInfo = h("div", { class: "enc-status" });
+  const uploadBtn = actionButton("生成并上传", "btn-ghost", uploadSelected);
+  const restoreBtn = actionButton("从云端恢复最新备份", "btn-danger", restoreSelected);
+  const restoreDivider = h("span", { class: "divider", "aria-hidden": "true" });
+  const resultWrap = h("div", { class: "result-stack", "aria-live": "polite" });
+  const disasterResult = h("div", { class: "result-stack", "aria-live": "polite" });
 
-  const fullCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, "Codex Home 完整备份"),
-    h("p", { class: "card-desc" }, "选择一个 Codex 运行环境（Windows 或 WSL）对其所有会话进行完整打包归档。"),
-    encInfo,
-    homeTabs,
+  fill(container,
     h(
       "div",
-      { class: "card-actions" },
-      actionButton("刷新运行环境", "btn-ghost", () => loadHomes(true)),
-      actionButton("检查同步状态", "btn-ghost", checkSelected),
-      actionButton("生成本地备份包", "btn-primary", backupSelected),
-      actionButton("恢复最近一次备份", "btn-danger", restoreSelected),
-      uploadBtn,
-      actionButton("标记对话为 Dirty", "btn-ghost", () => run("notify-change", { okMsg: "已补发 dirty 标记" }))
-    )
-  );
-
-  const disasterCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, "灾难级预飞保护 (Disaster Backup)"),
-    h("p", { class: "card-desc" }, "立即把本机 Codex 核心数据库和配置全部打包到 ~/.codex-sync/disaster-backups，不经过任何脱敏，且只保留在本地。"),
+      { class: "card section" },
+      h(
+        "div",
+        { class: "card-title" },
+        h("span", {}, "完整对话备份"),
+        h(
+          "div",
+          { class: "card-title-actions" },
+          actionButton("重新检测环境", "btn-ghost btn-sm", () => loadHomes(true), { title: "重新扫描 Windows 和 WSL 里的 Codex" })
+        )
+      ),
+      h(
+        "p",
+        { class: "card-desc" },
+        "把所选环境里的全部 Codex 对话打包成一个备份包。本地备份包只保存在本机；上传到同步服务器后，可以在另一台电脑上恢复。"
+      ),
+      homeTabs,
+      encInfo,
+      h(
+        "div",
+        { class: "card-actions" },
+        actionButton("生成本地备份包", "btn-primary", backupLocal),
+        uploadBtn,
+        actionButton("检查备份状态", "btn-ghost", checkSelected),
+        restoreDivider,
+        restoreBtn
+      ),
+      resultWrap
+    ),
     h(
       "div",
-      { class: "card-actions" },
-      actionButton("创建灾难备份", "btn-primary", () =>
-        run("preflight-backup", { payload: { force: true, reason: "web_manual" }, okMsg: "灾难备份已创建" })
-      )
+      { class: "card section" },
+      h("div", { class: "card-title" }, "本地灾难备份"),
+      h(
+        "p",
+        { class: "card-desc" },
+        "把本机 ~/.codex 的数据库和配置原样打包到 ~/.codex-sync/disaster-backups。不做脱敏、不上传，只留在本机，用于误操作后的兜底恢复。从云端恢复对话前也会自动创建一次。"
+      ),
+      h("div", { class: "card-actions" }, actionButton("立即创建灾难备份", "btn-ghost", createDisaster)),
+      disasterResult
     )
   );
-
-  container.replaceChildren(
-    h("div", { class: "section" }, fullCard),
-    h("div", { class: "section" }, disasterCard)
-  );
-
-  const ENC_SOURCE_LABELS = { env: "环境变量", config: "口令", key_file: "私有 key 文件", generated_key_file: "自动生成的私有 key 文件" };
-  const syncUpload = () => {
-    const cfg = asObject(store.getState().status?.config);
-    const enc = asObject(cfg.full_backup_encryption);
-    const encrypted = enc.enabled !== false && Boolean(enc.configured);
-    if (encrypted) {
-      encInfo.replaceChildren(
-        h("span", { class: "badge ok" }, "已启用客户端加密"),
-        h("span", { class: "enc-meta" }, `密钥来源：${ENC_SOURCE_LABELS[enc.source] || enc.source || "—"}`),
-        h("span", { class: "enc-meta" }, `密钥指纹：${enc.key_id || "—"}`),
-        h("div", { class: "enc-hint" }, "完整包会自动加密上传，无需明文。另一台电脑填入相同口令、指纹一致即可互相解密恢复。")
-      );
-    } else if (enc.enabled === false) {
-      encInfo.replaceChildren(
-        h("span", { class: "badge warn" }, "客户端加密已关闭"),
-        h("div", { class: "enc-hint" }, "完整对话包将按明文处理，建议到「系统设置」开启加密并设置口令。")
-      );
-    } else {
-      encInfo.replaceChildren(
-        h("span", { class: "badge warn" }, "尚未设置加密密钥"),
-        h("div", { class: "enc-hint" }, "到「系统设置 → 完整备份加密密码」设置口令后，完整包将自动加密上传。")
-      );
-    }
-    const allow = Boolean(cfg.full_backup_allow_plaintext_upload);
-    uploadBtn.style.display = encrypted ? "none" : "";
-    uploadBtn.disabled = !allow;
-    uploadBtn.title = allow ? "以明文上传当前选中环境的完整对话包" : "需先在设置开启「允许明文上传」";
-  };
 
   function selected() {
-    return homes.find(home => home.id === selectedHome) || { id: "windows", kind: "windows", label: "Windows" };
+    return homes.find((home) => home.id === selectedHome) || FALLBACK_HOMES[0];
+  }
+
+  function homeSubText(home) {
+    if (!home.ok) return home.error || "无法访问";
+    if (!home.has_codex) return "没有找到 ~/.codex";
+    return home.current_provider ? `当前渠道 ${home.current_provider}` : "可以备份";
   }
 
   function renderHomes() {
     if (!homes.length) {
-      homeTabs.replaceChildren(loadingSpinner("正在拉取 Codex 运行环境（包含 WSL 检查）…"));
+      fill(homeTabs, loadingSpinner("正在检测 Codex 环境（包括 WSL）…", { compact: true }));
       return;
     }
-    const elements = homes.map(home =>
-      h("button", {
-        class: `home-tab ${home.id === selectedHome ? "active" : ""}`,
-        type: "button",
-        disabled: !home.ok || !home.has_codex,
-        onClick: () => {
-          selectedHome = home.id;
-          renderHomes();
-          syncUpload();
-        }
-      },
-      h("span", { class: "home-tab-title" }, home.label || home.id),
-      h("span", { class: "home-tab-sub" }, home.ok ? (home.has_codex ? (home.current_provider ? `当前渠道 ${home.current_provider}` : "可备份") : "未检测到 ~/.codex 目录") : home.error || "不可访问")
-      )
+    fill(homeTabs,
+      ...homes.map((home) => {
+        const on = home.id === selectedHome;
+        return h(
+          "button",
+          {
+            class: `home-tab${on ? " active" : ""}`,
+            type: "button",
+            "aria-pressed": on ? "true" : "false",
+            disabled: !usableHome(home),
+            onClick: () => {
+              if (home.id === selectedHome) return;
+              selectedHome = home.id;
+              resultWrap.replaceChildren();
+              renderHomes();
+              syncControls();
+            },
+          },
+          h("span", { class: "home-tab-title" }, home.label || home.id),
+          h("span", { class: "home-tab-sub" }, homeSubText(home))
+        );
+      })
     );
-    homeTabs.replaceChildren(...elements.filter(Boolean));
   }
 
-  async function loadHomes(notify = false) {
-    try {
-      const result = await runAction("list-codex-homes");
-      homes = Array.isArray(result.homes) ? result.homes : [];
-      backupCache.homes = homes;
-      if (!homes.some(h => h.id === selectedHome && h.ok && h.has_codex)) {
-        selectedHome = (homes.find(h => h.ok && h.has_codex) || homes[0] || { id: "windows" }).id;
-      }
-      renderHomes();
-      syncUpload();
-      if (notify) showToast("环境列表已刷新", "success");
-    } catch(e) {
-      homes = [{ id: "windows", kind: "windows", label: "Windows", ok: true, has_codex: true }];
+  function syncControls() {
+    const { enc, encrypted, allowPlain } = encryptionState(store);
+    const toPolicy = h("button", { class: "link-btn", type: "button", onClick: () => navigate("settings", "policy") }, "去设置加密口令");
+    if (encrypted) {
+      fill(encInfo,
+        h("span", { class: "badge ok" }, "已启用客户端加密"),
+        h("span", { class: "enc-meta" }, `密钥来源：${ENC_SOURCE_LABELS[enc.source] || enc.source || "-"}`),
+        h("span", { class: "enc-meta mono" }, `指纹：${enc.key_id || "-"}`),
+        h("div", { class: "enc-hint" }, "上传前会在本机加密，服务器看不到内容。另一台电脑设置相同的口令（指纹一致）后即可解密恢复。")
+      );
+    } else {
+      fill(encInfo,
+        h("span", { class: "badge warn" }, enc.enabled === false ? "客户端加密已关闭" : "尚未设置加密口令"),
+        h(
+          "div",
+          { class: "enc-hint" },
+          allowPlain
+            ? "当前允许明文上传：备份包会以明文保存在服务器上，建议设置加密口令。 "
+            : "设置加密口令后才能把完整备份上传到服务器。 ",
+          toPolicy
+        )
+      );
+    }
+
+    // 未加密且不允许明文时不提供上传入口，说明文字里已给出去处。
+    uploadBtn.hidden = !encrypted && !allowPlain;
+    uploadBtn.classList.toggle("btn-ghost", encrypted);
+    uploadBtn.classList.toggle("btn-danger", !encrypted);
+    uploadBtn.textContent = encrypted ? "生成并上传" : "生成并明文上传";
+    uploadBtn.title = encrypted ? "生成备份包，加密后上传到同步服务器" : "备份包未加密，会以明文上传到同步服务器";
+
+    const wsl = selected().kind === "wsl";
+    restoreBtn.textContent = wsl ? "恢复最近的本地备份" : "从云端恢复最新备份";
+    restoreBtn.hidden = !wsl && !serverConfigured(store);
+    restoreDivider.hidden = restoreBtn.hidden;
+    restoreBtn.title = wsl ? "用本机保存的最近一个 WSL 备份包覆盖该发行版的对话数据" : "下载同步服务器上最新的完整备份，覆盖本机对话数据";
+  }
+
+  async function loadHomes(force = false) {
+    if (force) {
+      homes = [];
       renderHomes();
     }
+    homes = await fetchHomes(force);
+    if (!alive) return;
+    selectedHome = pickHome(homes, selectedHome);
+    renderHomes();
+    syncControls();
+    if (force) showToast("Codex 环境已重新检测", "success");
+  }
+
+  function showResult(title, ...children) {
+    fill(resultWrap, resultSection(title, ...children));
+  }
+
+  function packageFacts(result) {
+    const pkg = asObject(result.package && typeof result.package === "object" ? result.package : result);
+    return factsOf([
+      ["备份 ID", pkg.backup_id || pkg.id ? shortId(pkg.backup_id || pkg.id) : null],
+      ["文件数", pkg.included_count],
+      ["数据量", pkg.included_bytes ? formatBytes(pkg.included_bytes) : null],
+      ["备份包位置", pkg.archive || pkg.path],
+    ]);
+  }
+
+  function describeBackup(result, label, upload) {
+    const pkg = asObject(result.package && typeof result.package === "object" ? result.package : result);
+    const unchanged = pkg.created === false;
+    if (upload) {
+      if (!result.uploaded) return `${label} 的对话没有变化，云端已是最新`;
+      return unchanged ? `${label} 的对话没有变化，已上传最近的备份包` : `${label} 完整备份已生成并上传`;
+    }
+    return unchanged ? `${label} 的对话没有变化，沿用最近的备份包` : `${label} 本地备份包已生成`;
+  }
+
+  async function runBackup(upload) {
+    const home = selected();
+    const label = home.label || home.id;
+    const { encrypted } = encryptionState(store);
+    const common = { upload, allow_plaintext_upload: upload && !encrypted };
+    const result =
+      home.kind === "wsl"
+        ? await run("wsl-full-backup", {
+            payload: { distro: home.distro, include_config: true, include_memories: true, ...common },
+            label: "生成备份包",
+            okMsg: (r) => describeBackup(r, label, upload),
+          })
+        : await run("full-backup-now", {
+            payload: common,
+            label: "生成备份包",
+            okMsg: (r) => describeBackup(r, label, upload),
+          });
+    if (!alive || isFailed(result)) return;
+    showResult(upload ? "生成并上传" : "生成本地备份包", packageFacts(result));
+  }
+
+  function backupLocal() {
+    return runBackup(false);
+  }
+
+  async function uploadSelected() {
+    if (!serverConfigured(store)) {
+      showToast("还没有配置同步服务器", "warning", { action: { label: "去配置", onClick: () => navigate("settings", "server") } });
+      return;
+    }
+    const { encrypted, allowPlain } = encryptionState(store);
+    if (!encrypted) {
+      if (!allowPlain) return;
+      const home = selected();
+      const ok = await confirmDialog({
+        title: "以明文上传完整备份？",
+        message: `${home.label || home.id} 的完整备份包含全部对话内容，当前没有加密。上传后，能访问这台服务器的人都可以直接读取这些内容。`,
+        details: ["设置加密口令后，之后的上传会自动加密", "只在你完全信任这台服务器时才使用明文上传"],
+        confirmLabel: "明文上传",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await runBackup(true);
   }
 
   async function checkSelected() {
     const home = selected();
-    if (home.kind === "wsl") return run("wsl-status", { refresh: false });
-    return run("full-backup-status", { refresh: false });
-  }
-
-  async function backupSelected() {
-    const home = selected();
-    if (home.kind === "wsl") {
-      return run("wsl-full-backup", {
-        payload: { distro: home.distro, include_config: true, include_memories: true },
-        okMsg: `${home.label || "WSL"} 本地完整备份包已生成`
-      });
+    showResult("备份状态", loadingSpinner("正在检查…", { compact: true }));
+    try {
+      if (home.kind === "wsl") {
+        const res = await runAction("wsl-status");
+        if (!alive) return;
+        const distro = (Array.isArray(res.distros) ? res.distros : []).find((item) => item.distro === home.distro);
+        if (!distro) {
+          showResult("备份状态", statusLine(res.error || `没有找到发行版 ${home.distro}`, "error"));
+          return;
+        }
+        showResult(
+          `${home.label} 状态`,
+          factsOf([
+            ["发行版", distro.distro],
+            ["用户主目录", distro.home],
+            ["~/.codex", distro.has_codex ? "存在" : "不存在"],
+            ["config.toml", distro.has_config ? "存在" : "没有"],
+            ["AGENTS.md", distro.has_agents ? "存在" : "没有"],
+          ]),
+          distro.error || distro.warning ? statusLine(distro.error || distro.warning, distro.error ? "error" : "warn") : null
+        );
+        return;
+      }
+      const res = await runAction("full-backup-status");
+      if (!alive) return;
+      const local = asObject(res.local);
+      const remote = asObject(res.remote);
+      const device = asObject(remote.device_state);
+      if (isFailed(local)) {
+        showResult("备份状态", statusLine(`读取本机状态失败：${failureReason(local)}`, "error"));
+        return;
+      }
+      const remoteOk = remote.success !== false && !remote.error;
+      showResult(
+        "Windows 备份状态",
+        factsOf([
+          ["本机对话", local.needs_upload ? "有改动尚未上传" : "与上次上传一致"],
+          ["备份范围", `${local.included_count ?? "-"} 个文件 · ${formatBytes(local.included_bytes)}`],
+          ["备份分支", local.branch_id],
+          ["云端状态", remoteOk ? (remote.device_state ? SYNC_STATE_LABELS[device.sync_state] || device.sync_state || "-" : "还没有备份") : null],
+          ["云端最新备份", remoteOk && device.head_backup_id ? shortId(device.head_backup_id) : null],
+          ["云端上次备份", remoteOk && device.last_backup_at ? formatDateTime(device.last_backup_at) : null],
+        ]),
+        remoteOk ? null : statusLine(`无法读取云端状态：${failureReason(remote)}`, "warn")
+      );
+    } catch (e) {
+      if (alive) showResult("备份状态", statusLine(`检查失败：${e.message || e}`, "error"));
     }
-    return run("full-backup-now", { payload: { upload: false }, okMsg: "Windows 本地完整备份包已生成" });
   }
 
   async function restoreSelected() {
     const home = selected();
     if (home.kind === "wsl") {
-      if (!window.confirm(`将把最近一份 WSL 完整备份还原到 ${home.label}。默认不覆盖 config.toml 配置文件。继续吗？`)) return;
-      return run("wsl-restore-latest", {
-        payload: { distro: home.distro, restore_config: false },
-        okMsg: "WSL 备份已还原"
+      const ok = await confirmDialog({
+        title: `恢复 ${home.label} 的最近备份？`,
+        message: "会用本机保存的最近一个 WSL 完整备份包，覆盖该发行版 ~/.codex 里的对话数据。",
+        details: ["config.toml 等配置文件不会被覆盖", "建议先关闭该 WSL 里正在运行的 Codex"],
+        confirmLabel: "开始恢复",
+        danger: true,
       });
+      if (!ok) return;
+      const result = await run("wsl-restore-latest", {
+        payload: { distro: home.distro, restore_config: false },
+        label: "恢复备份",
+        okMsg: (r) => `已恢复 ${r.restored_count ?? 0} 个文件到 ${home.label}`,
+      });
+      if (alive && !isFailed(result)) showResult("恢复结果", restoreFacts(result));
+      return;
     }
-    if (!window.confirm(
-      "将从云端拉取最新的完整对话备份并还原到本机 ~/.codex（“合盖即走”的接力恢复）。\n\n" +
-      "· 恢复前会自动创建一次本地灾难备份（preflight）以防万一\n" +
-      "· 默认不覆盖 config.toml / AGENTS.md 等配置文件\n" +
-      "· 加密包需要本机已设置相同的加密口令，或已导入对应密钥\n\n确认从云端恢复最新对话吗？"
-    )) return;
-    return run("restore-latest-full-backup", {
-      payload: { restore_config: false },
-      okMsg: "已从云端拉取并恢复最新完整对话备份"
+    if (!serverConfigured(store)) {
+      showToast("还没有配置同步服务器", "warning", { action: { label: "去配置", onClick: () => navigate("settings", "server") } });
+      return;
+    }
+    const ok = await confirmDialog({
+      title: "从云端恢复最新备份？",
+      message: "会从同步服务器下载最新的完整对话备份，覆盖本机 ~/.codex 里的对话数据。适合换到另一台电脑后接着工作。",
+      details: RESTORE_NOTES,
+      confirmLabel: "下载并恢复",
+      danger: true,
     });
+    if (!ok) return;
+    const result = await run("restore-latest-full-backup", {
+      payload: { restore_config: false },
+      label: "恢复云端备份",
+      okMsg: (r) => `已恢复 ${r.restored_count ?? 0} 个文件（来自 ${backupEnvLabel(r.selected?.device_id)}）`,
+    });
+    if (alive && !isFailed(result)) showResult("恢复结果", restoreFacts(result));
   }
 
-  syncUpload();
-  if (backupCache.homes) {
-    homes = backupCache.homes;
-    if (!homes.some(h => h.id === selectedHome && h.ok && h.has_codex)) {
-      selectedHome = (homes.find(h => h.ok && h.has_codex) || homes[0] || { id: "windows" }).id;
-    }
-    renderHomes();
-  } else {
-    loadHomes();
+  async function createDisaster() {
+    const result = await run("preflight-backup", {
+      payload: { force: true, reason: "web_manual" },
+      label: "创建灾难备份",
+      okMsg: (r) => (r.created === false ? `没有创建：${r.reason || "条件不满足"}` : "灾难备份已创建"),
+    });
+    if (!alive || isFailed(result) || result.created === false) return;
+    fill(disasterResult,
+      resultSection(
+        "灾难备份",
+        factsOf([
+          ["文件数", result.included_count],
+          ["数据量", result.included_bytes ? formatBytes(result.included_bytes) : null],
+          ["跳过", Array.isArray(result.skipped) && result.skipped.length ? `${result.skipped.length} 个过大或无法读取的文件` : null],
+          ["备份包位置", result.archive],
+        ])
+      )
+    );
   }
-  const uConfig = store.select(s => s.status?.config, syncUpload);
+
+  renderHomes();
+  syncControls();
+  loadHomes(false);
+  const unsubscribe = store.select((s) => s.status?.config, syncControls);
 
   return () => {
-    uConfig();
+    alive = false;
+    unsubscribe();
   };
 }
 
-// ==================== TAB 2: 云端备份 ====================
-function mountCloudBackups(container, run, store) {
-  let cloudBackups = null;
-  let loadingCloudBackups = false;
-  let showAllCloudBackups = false;
+function restoreFacts(result) {
+  const source = asObject(result.selected);
+  const time = source.received_at || source.created_at;
+  return factsOf([
+    ["恢复文件数", result.restored_count],
+    ["来源", source.device_id ? backupEnvLabel(source.device_id) : null],
+    ["备份时间", time ? formatDateTime(time) : null],
+    ["跳过", Array.isArray(result.skipped) && result.skipped.length ? `${result.skipped.length} 个（配置文件等）` : null],
+    ["恢复前的灾难备份", asObject(result.preflight_backup).archive],
+  ]);
+}
 
-  const cloudBackupsCard = h("div", { class: "card" });
+// ==================== 云端备份 ====================
+function mountCloud(container, { store, openImport }) {
+  let alive = true;
+  let data = backupCache.cloud;
+  let loading = false;
+  let showAll = false;
 
-  container.replaceChildren(
-    h("div", { class: "section" }, cloudBackupsCard)
-  );
+  const card = h("div", { class: "card section" });
+  fill(container, card);
 
-  async function refreshCloudBackups({ notify = false } = {}) {
-    loadingCloudBackups = true;
-    renderCloudBackups();
+  async function load({ notify = false } = {}) {
+    if (!serverConfigured(store)) {
+      render();
+      return;
+    }
+    loading = true;
+    render();
+    let result;
     try {
-      cloudBackups = await runAction("list-full-backups");
-      if (notify) {
-        showToast(cloudBackups?.error ? "云端备份列表读取失败" : "云端备份列表已更新", cloudBackups?.error ? "error" : "success");
-      }
+      result = await runAction("list-full-backups");
     } catch (e) {
-      cloudBackups = { success: false, error: String(e.message || e) };
-      if (notify) {
-        showToast(String(e.message || e), "error");
-      }
-    } finally {
-      loadingCloudBackups = false;
-      renderCloudBackups();
+      result = { success: false, error: String(e.message || e) };
+    }
+    if (!alive) return;
+    loading = false;
+    data = result;
+    if (!isFailed(result)) backupCache.cloud = result;
+    render();
+    if (notify) {
+      if (isFailed(result)) showToast(`读取云端备份失败：${failureReason(result)}`, "error");
+      else showToast("云端备份列表已刷新", "success");
     }
   }
 
-  function renderCloudBackups() {
-    const backups = Array.isArray(cloudBackups?.full_backups) ? cloudBackups.full_backups : [];
-    const visibleBackups = showAllCloudBackups ? backups : backups.slice(0, 12);
-    const children = [
+  function render() {
+    const backups = Array.isArray(data?.full_backups) ? data.full_backups : [];
+    const failed = Boolean(data) && isFailed(data);
+    let badge = null;
+    if (loading) badge = h("span", { class: "badge" }, "读取中");
+    else if (failed) badge = h("span", { class: "badge danger" }, "读取失败");
+    else if (data) badge = h("span", { class: "badge info" }, `${backups.length} 个`);
+
+    let body;
+    if (!serverConfigured(store)) body = serverMissingNotice("还没有配置同步服务器，无法读取云端备份。");
+    else if (failed) body = statusLine(`读取云端备份失败：${failureReason(data)}`, "error");
+    else if (!data) body = loadingSpinner("正在读取云端备份…");
+    else if (!backups.length) body = h("div", { class: "empty compact" }, "服务器上还没有完整备份。可以在「完整备份」页生成并上传。");
+    else {
+      const visible = showAll ? backups : backups.slice(0, CLOUD_PAGE);
+      body = h(
+        "div",
+        {},
+        h(
+          "div",
+          { class: "table-wrap" },
+          h(
+            "table",
+            { class: "table" },
+            h(
+              "thead",
+              {},
+              h("tr", {}, h("th", {}, "来源"), h("th", {}, "上传时间"), h("th", {}, "大小"), h("th", {}, "状态"), h("th", {}, "ID"), h("th", {}, "操作"))
+            ),
+            h("tbody", {}, ...visible.map(row))
+          )
+        ),
+        backups.length > CLOUD_PAGE
+          ? h(
+              "div",
+              { class: "list-more" },
+              h(
+                "button",
+                {
+                  class: "btn btn-ghost btn-sm",
+                  type: "button",
+                  onClick: () => {
+                    showAll = !showAll;
+                    render();
+                  },
+                },
+                showAll ? "只显示最新 12 个" : `显示全部（共 ${backups.length} 个）`
+              )
+            )
+          : null
+      );
+    }
+
+    fill(card,
       h(
         "div",
         { class: "card-title" },
         h("span", {}, "云端完整备份"),
-        h("span", { class: `badge ${cloudBackups?.error ? "danger" : backups.length ? "ok" : ""}` },
-          loadingCloudBackups ? "加载中" : cloudBackups?.error ? "失败" : `${backups.length} 个`
-        ),
-        actionButton("刷新云端备份", "btn-ghost btn-sm", () => refreshCloudBackups({ notify: true }))
+        h("div", { class: "card-title-actions" }, badge, actionButton("刷新", "btn-ghost btn-sm", () => load({ notify: true })))
       ),
-      cloudBackups?.error
-        ? h("div", { class: "status-line error" }, cloudBackups.error)
-        : backups.length
-          ? h(
-              "div",
-              {},
-              h(
-                "div",
-                { class: "table-wrap" },
-                h(
-                  "table",
-                  { class: "table" },
-                  h("thead", {}, h("tr", {},
-                    h("th", {}, "环境"),
-                    h("th", {}, "本机时间"),
-                    h("th", {}, "大小"),
-                    h("th", {}, "状态"),
-                    h("th", {}, "ID")
-                  )),
-                  h("tbody", {}, ...visibleBackups.map(cloudBackupRow))
-                )
-              ),
-              backups.length > 12
-                ? h(
-                    "div",
-                    { class: "card-actions", style: { marginTop: "10px" } },
-                    h("span", { class: "muted" }, showAllCloudBackups ? `已显示全部 ${backups.length} 个备份` : `已显示最新 12 个，共 ${backups.length} 个`),
-                    actionButton(showAllCloudBackups ? "收起列表" : "显示全部", "btn-ghost btn-sm", () => {
-                      showAllCloudBackups = !showAllCloudBackups;
-                      renderCloudBackups();
-                    })
-                  )
-                : null
-            )
-          : h("div", { class: "empty compact" }, loadingCloudBackups ? "正在读取云端备份…" : "点击右上方“刷新云端备份”按钮加载云端大包列表。")
-    ];
-    cloudBackupsCard.replaceChildren(...children.filter(Boolean));
+      h(
+        "p",
+        { class: "card-desc" },
+        "同步服务器上保存的完整对话备份，最新的在最前面。可以把某个 Windows 备份整体恢复到本机，也可以只挑其中几个对话导入。"
+      ),
+      body
+    );
   }
 
-  function cloudBackupRow(item) {
+  function row(item) {
     const backup = asObject(item);
-    const state = backup.sync_state || (backup.parent_backup_id ? "incremental" : "root");
     const time = backup.received_at || backup.created_at || "";
+    const state = backup.sync_state || (backup.parent_backup_id ? "incremental" : "root");
+    const fromWsl = String(backup.device_id || "").startsWith("wsl:");
     return h(
       "tr",
       {},
       h(
         "td",
         { class: "cell-ellipsis", title: backup.device_id || "" },
-        h("div", {}, fullBackupEnvLabel(backup)),
-        h("div", { class: "muted", style: { fontSize: "12px" } }, backup.branch_id || backup.device_id || "-")
+        h("div", {}, backupEnvLabel(backup.device_id)),
+        h("div", { class: "cell-sub" }, backup.branch_id || "-")
       ),
-      h("td", { title: time ? `UTC: ${time}` : "" }, formatDateTime(time)),
+      h("td", { title: time ? `UTC ${time}` : "" }, formatDateTime(time)),
       h("td", {}, formatBytes(backup.size_bytes)),
       h(
         "td",
         {},
-        h("span", { class: `badge ${backup.encrypted ? "ok" : "warn"}` }, backup.encrypted ? "已加密" : "明文"),
-        h("span", { class: "badge", style: { marginLeft: "6px" } }, state)
+        h(
+          "div",
+          { class: "badge-row" },
+          h("span", { class: `badge ${backup.encrypted ? "ok" : "warn"}` }, backup.encrypted ? "已加密" : "明文"),
+          h("span", { class: "badge" }, SYNC_STATE_LABELS[state] || state)
+        )
       ),
-      h("td", { class: "mono", title: backup.id || "" }, shortId(backup.id))
+      h("td", { class: "mono", title: backup.id || "" }, shortId(backup.id)),
+      h(
+        "td",
+        {},
+        h(
+          "div",
+          { class: "row-actions" },
+          h(
+            "button",
+            { class: "btn btn-ghost btn-sm", type: "button", title: "挑选这个备份里的对话导入", onClick: () => openImport(backup.id) },
+            "导入对话"
+          ),
+          fromWsl ? null : actionButton("恢复到本机", "btn-ghost btn-sm", () => restoreBackup(backup), { title: "用这个备份整体覆盖本机对话" })
+        )
+      )
     );
   }
 
-  function fullBackupEnvLabel(backup) {
-    const device = String(backup.device_id || "");
-    if (device.startsWith("wsl:")) return `WSL · ${device.slice(4) || "unknown"}`;
-    return device ? `Windows · ${device}` : "Windows";
+  async function restoreBackup(backup) {
+    const ok = await confirmDialog({
+      title: "用这个备份覆盖本机对话？",
+      message: `会下载 ${backupEnvLabel(backup.device_id)} 在 ${formatDateTime(backup.received_at || backup.created_at)} 上传的完整备份，覆盖本机 ~/.codex 里的对话数据。`,
+      details: RESTORE_NOTES,
+      confirmLabel: "下载并恢复",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      const downloaded = await runAction("download-full-backup", { backup_id: backup.id });
+      if (isFailed(downloaded)) {
+        showToast(`下载备份失败：${failureReason(downloaded)}`, "error");
+        return;
+      }
+      const result = await runAction("restore-full-backup", { archive: downloaded.path, confirm_backup_id: backup.id, restore_config: false });
+      if (isFailed(result)) showToast(`恢复失败：${failureReason(result)}`, "error");
+      else showToast(`已恢复 ${result.restored_count ?? 0} 个文件。恢复前的数据已另存为灾难备份。`, "success");
+    } catch (e) {
+      showToast(`恢复失败：${e.message || e}`, "error");
+    } finally {
+      refreshStatus(store);
+    }
   }
 
-  refreshCloudBackups();
-  renderCloudBackups();
+  render();
+  load();
 
-  return () => {};
+  return () => {
+    alive = false;
+  };
 }
 
-// ==================== TAB 3: 本地备份导入 ====================
-function mountImportArchive(container, run, store) {
+// ==================== 从备份导入对话 ====================
+function mountImport(container, { store, takeImportPreset }) {
+  let alive = true;
+  let homes = Array.isArray(backupCache.homes) ? backupCache.homes : [];
   let backups = null;
-  let homes = [];
   let convos = null;
   let detail = null;
-  let curBackupId = "";
-  let targetHome = "windows";
+  let detailRow = null;
+  let curBackupId = takeImportPreset();
+  let targetHome = pickHome(homes, "windows");
   let target = "";
-  let busy = false;
+  let search = "";
+  let shown = LIST_PAGE;
+  let listSeq = 0;
+  let detailSeq = 0;
+  let searchTimer = 0;
   const selected = new Set();
 
-  const backupSel = h("select", { class: "input" });
-  const homeSel = h("select", { class: "input" });
-  const targetSel = h("select", { class: "input" });
-  const listWrap = h("div", { class: "card", style: { maxHeight: "56vh", overflow: "auto" } });
-  const detailWrap = h("div", { class: "card", style: { maxHeight: "56vh", overflow: "auto" } });
-  const batchWrap = h("div", { class: "card-actions" });
+  const backupSel = h("select", { class: "input", "aria-label": "选择备份包" });
+  const searchInput = h("input", { class: "input", type: "search", placeholder: "在备份里搜索标题、首条消息或项目路径", "aria-label": "搜索备份里的对话" });
+  const homeSel = h("select", { class: "input", "aria-label": "导入到哪个环境" });
+  const targetSel = h("select", { class: "input", "aria-label": "导入到哪个渠道" });
+  const importBtn = actionButton("导入所选对话", "btn-primary btn-sm", doImport);
+  const noticeWrap = h("div");
+  const batchWrap = h("div", { class: "batch-bar" });
+  const listHead = h("div", { class: "conv-pane-head" });
+  const listBody = h("div", { class: "conv-pane-body" });
+  const detailPane = h("div", { class: "conv-pane" });
+
+  fill(container,
+    h(
+      "div",
+      { class: "card section" },
+      h(
+        "div",
+        { class: "card-title" },
+        h("span", {}, "从备份导入对话"),
+        h("div", { class: "card-title-actions" }, actionButton("刷新备份列表", "btn-ghost btn-sm", () => loadBackups({ notify: true })))
+      ),
+      h(
+        "p",
+        { class: "card-desc" },
+        "选一个备份包，勾选需要的对话，再选择导入到哪个环境和渠道。云端备份会先下载到本机缓存，第一次打开可能需要一点时间。"
+      ),
+      h("div", { class: "filter-bar" }, backupSel, searchInput),
+      noticeWrap
+    ),
+    h("div", { class: "section" }, batchWrap),
+    h("div", { class: "conv-layout" }, h("div", { class: "conv-pane" }, listHead, listBody), detailPane)
+  );
 
   backupSel.addEventListener("change", () => {
     curBackupId = backupSel.value;
-    selected.clear();
     loadConvos();
+  });
+  searchInput.addEventListener("input", () => {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(() => {
+      search = searchInput.value.trim().toLowerCase();
+      shown = LIST_PAGE;
+      renderList();
+    }, 200);
+  });
+  homeSel.addEventListener("change", () => {
+    targetHome = homeSel.value || "windows";
+    target = "";
+    // 「本机已有 / 比本机新」取决于目标环境，换环境后重新比对，保留已勾选的对话
+    if (curBackupId) loadConvos({ keepSelection: true });
+    else fillTargets();
   });
   targetSel.addEventListener("change", () => {
     target = targetSel.value;
   });
-  homeSel.addEventListener("change", async () => {
-    targetHome = homeSel.value || "windows";
-    target = "";
-    if (curBackupId) await loadConvos();
-    else if (convos && convos.success) await fillTarget(convos);
-    renderBatch();
-  });
 
-  const toolbar = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, "备份导入向导"),
-    h("p", { class: "card-desc" }, "第一步：在下拉框中选择要加载的备份包。第二步：勾选需要恢复导入的对话。第三步：指定目标环境和渠道，执行导入。"),
-    h(
-      "div",
-      { class: "card-actions" },
-      h("span", { class: "muted" }, "选择备份源包"),
-      backupSel,
-      actionButton("刷新备份包列表", "btn-ghost btn-sm", loadBackups),
-      actionButton("刷新目标环境", "btn-ghost btn-sm", refreshTargetHomes)
-    )
-  );
+  const homeLabel = (id) => homeLabelFor(homes, id);
 
-  container.replaceChildren(
-    h("div", { class: "section" }, toolbar),
-    h("div", { class: "section" }, batchWrap),
-    h("div", { class: "grid grid-2" }, listWrap, detailWrap)
-  );
+  function backupItems() {
+    return backups && !isFailed(backups) && Array.isArray(backups.backups) ? backups.backups : [];
+  }
 
-  async function loadBackups() {
-    busy = true;
-    renderBatch();
+  function backupOptionLabel(item) {
+    const source = item.source === "server" ? "云端" : item.source === "wsl" ? "WSL 本地" : "本机";
+    const parts = [formatDateTime(item.created_at), backupEnvLabel(item.device_id), source];
+    if (item.size_bytes) parts.push(formatBytes(item.size_bytes));
+    if (item.source === "server" && item.downloaded) parts.push("已下载");
+    return parts.join(" · ");
+  }
+
+  function renderBackupOptions() {
+    const items = backupItems();
+    let placeholder = "正在读取备份列表…";
+    if (backups) placeholder = items.length ? `选择备份包（共 ${items.length} 个）` : "没有可导入的备份包";
+    fill(backupSel, h("option", { value: "" }, placeholder), ...items.map((item) => h("option", { value: item.backup_id }, backupOptionLabel(item))));
+    backupSel.value = items.some((item) => item.backup_id === curBackupId) ? curBackupId : "";
+
+    const notices = [];
+    if (backups && isFailed(backups)) notices.push(statusLine(`读取备份列表失败：${failureReason(backups)}`, "error"));
+    else if (backups?.remote_error && !serverConfigured(store)) notices.push(serverMissingNotice("还没有配置同步服务器，只列出了本机已有的备份。"));
+    else if (backups?.remote_error) notices.push(statusLine(`无法连接同步服务器，只列出了本机已有的备份：${backups.remote_error}`, "warn"));
+    fill(noticeWrap, ...notices);
+  }
+
+  async function loadBackups({ notify = false } = {}) {
+    backupSel.disabled = true;
+    let result;
     try {
-      backups = await runAction("list-importable-backups");
-    } catch(e) {
-      backups = { success: false, error: String(e.message || e) };
+      result = await runAction("list-importable-backups");
+    } catch (e) {
+      result = { success: false, error: String(e.message || e) };
     }
-    busy = false;
-    const items = (backups && backups.success && backups.backups) || [];
-    const ids = new Set(items.map(item => item.backup_id));
-    const opts = [
-      h("option", { value: "" }, items.length ? `-- 选择备份包（共 ${items.length} 个）--` : "-- 无可用备份包 --"),
-      ...items.map(b =>
-        h("option", { value: b.backup_id }, `${sourceLabel(b.source)} · ${b.device_id || "?"} · ${formatDateTime(b.created_at)}${b.downloaded ? " ✓本地就绪" : ""}`)
-      )
-    ];
-    backupSel.replaceChildren(...opts.filter(Boolean));
-    if (curBackupId && ids.has(curBackupId)) {
-      backupSel.value = curBackupId;
-    } else {
+    if (!alive) return;
+    backups = result;
+    backupSel.disabled = false;
+    if (curBackupId && !backupItems().some((item) => item.backup_id === curBackupId)) {
+      showToast("可导入列表里没有找到所选的备份包，它可能已被清理", "warning");
       curBackupId = "";
-      backupSel.value = "";
-      selected.clear();
-      convos = null;
-      detail = null;
-      renderList();
-      renderDetail();
+      resetConvos();
     }
-    if (!items.length) {
-      listWrap.replaceChildren(
-        h("div", { class: "empty" }, backups && backups.remote_error ? "服务器连接失败，且本地无缓存备份：" + backups.remote_error : "暂无可导入的备份文件")
-      );
+    renderBackupOptions();
+    if (notify) {
+      if (isFailed(result)) showToast(`读取备份列表失败：${failureReason(result)}`, "error");
+      else showToast("备份列表已刷新", "success");
     }
-    renderBatch();
   }
 
-  async function loadHomes(force = false) {
-    if (!force && Array.isArray(backupCache.homes)) {
-      homes = backupCache.homes;
-      renderTargetHomes();
-      return;
-    }
-    if (force) backupCache.targetChannelsByHome.clear();
-    try {
-      const result = await runAction("list-codex-homes");
-      homes = Array.isArray(result.homes) ? result.homes : [];
-    } catch(e) {
-      homes = [{ id: "windows", label: "Windows", kind: "windows", ok: true, has_codex: true }];
-    }
-    backupCache.homes = homes;
-    renderTargetHomes();
-  }
-
-  function renderTargetHomes() {
-    const usable = homes.filter(home => home.ok && home.has_codex);
-    if (!usable.some(home => home.id === targetHome)) {
-      targetHome = (usable[0] || homes[0] || { id: "windows" }).id;
-    }
-    const opts = homes.map(home =>
-      h("option", { value: home.id, disabled: !home.ok || !home.has_codex }, `${home.label || home.id}${home.has_codex ? "" : "（无 .codex 目录）"}`)
+  function renderHomeOptions() {
+    targetHome = pickHome(homes, targetHome);
+    fill(homeSel,
+      ...homes.map((home) =>
+        h("option", { value: home.id, disabled: !usableHome(home) }, `${home.label || home.id}${usableHome(home) ? "" : "（不可用）"}`)
+      )
     );
-    homeSel.replaceChildren(...opts.filter(Boolean));
     homeSel.value = targetHome;
   }
 
-  async function refreshTargetHomes() {
-    await loadHomes(true);
-    target = "";
-    if (curBackupId) await loadConvos();
-    else renderBatch();
-    showToast("目标环境已刷新", "success");
+  async function loadHomes() {
+    homes = await fetchHomes(false);
+    if (!alive) return;
+    renderHomeOptions();
   }
 
-  async function loadConvos() {
-    if (!curBackupId) {
-      convos = null;
-      renderList();
-      renderBatch();
-      return;
-    }
-    listWrap.replaceChildren(loadingSpinner("正在解析备份包（云端备份将自动拉取缓存）…"));
-    try {
-      convos = await runAction("list-backup-conversations", { backup_id: curBackupId, target_home: targetHome });
-    } catch(e) {
-      convos = { success: false, error: String(e.message || e) };
-    }
-    if (convos && convos.success) await fillTarget(convos);
-    renderList();
-    renderBatch();
+  async function loadTargetChannels(homeId) {
+    if (backupCache.targetChannelsByHome.has(homeId)) return backupCache.targetChannelsByHome.get(homeId);
+    const result = await runAction("list-target-channels", { target_home: homeId });
+    if (!isFailed(result)) backupCache.targetChannelsByHome.set(homeId, result);
+    return result;
   }
 
-  async function fillTarget(data) {
-    let local = null;
+  function uniqueProviders(items) {
+    return [...new Set((items || []).filter((p) => p && p !== "(unknown)"))].sort();
+  }
+
+  async function fillTargets() {
+    const homeId = targetHome;
+    let local;
     try {
-      local = await loadTargetChannels();
-    } catch(e) {
+      local = await loadTargetChannels(homeId);
+    } catch (e) {
       local = { success: false, error: String(e.message || e) };
     }
-
-    const current = local?.current_provider || data.current_provider || "";
-    const localProviders = uniqueProviders([
-      current,
-      ...((local && local.success && local.channels) || []).map(c => c.provider),
-    ]);
-    const backupProviders = uniqueProviders((data.conversations || []).map(c => c.model_provider));
-    if (!target) target = current || localProviders[0] || backupProviders[0] || "";
+    if (!alive || homeId !== targetHome) return;
+    const localOk = local && !isFailed(local);
+    const current = (localOk && local.current_provider) || convos?.current_provider || "";
+    const localProviders = uniqueProviders([current, ...(localOk && Array.isArray(local.channels) ? local.channels : []).map((c) => c.provider)]);
+    const backupProviders = uniqueProviders((convos?.conversations || []).map((c) => c.model_provider)).filter((p) => !localProviders.includes(p));
 
     const groups = [];
     if (localProviders.length) {
       groups.push(
-        h("optgroup", { label: targetHome === "windows" ? "Windows 渠道" : "目标 WSL 渠道" },
-          ...localProviders.map(p => h("option", { value: p }, providerLabel(p, current, "目标")))
+        h(
+          "optgroup",
+          { label: `${homeLabel(homeId)} 的渠道` },
+          ...localProviders.map((p) => h("option", { value: p }, p === current ? `${p}（当前）` : p))
         )
       );
     }
     if (backupProviders.length) {
-      groups.push(
-        h("optgroup", { label: "备份包自带渠道" },
-          ...backupProviders.map(p => h("option", { value: p }, providerLabel(p, current, "备份")))
-        )
-      );
+      groups.push(h("optgroup", { label: "备份里的其他渠道" }, ...backupProviders.map((p) => h("option", { value: p }, p))));
     }
-
-    const targetOpts = groups.length ? groups : [h("option", { value: "" }, "未检测到可选渠道")];
-    targetSel.replaceChildren(...targetOpts.filter(Boolean));
-    targetSel.value = target || current || "";
-    if (targetSel.value !== (target || current || "")) {
-      targetSel.value = current || localProviders[0] || backupProviders[0] || "";
-    }
-    target = targetSel.value;
+    const all = [...localProviders, ...backupProviders];
+    fill(targetSel, ...(groups.length ? groups : [h("option", { value: "" }, "没有检测到渠道")]));
+    if (!all.includes(target)) target = current || all[0] || "";
+    targetSel.value = target;
   }
 
-  function uniqueProviders(items) {
-    return [...new Set((items || []).filter(p => p && p !== "(unknown)"))].sort();
+  function resetConvos() {
+    convos = null;
+    detail = null;
+    detailRow = null;
+    selected.clear();
+    shown = LIST_PAGE;
+    renderList();
+    renderDetail();
+    renderBatch();
   }
 
-  async function loadTargetChannels() {
-    const key = targetHome || "windows";
-    if (backupCache.targetChannelsByHome.has(key)) {
-      return backupCache.targetChannelsByHome.get(key);
+  async function loadConvos({ keepSelection = false } = {}) {
+    const seq = (listSeq += 1);
+    if (!keepSelection) {
+      selected.clear();
+      detail = null;
+      detailRow = null;
+      shown = LIST_PAGE;
+      renderDetail();
     }
-    const result = await runAction("list-target-channels", { target_home: targetHome });
-    backupCache.targetChannelsByHome.set(key, result);
-    return result;
+    if (!curBackupId) {
+      resetConvos();
+      fillTargets();
+      return;
+    }
+    convos = null;
+    fill(listHead, h("span", {}, "备份里的对话"));
+    fill(listBody, loadingSpinner("正在读取备份包（云端备份会先下载到本机）…"));
+    renderBatch();
+    let result;
+    try {
+      result = await runAction("list-backup-conversations", { backup_id: curBackupId, target_home: targetHome });
+    } catch (e) {
+      result = { success: false, error: String(e.message || e) };
+    }
+    if (!alive || seq !== listSeq) return;
+    convos = result;
+    if (keepSelection && !isFailed(result)) {
+      const importable = new Set((result.conversations || []).filter((c) => c.has_body).map((c) => c.id));
+      for (const id of [...selected]) if (!importable.has(id)) selected.delete(id);
+    }
+    await fillTargets();
+    if (!alive || seq !== listSeq) return;
+    renderList();
+    renderBatch();
   }
 
-  function providerLabel(provider, current, source) {
-    const tags = [source];
-    if (provider === current) tags.push("当前");
-    return `${provider}（${tags.join("，")}）`;
+  function allConvos() {
+    return convos && !isFailed(convos) && Array.isArray(convos.conversations) ? convos.conversations : [];
+  }
+
+  function filteredConvos() {
+    const list = allConvos();
+    if (!search) return list;
+    return list.filter((c) => `${c.title || ""}\n${c.first_user_message || ""}\n${c.preview || ""}\n${c.cwd || ""}`.toLowerCase().includes(search));
   }
 
   function renderList() {
-    if (!convos) {
-      listWrap.replaceChildren(h("div", { class: "empty" }, "请先选择一个备份包以加载列表"));
+    if (!curBackupId) {
+      fill(listHead, h("span", {}, "备份里的对话"));
+      fill(listBody, h("div", { class: "empty" }, "先在上方选择一个备份包"));
       return;
     }
-    if (!convos.success) {
-      listWrap.replaceChildren(h("div", { class: "empty" }, "加载失败：" + (convos.error || "")));
+    if (!convos) return; // 加载中，保留转圈
+    if (isFailed(convos)) {
+      fill(listHead, h("span", {}, "备份里的对话"));
+      fill(listBody, statusLine(`读取备份失败：${failureReason(convos)}`, "error"));
       return;
     }
-    const list = convos.conversations || [];
+    const all = allConvos();
+    const list = filteredConvos();
+    const fresh = all.filter((c) => c.has_body && !c.present).length;
+    fill(listHead,
+      h("span", {}, search ? `匹配 ${list.length} / ${all.length} 个对话` : `共 ${all.length} 个对话`),
+      h("span", {}, `可新增 ${fresh} 个`)
+    );
     if (!list.length) {
-      listWrap.replaceChildren(h("div", { class: "empty" }, "包内暂无有效对话数据"));
+      fill(listBody, h("div", { class: "empty" }, all.length ? "没有匹配的对话" : "这个备份里没有对话"));
       return;
     }
-    const elements = list.map(convRow);
-    listWrap.replaceChildren(h("div", {}, ...elements.filter(Boolean)));
+    const visible = list.slice(0, shown);
+    const rest = list.length - visible.length;
+    fill(listBody,
+      ...visible.map(convRow),
+      rest > 0
+        ? h(
+            "div",
+            { class: "list-more" },
+            h(
+              "button",
+              {
+                class: "btn btn-ghost btn-sm",
+                type: "button",
+                onClick: () => {
+                  shown += LIST_PAGE;
+                  renderList();
+                },
+              },
+              `显示更多（还有 ${rest} 个）`
+            )
+          )
+        : null
+    );
+  }
+
+  function convStatusBadge(c) {
+    if (!c.has_body) return h("span", { class: "badge warn", title: "备份里没有这个对话的正文，无法导入" }, "缺少正文");
+    if (!c.present) return h("span", { class: "badge ok" }, "本机没有");
+    if (c.newer) return h("span", { class: "badge info", title: "备份里的版本比目标环境里的更新" }, "比本机新");
+    return h("span", { class: "badge" }, "本机已有");
   }
 
   function convRow(c) {
-    const cb = h("input", { type: "checkbox", checked: selected.has(c.id) || null, disabled: !c.has_body || null });
-    cb.addEventListener("change", () => {
-      if (cb.checked) selected.add(c.id);
+    const box = h("input", { type: "checkbox", "aria-label": `选择 ${c.title || c.id}`, disabled: !c.has_body });
+    box.checked = selected.has(c.id);
+    box.addEventListener("change", () => {
+      if (box.checked) selected.add(c.id);
       else selected.delete(c.id);
       renderBatch();
     });
-    const title = h("div", { style: { fontWeight: "600", cursor: "pointer" }, onClick: () => openDetail(c.id) }, c.title || "(无标题)");
-    const tags = h(
+    const preview = c.first_user_message || c.preview || "";
+    return h(
       "div",
-      { class: "muted", style: { fontSize: "12px" } },
-      h("span", { class: "badge" }, c.model_provider || "-"),
-      c.present
-        ? h("span", { class: "badge", style: { marginLeft: "6px" } }, c.newer ? "本地已存在更新版本" : "本地已有")
-        : h("span", { class: "badge ok", style: { marginLeft: "6px" } }, "全新导入"),
-      c.has_body ? null : h("span", { class: "badge warn", style: { marginLeft: "6px" } }, "空内容")
+      { class: `conv-row${detailRow?.id === c.id ? " active" : ""}`, dataset: { id: c.id } },
+      box,
+      h(
+        "div",
+        { class: "conv-main" },
+        h("button", { class: "conv-title", type: "button", title: c.title || "", onClick: () => openDetail(c) }, c.title || "(无标题)"),
+        h(
+          "div",
+          { class: "conv-meta" },
+          h("span", { class: "badge" }, c.model_provider || "未知渠道"),
+          convStatusBadge(c),
+          c.archived ? h("span", { class: "badge" }, "已归档") : null,
+          c.updated_at ? h("span", {}, formatEpoch(c.updated_at)) : null
+        ),
+        preview ? h("div", { class: "conv-preview", title: preview }, preview) : null
+      )
     );
-    const rowChildren = [
-      h("div", { style: { paddingTop: "2px" } }, cb),
-      h("div", { style: { flex: "1", minWidth: "0" } }, title, tags)
-    ];
-    return h("div", { style: ROW_STYLE }, ...rowChildren.filter(Boolean));
   }
 
-  async function openDetail(id) {
-    detailWrap.replaceChildren(loadingSpinner("正在加载预览文本…"));
+  function markActive() {
+    for (const el of listBody.querySelectorAll(".conv-row")) el.classList.toggle("active", el.dataset.id === detailRow?.id);
+  }
+
+  async function openDetail(c) {
+    detailRow = c;
+    markActive();
+    const seq = (detailSeq += 1);
+    fill(detailPane, h("div", { class: "conv-pane-body" }, loadingSpinner("正在读取对话正文…")));
+    let result;
     try {
-      detail = await runAction("read-backup-conversation", { backup_id: curBackupId, thread_id: id });
+      result = await runAction("read-backup-conversation", { backup_id: curBackupId, thread_id: c.id });
     } catch (e) {
-      detail = { success: false, error: String(e.message || e) };
+      result = { success: false, error: String(e.message || e) };
     }
+    if (!alive || seq !== detailSeq) return;
+    detail = result;
     renderDetail();
   }
 
   function renderDetail() {
-    if (!detail) {
-      detailWrap.replaceChildren(h("div", { class: "empty" }, "点击左侧对话标题以预览对话正文"));
+    if (!detail || !detailRow) {
+      fill(detailPane, h("div", { class: "conv-pane-body" }, h("div", { class: "empty" }, "点左侧的对话标题查看正文")));
       return;
     }
-    if (!detail.success) {
-      detailWrap.replaceChildren(h("div", { class: "empty" }, "正文加载失败：" + (detail.error || "")));
+    if (isFailed(detail)) {
+      fill(detailPane, h("div", { class: "conv-pane-body" }, statusLine(`读取正文失败：${failureReason(detail)}`, "error")));
       return;
     }
-    const msgs = (detail.messages || []).map(m => {
-      const msgChildren = [
-        h("div", { class: "muted", style: { fontSize: "12px" } }, ROLE_LABEL[m.role] || m.role),
-        h("div", { style: { whiteSpace: "pre-wrap", wordBreak: "break-word" } }, m.text || "")
-      ];
-      return h("div", { style: msgStyle(m.role) }, ...msgChildren.filter(Boolean));
-    });
-    const nodes = [
-      h("div", { class: "card-title" }, h("span", {}, (detail.thread || {}).title || "(无标题)")),
-      h("div", {}, ...msgs),
-      detail.truncated ? h("div", { class: "muted" }, "（已截断）") : null
-    ];
-    detailWrap.replaceChildren(...nodes.filter(Boolean));
+    const t = asObject(detail.thread);
+    const messages = (detail.messages || []).map(renderMessage);
+    const cwd = t.cwd || detailRow.cwd;
+    fill(detailPane,
+      h(
+        "div",
+        { class: "detail-head" },
+        h("div", { class: "detail-title" }, t.title || detailRow.title || "(无标题)"),
+        h(
+          "div",
+          { class: "detail-meta" },
+          [t.model_provider || detailRow.model_provider, `${messages.length} 条消息`, formatEpoch(t.updated_at || detailRow.updated_at)].filter(Boolean).join(" · ")
+        ),
+        cwd ? h("div", { class: "detail-meta mono", title: cwd }, cwd) : null
+      ),
+      h(
+        "div",
+        { class: "conv-pane-body" },
+        h(
+          "div",
+          { class: "msg-list" },
+          ...(messages.length ? messages : [h("div", { class: "empty compact" }, "这个对话没有可显示的消息")]),
+          detail.truncated ? statusLine("正文较长，只显示了前面一部分。", "info") : null
+        )
+      )
+    );
   }
 
   function renderBatch() {
-    const batchNodes = [
-      h("span", { class: "muted" }, busy ? "加载中…" : `已选择 ${selected.size} 项`),
-      h("span", { class: "muted", style: { marginLeft: "8px" } }, "目标位置"),
+    const importable = filteredConvos().filter((c) => c.has_body);
+    fill(batchWrap,
+      h("span", { class: "batch-count" }, `已选 ${selected.size}`),
+      h(
+        "button",
+        {
+          class: "btn btn-ghost btn-sm",
+          type: "button",
+          disabled: !importable.length,
+          onClick: () => {
+            for (const c of importable) selected.add(c.id);
+            renderList();
+            renderBatch();
+          },
+        },
+        search ? `全选匹配的（${importable.length}）` : `全选（${importable.length}）`
+      ),
+      h(
+        "button",
+        {
+          class: "btn btn-ghost btn-sm",
+          type: "button",
+          disabled: !selected.size,
+          onClick: () => {
+            selected.clear();
+            renderList();
+            renderBatch();
+          },
+        },
+        "清空选择"
+      ),
+      h("span", { class: "divider", "aria-hidden": "true" }),
+      h("span", { class: "batch-label" }, "导入到"),
       homeSel,
-      h("span", { class: "muted", style: { marginLeft: "8px" } }, "接入渠道"),
+      h("span", { class: "batch-label" }, "渠道"),
       targetSel,
-      actionButton("导入到选定环境", "btn-primary btn-sm", doImport)
-    ];
-    batchWrap.replaceChildren(...batchNodes.filter(Boolean));
+      importBtn
+    );
   }
 
   async function doImport() {
-    if (!curBackupId) { showToast("请先选择备份包", "warning"); return; }
-    if (!selected.size) { showToast("请先勾选需要导入的对话", "warning"); return; }
+    if (!curBackupId) {
+      showToast("请先选择备份包", "warning");
+      return;
+    }
+    if (!selected.size) {
+      showToast("请先勾选要导入的对话", "warning");
+      return;
+    }
     const ids = [...selected];
-    const t = target || targetSel.value || "";
+    const payload = { backup_id: curBackupId, thread_ids: ids, target: target || targetSel.value || "", target_home: targetHome };
     try {
-      let res = await runAction("import-conversations", { backup_id: curBackupId, thread_ids: ids, target: t, target_home: targetHome });
-      if (res && res.needs_close) {
-        if (!window.confirm(targetHome.startsWith("wsl:") ? WSL_CONFIRM_MSG : CONFIRM_MSG)) {
-          return;
-        }
-        res = await runAction("import-conversations", { backup_id: curBackupId, thread_ids: ids, target: t, target_home: targetHome, close_codex: true });
+      let result = await runAction("import-conversations", payload);
+      if (result && result.needs_close) {
+        if (!(await confirmCloseCodex({ wsl: targetHome.startsWith("wsl:") }))) return;
+        result = await runAction("import-conversations", { ...payload, close_codex: true });
       }
-      const ok = res && res.success;
-      const homeLabel = homes.find(h => h.id === targetHome)?.label || targetHome;
-      showToast(ok ? `已成功导入 ${res.imported} 个会话到 ${homeLabel} · ${res.target}` : (res && res.error) || "导入失败", ok ? "success" : "error");
-      if (ok) {
-        selected.clear();
-        await loadConvos();
+      if (!alive) return;
+      if (isFailed(result)) {
+        showToast(`导入失败：${failureReason(result)}`, "error");
+        return;
       }
+      showToast(`已导入 ${result.imported ?? ids.length} 个对话到 ${homeLabel(targetHome)} · ${result.target || payload.target || "当前渠道"}`, "success");
+      backupCache.targetChannelsByHome.delete(targetHome);
+      await loadConvos();
     } catch (e) {
-      showToast(String(e.message || e), "error");
+      showToast(`导入失败：${e.message || e}`, "error");
     } finally {
-      refreshStatus(store).catch(() => {});
+      refreshStatus(store);
     }
   }
 
-  loadHomes().then(() => {
-    renderBatch();
-    loadBackups();
-  });
+  renderHomeOptions();
+  renderBackupOptions();
+  renderList();
   renderDetail();
+  renderBatch();
+  (async () => {
+    await Promise.all([loadHomes(), loadBackups()]);
+    if (!alive) return;
+    if (curBackupId) loadConvos();
+    else fillTargets();
+  })();
 
-  return () => {};
+  return () => {
+    alive = false;
+    clearTimeout(searchTimer);
+  };
 }
 
-// ==================== TAB 4: 服务器留存策略 ====================
-function mountRetentionPolicy(container, run, store) {
-  let retentionData = null;
-  let retentionLoading = false;
-  const retentionBody = h("div", { class: "result-stack" });
+// ==================== 服务器留存 ====================
+function mountRetention(container, { store }) {
+  let alive = true;
+  let data = null;
+  let loading = false;
 
-  async function loadServerRetention() {
-    retentionLoading = true;
-    renderRetention();
-    try {
-      retentionData = await runAction("server-retention-status");
-      showToast(retentionData.success === false ? "服务器留存策略读取失败" : "服务器留存策略已更新", retentionData.success === false ? "error" : "success");
-    } catch (e) {
-      retentionData = { success: false, error: String(e.message || e) };
-      showToast(String(e.message || e), "error");
-    } finally {
-      retentionLoading = false;
-      renderRetention();
-    }
-  }
-
-  async function pruneServerRetention() {
-    if (!window.confirm("将删除服务器端超出留存策略的完整备份和项目备份。每个设备/项目会保留最新入口。确认执行？")) return;
-    retentionLoading = true;
-    renderRetention();
-    try {
-      retentionData = await runAction("server-retention-prune", { dry_run: false });
-      const n = Number(retentionData.deleted_count || 0);
-      showToast(`服务器清理完成：删除 ${n} 项`, retentionData.success === false ? "error" : "success");
-    } catch (e) {
-      retentionData = { success: false, error: String(e.message || e) };
-      showToast(String(e.message || e), "error");
-    } finally {
-      retentionLoading = false;
-      renderRetention();
-    }
-  }
-
-  const retentionCard = h(
-    "div",
-    { class: "card" },
-    h("div", { class: "card-title" }, "服务器留存与自动清理"),
-    h("p", { class: "card-desc" }, "服务器在接收到新备份后会自动按策略进行清理；这里可以随时查看保留预览，也可以手动强制立即执行清理。"),
+  const body = h("div", { class: "result-stack", "aria-live": "polite" });
+  fill(container,
     h(
       "div",
-      { class: "card-actions" },
-      actionButton("查看清理预览", "btn-ghost", loadServerRetention),
-      actionButton("立即执行清理", "btn-danger", pruneServerRetention)
-    ),
-    retentionBody
-  );
-
-  container.replaceChildren(
-    h("div", { class: "section" }, retentionCard)
-  );
-
-  function renderRetention() {
-    if (retentionLoading) {
-      retentionBody.replaceChildren(loadingSpinner("正在读取服务器留存状态…"));
-      return;
-    }
-    if (!retentionData) {
-      retentionBody.replaceChildren(h("div", { class: "empty compact" }, "尚未读取服务器留存状态，请点击上方“查看清理预览”。"));
-      return;
-    }
-    if (retentionData.success === false || retentionData.error) {
-      retentionBody.replaceChildren(h("div", { class: "status-line error" }, retentionData.error || "读取失败"));
-      return;
-    }
-    const policy = asObject(retentionData.policy);
-    const full = asObject(policy.full_backups);
-    const project = asObject(policy.project_backups);
-    const usage = asObject(retentionData.usage);
-    const planned = Number(retentionData.planned_count || 0);
-    const actionCount = retentionData.dry_run ? planned : Number(retentionData.deleted_count ?? planned);
-    const actionBytes = retentionData.dry_run ? retentionData.planned_bytes : (retentionData.deleted_bytes ?? retentionData.planned_bytes);
-    const nodes = [
+      { class: "card section" },
       h(
         "div",
-        { class: "result-facts" },
-        fact("完整备份策略", `每设备/分支 ${full.keep_per_device_branch ?? "-"} 份 · ${full.max_age_days ?? "-"} 天`),
-        fact("项目备份策略", `每项目/设备 ${project.keep_per_repo_device ?? "-"} 份 · ${project.max_age_days ?? "-"} 天`),
-        fact("服务器容量上限", formatBytes(policy.server_total_max_bytes)),
-        fact("当前备份占用", formatBytes(usage.backup_bytes)),
-        fact("当前记录", `完整 ${usage.full_backup_count || 0} · 项目 ${usage.project_backup_count || 0}`),
-        fact(retentionData.dry_run ? "预览删除" : "本次删除", `${actionCount} 项 · ${formatBytes(actionBytes)}`),
-        fact("已保护入口", `${usage.protected_count || 0} 项`)
+        { class: "card-title" },
+        h("span", {}, "服务器留存与清理"),
+        h("div", { class: "card-title-actions" }, actionButton("刷新", "btn-ghost btn-sm", () => load({ notify: true })))
       ),
-      Array.isArray(retentionData.warnings) && retentionData.warnings.length
-        ? h("div", { class: "status-line warn" }, retentionData.warnings.join("；"))
-        : null
-    ];
-    retentionBody.replaceChildren(...nodes.filter(Boolean));
+      h(
+        "p",
+        { class: "card-desc" },
+        "服务器每次收到新备份后，会按下面的策略自动清理旧备份；每个设备、每个项目最新的一份始终保留。这里可以查看当前占用，也可以立即清理超出策略的备份。"
+      ),
+      body,
+      h("div", { class: "card-actions" }, actionButton("立即清理旧备份", "btn-danger", prune))
+    )
+  );
+
+  function keepText(count, days, unit) {
+    const keep = Number(count) > 0 ? `每个${unit}保留 ${count} 份` : "不限份数";
+    const age = Number(days) > 0 ? `最长 ${days} 天` : "不限时间";
+    return `${keep}，${age}`;
   }
 
-  loadServerRetention();
+  function planTable(planned) {
+    const visible = planned.slice(0, PLAN_PREVIEW);
+    return h(
+      "details",
+      { class: "collapse" },
+      h("summary", {}, `查看可清理的备份（${planned.length} 个）`),
+      h(
+        "div",
+        { class: "collapse-body" },
+        h(
+          "div",
+          { class: "table-wrap" },
+          h(
+            "table",
+            { class: "table" },
+            h("thead", {}, h("tr", {}, h("th", {}, "类型"), h("th", {}, "来源"), h("th", {}, "上传时间"), h("th", {}, "大小"), h("th", {}, "原因"))),
+            h(
+              "tbody",
+              {},
+              ...visible.map((item) => {
+                const full = item.kind === "full_backup";
+                const time = item.received_at || item.created_at;
+                return h(
+                  "tr",
+                  {},
+                  h("td", {}, full ? "完整备份" : "项目备份"),
+                  h(
+                    "td",
+                    { class: "cell-ellipsis", title: item.device_id || "" },
+                    full ? backupEnvLabel(item.device_id) : item.repo_name || "-",
+                    full ? null : h("div", { class: "cell-sub" }, item.device_id || "-")
+                  ),
+                  h("td", {}, formatDateTime(time)),
+                  h("td", {}, formatBytes(item.size_bytes)),
+                  h("td", {}, (item.reasons || []).map((reason) => RETENTION_REASONS[reason] || reason).join("；") || "-")
+                );
+              })
+            )
+          )
+        ),
+        planned.length > visible.length ? h("div", { class: "table-msg" }, `只列出前 ${PLAN_PREVIEW} 个，共 ${planned.length} 个。`) : null
+      )
+    );
+  }
 
-  return () => {};
-}
+  function render() {
+    if (!serverConfigured(store)) {
+      fill(body, serverMissingNotice("还没有配置同步服务器。"));
+      return;
+    }
+    if (loading && !data) {
+      fill(body, loadingSpinner("正在读取服务器留存状态…"));
+      return;
+    }
+    if (!data) {
+      body.replaceChildren();
+      return;
+    }
+    if (isFailed(data)) {
+      fill(body, statusLine(`读取留存状态失败：${failureReason(data)}`, "error"));
+      return;
+    }
+    const policy = asObject(data.policy);
+    const full = asObject(policy.full_backups);
+    const project = asObject(policy.project_backups);
+    const usage = asObject(data.usage);
+    const planned = Array.isArray(data.planned) ? data.planned : [];
+    const warnings = Array.isArray(data.warnings) ? data.warnings : [];
+    fill(body,
+      facts([
+        ["完整备份保留", keepText(full.keep_per_device_branch, full.max_age_days, "设备")],
+        ["项目备份保留", keepText(project.keep_per_repo_device, project.max_age_days, "项目")],
+        ["服务器容量上限", Number(policy.server_total_max_bytes) > 0 ? formatBytes(policy.server_total_max_bytes) : "不限"],
+        ["当前占用", `${formatBytes(usage.backup_bytes)}（完整 ${usage.full_backup_count || 0} 个 · 项目 ${usage.project_backup_count || 0} 个）`],
+        ["受保护的最新备份", `${usage.protected_count || 0} 个`],
+        ["可清理", planned.length ? `${planned.length} 个 · ${formatBytes(data.planned_bytes)}` : "没有"],
+      ]),
+      warnings.length ? statusLine(warnings.map((w) => RETENTION_WARNINGS[w] || w).join("；"), "warn") : null,
+      planned.length ? planTable(planned) : null
+    );
+  }
 
-function sourceLabel(source) {
-  if (source === "wsl") return "WSL";
-  if (source === "local") return "本地缓存";
-  return "云服务器";
+  async function load({ notify = false } = {}) {
+    if (!serverConfigured(store)) {
+      render();
+      return;
+    }
+    loading = true;
+    render();
+    let result;
+    try {
+      result = await runAction("server-retention-status");
+    } catch (e) {
+      result = { success: false, error: String(e.message || e) };
+    }
+    if (!alive) return;
+    loading = false;
+    data = result;
+    render();
+    if (notify) {
+      if (isFailed(result)) showToast(`读取留存状态失败：${failureReason(result)}`, "error");
+      else showToast("留存状态已刷新", "success");
+    }
+  }
+
+  // 先做一次预演拿到清理清单，确认后再真正删除。
+  async function prune() {
+    if (!serverConfigured(store)) {
+      showToast("还没有配置同步服务器", "warning", { action: { label: "去配置", onClick: () => navigate("settings", "server") } });
+      return;
+    }
+    let preview;
+    try {
+      preview = await runAction("server-retention-prune", { dry_run: true });
+    } catch (e) {
+      showToast(`读取清理计划失败：${e.message || e}`, "error");
+      return;
+    }
+    if (!alive) return;
+    data = preview;
+    render();
+    if (isFailed(preview)) {
+      showToast(`读取清理计划失败：${failureReason(preview)}`, "error");
+      return;
+    }
+    const planned = Array.isArray(preview.planned) ? preview.planned : [];
+    if (!planned.length) {
+      showToast("没有超出留存策略的备份，不需要清理", "info");
+      return;
+    }
+    const fullCount = planned.filter((item) => item.kind === "full_backup").length;
+    const projectCount = planned.length - fullCount;
+    const ok = await confirmDialog({
+      title: "清理服务器上的旧备份？",
+      message: `将从服务器永久删除 ${planned.length} 个备份，释放约 ${formatBytes(preview.planned_bytes)}。删除后无法找回。`,
+      details: [
+        fullCount ? `完整对话备份 ${fullCount} 个` : null,
+        projectCount ? `项目备份 ${projectCount} 个` : null,
+        "每个设备、每个项目最新的一份不会被删除",
+      ],
+      confirmLabel: "永久删除",
+      danger: true,
+    });
+    if (!ok || !alive) return;
+    try {
+      const result = await runAction("server-retention-prune", { dry_run: false });
+      const deleted = Number(result.deleted_count || 0);
+      if (isFailed(result)) {
+        showToast(
+          deleted ? `部分备份没有删掉：已删除 ${deleted} 个，其余失败（${failureReason(result, "服务器删除文件失败")}）` : `清理失败：${failureReason(result)}`,
+          "error"
+        );
+      } else {
+        showToast(`已删除 ${deleted} 个旧备份，释放 ${formatBytes(result.deleted_bytes)}`, "success");
+      }
+    } catch (e) {
+      showToast(`清理失败：${e.message || e}`, "error");
+    }
+    await load();
+  }
+
+  render();
+  load();
+
+  return () => {
+    alive = false;
+  };
 }

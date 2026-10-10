@@ -52,21 +52,21 @@ python -m pytest tests/test_config.py::test_load_config -v
 ## 构建发布
 
 ```powershell
-# Windows EXE 打包（PyInstaller）
-powershell -File scripts/build_windows_release.ps1 -Version 0.2.0
+# Windows 安装包：PyInstaller onedir → Inno Setup 安装向导（-Version 省略时读 __init__.py）
+powershell -File scripts/build_windows_release.ps1 -Version 0.4.0
 ```
 
-打包入口是 `app_entry.py`，产物为 `dist/CodexSyncSetup-vX.Y.Z-windows-x64.exe`。
+需要 PyInstaller、pywebview 和 Inno Setup 6（`winget install JRSoftware.InnoSetup`）。打包入口是 `app_entry.py`，程序目录在 `dist/CodexSync/`，安装包为 `dist/CodexSyncSetup-vX.Y.Z-windows-x64.exe`。安装脚本在 `installer/CodexSync.iss`（中文语言文件、向导图片也在 `installer/`，图片由 `scripts/make_installer_images.py` 生成）。.iss 里的 AppId、互斥体名、Run 值名必须和 `app_install.py` / `SingleInstance` 一致，`tests/test_app_install.py` 会校验。
 
 ## 架构概览
 
 ### 入口层次
 
 ```
-app_entry.py          ← PyInstaller EXE 入口，双击自动安装到 %LOCALAPPDATA%\CodexSync
+app_entry.py          ← PyInstaller EXE 入口：无参数打开桌面端，有参数走 CLI（安装/卸载由 Inno Setup 负责）
 codex_sync/cli.py     ← CLI 入口，argparse 子命令 → 各模块函数
 codex_sync/sync_server.py  ← 独立同步服务器（SQLite + HTTP），部署到 Linux
-codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
+codex_sync/__init__.py     ← 版本号 __version__ = "0.4.0"
 ```
 
 ### 桌面端架构 (web_desktop.py)
@@ -79,9 +79,14 @@ codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
 - **前端 SPA**: `codex_sync/web/` 目录，纯 vanilla JS，无框架依赖。
   - `js/main.js` — 入口，初始化 store、注册路由、启动轮询
   - `js/store.js` — 轻量响应式 store（`getState`/`setState`/`subscribe`/`select`）
-  - `js/router.js` — hash 路由
+  - `js/router.js` — hash 路由（`#/route/sub`，sub 为页内二级页签；`setLeaveGuard` 用于未保存修改的离开确认）
   - `js/api.js` — HTTP API 封装
-  - `js/views/` — 各页面视图（overview、conversations、project、backups、settings、logs、drawer）
+  - `js/ui.js` — 共享 UI：`makeRun` 统一动作执行器、`actionButton`、`createSubTabs`、`switchControl`/`switchRow`、`serverMissingNotice`
+  - `js/format.js` — 时间/大小/倒计时格式化、`facts`、`statusLine`、`loadingSpinner`、`isFailed`/`failureReason` 等
+  - `js/dialog.js` — 模态对话框（`showDialog`、`confirmDialog`、`confirmCloseCodex`），视图里不要用 `window.confirm`
+  - `js/toast.js`、`js/markdown.js`（对话消息渲染）、`js/connection.js`（服务器连接状态）
+  - `js/views/` — 页面视图（overview、conversations、project、backups、settings），`logs` 是常驻日志面板
+  - 样式在 `styles/`（tokens / base / layout / components），浅色/深色主题由 CSS 变量和 `<html data-theme>` 控制；视图里不写内联样式
 - **系统托盘**: `WindowsTrayIcon` 类，原生 Win32 API 实现（`Shell_NotifyIconW`），支持双击还原、右键菜单（显示/退出）。
 - **单实例**: `SingleInstance` 类，Windows Named Mutex，防止重复启动。
 - **关闭行为**: `desktop_close_behavior` 配置（ask/minimize_to_tray/exit），首次关闭弹出原生 MessageBox 询问。
@@ -106,8 +111,8 @@ codex_sync/__init__.py     ← 版本号 __version__ = "0.2.0"
 | `disaster_backup.py` | 敏感写入前的本地灾难备份 |
 | `paths.py` | 路径常量：`~/.codex-sync/`（本应用数据）、`~/.codex/`（Codex 数据） |
 | `project_auto_backup.py` | 项目自动备份队列、Git post-commit hook 集成 |
-| `app_install.py` | EXE 安装到 `%LOCALAPPDATA%\CodexSync`、快捷方式、开机自启 |
-| `app_update.py` | 应用更新检查/下载 |
+| `app_install.py` | 读取 Inno Setup 写入的安装信息、开机自启（HKCU Run）、卸载前清理（`uninstall-cleanup`：撤掉指向本 exe 的 hooks 和定时任务） |
+| `app_update.py` | 应用更新检查/下载，运行下载好的安装程序 |
 
 ### 数据流
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import subprocess
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
@@ -323,6 +324,28 @@ def download_latest_update(*, force: bool = False, timeout: int = 60, target_dir
         "sha256": actual,
         "verified": bool(expected),
     }
+
+
+def launch_update_installer(path: str) -> dict[str, Any]:
+    """运行已下载的安装程序。只接受下载目录里的 CodexSyncSetup*.exe，避免被前端拿来执行任意程序。"""
+    raw = str(path or "").strip()
+    if not raw:
+        return {"success": False, "error": "没有可安装的更新包，请先下载。"}
+    try:
+        target = Path(raw).expanduser().resolve()
+        download_dir = _default_download_dir().resolve()
+    except OSError as exc:
+        return {"success": False, "error": str(exc)}
+    if target.parent != download_dir or target.suffix.lower() != ".exe" or not target.name.lower().startswith("codexsyncsetup"):
+        return {"success": False, "error": "只能运行更新下载目录里的 Codex Sync 安装程序。", "path": str(target)}
+    if not target.is_file():
+        return {"success": False, "error": "安装程序不存在，可能已被删除，请重新下载。", "path": str(target)}
+    try:
+        subprocess.Popen([str(target)], cwd=str(target.parent), close_fds=True)
+    except OSError as exc:
+        # 常见原因：Windows 智能应用控制 / SmartScreen 拦截了未签名的安装程序
+        return {"success": False, "path": str(target), "error": f"无法启动安装程序：{exc}"}
+    return {"success": True, "launched": True, "path": str(target)}
 
 
 def open_update_page(*, force: bool = False) -> dict[str, Any]:

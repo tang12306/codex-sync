@@ -1,4 +1,4 @@
-/* reset + 基础排版 + 滚动条 */
+/* reset + 基础排版 + 焦点 + 滚动条 */
 
 *,
 *::before,
@@ -21,7 +21,7 @@ body {
   color: var(--text);
   font-family: var(--font-sans);
   font-size: 14px;
-  line-height: 1.5;
+  line-height: 1.55;
   -webkit-font-smoothing: antialiased;
 }
 
@@ -29,17 +29,17 @@ h1,
 h2,
 h3,
 h4 {
-  font-weight: 650;
-  line-height: 1.25;
+  font-weight: 600;
+  line-height: 1.3;
 }
 
 a {
-  color: var(--accent);
+  color: var(--accent-fg);
   text-decoration: none;
 }
 
 a:hover {
-  color: var(--accent-hover);
+  text-decoration: underline;
 }
 
 code,
@@ -64,28 +64,55 @@ select,
 textarea {
   font-family: inherit;
   font-size: inherit;
+  color: inherit;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+/* 键盘焦点：只在键盘导航时显示，鼠标点击不出现 */
+:focus {
+  outline: none;
+}
+:focus-visible {
+  outline: none;
+  box-shadow: var(--focus-ring);
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }
 
 /* 滚动条 */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 10px;
+  height: 10px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.08);
+  background: var(--scroll-thumb);
   border-radius: 999px;
-  border: 2px solid var(--bg);
+  border: 2px solid transparent;
+  background-clip: padding-box;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.2);
+  background: var(--scroll-thumb-hover);
+  background-clip: padding-box;
 }
 
-/* 尊重系统的减弱动效偏好 */
+/* 尊重系统的减弱动效偏好（无障碍覆盖，需要压过组件里的动画） */
 @media (prefers-reduced-motion: reduce) {
-  * {
+  *,
+  *::before,
+  *::after {
     transition: none !important;
     animation: none !important;
   }
