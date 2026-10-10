@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -15,36 +16,44 @@ from pathlib import Path
 
 OWNER = "tang12306"
 REPO = "codex-sync"
-TAG = "v0.4.0"
-NAME = "Codex Sync v0.4.0"
 ROOT = Path(__file__).resolve().parent.parent
-ASSET = ROOT / "dist" / "CodexSyncSetup-v0.4.0-windows-x64.exe"
-SHA = ROOT / "dist" / "CodexSyncSetup-v0.4.0-windows-x64.exe.sha256"
+# 版本号跟随 codex_sync/__init__.py，发布前先改版本、跑 build_windows_release.ps1
+VERSION = re.search(r'__version__\s*=\s*"([^"]+)"', (ROOT / "codex_sync" / "__init__.py").read_text(encoding="utf-8")).group(1)
+TAG = f"v{VERSION}"
+NAME = f"Codex Sync v{VERSION}"
+ASSET = ROOT / "dist" / f"CodexSyncSetup-v{VERSION}-windows-x64.exe"
+SHA = ROOT / "dist" / f"CodexSyncSetup-v{VERSION}-windows-x64.exe.sha256"
 
-NOTES = """# Codex Sync v0.4.0
+NOTES = rf"""# Codex Sync v{VERSION}
 
-本次主题是「精简瘦身」：移除已无意义的「云端轻量接力快照」，并大幅简化界面，让常用操作一眼看懂、好用。
+本次主题是「正规安装程序 + 界面全面改版」：安装、升级、卸载都和常见的 Windows 软件一样了，几个主要页面也重新排版。
 
-## 🧹 彻底移除云端轻量接力快照
-- 前后端整体移除「轻量快照」（记录 cwd / git / 配置元数据的诊断快照）及其上传管线、服务器存储、还原/接续抽屉。
-- **完整对话备份、项目备份完全不受影响**，仍可正常备份/恢复。
-- 同步服务器 API 升级到 v5（features 不再含 `snapshots`）。
+## 📦 全新安装程序
+- 换成标准的 Windows 安装向导：欢迎页 → 许可协议 → 选择安装目录 → 附加任务（桌面快捷方式 / 开机自启）→ 安装 → 完成。
+- 默认按当前用户安装到 `%LOCALAPPDATA%\Programs\CodexSync`，无需管理员权限。
+- 在「设置 → 应用 → 已安装的应用」里可以看到 Codex Sync 并正常卸载。卸载会撤掉指向本程序的 Codex hooks 和定时任务，`~/.codex-sync` 里的配置和备份记录会保留。
+- 安装 / 卸载前会检测正在运行的 Codex Sync 并提示关闭。
+- 程序文件带版本信息（右键 → 属性 → 详细信息）。
 
-## ✨ 界面精简
-- 删除四个页面底部冗余的「输出详情 / 原始详情」大方框，操作成功/失败统一由右上角提示反馈。
-- 「备份与恢复 → 云端」标签只保留云端完整备份列表；移除快照表与详情/接续/还原抽屉。
-- 修复「恢复目标目录」单行输入框被错误撑成大方框的样式问题。
-- 移除项目页低密度的「备份内容 / 安全边界」说明卡，清理大量死代码（约 -2500 行）。
+## ✨ 界面改版
+- 项目备份、对话、备份与恢复、系统设置页面重新排版；页内二级页签，刷新后停留在原来的页签。
+- 系统设置底部固定保存栏，支持 Ctrl+S；有未保存的修改时离开页面会先确认。
+- 统一的确认对话框，浅色 / 深色主题可切换。
+- 修复界面上出现「nullnull」等显示问题。
 
-## 🔧 其它（自上个版本累积）
-- 项目自动备份统一为完整快照、支持「一键恢复最新完整版」、项目实时备份。
-- 「立即同步」语义更新为：扫描并上传完整对话备份 + 处理项目自动备份队列。
+## 🔄 应用内更新
+- 「系统设置 → 安装与自动化」下载新版后，可以直接点「立即安装」原地升级。
 
-## 📦 安装
-下载 `CodexSyncSetup-v0.4.0-windows-x64.exe`，双击按向导安装即可。无需管理员权限（安装到当前用户目录）。
+## 🔧 修复
+- 修复 Windows 定时任务每次运行都会失败的问题；打包版的定时任务改为直接调用程序本身。
+- 对话很多时会提示列表已截断；日志里的敏感字段会脱敏。
 
-## ⚠️ 升级提示
-服务器端需重新部署到 v5（在「系统设置 → 服务器与部署 → 一键更新部署」即可推送）。SHA256 见随附的 `.sha256` 文件。
+## ⬆️ 从 0.4.0 升级
+下载 `CodexSyncSetup-v{VERSION}-windows-x64.exe` 双击安装即可。安装程序会默认装回原来的目录并接管旧安装（旧的「卸载 Codex Sync」快捷方式会被清理）；如果旧版正在运行，会先提示关闭。
+服务器端无需更新（同步服务器 API 仍为 v5）。
+
+## ⚠️ 提示
+安装包暂未做代码签名，Windows 可能提示「Windows 已保护你的电脑」，点「更多信息 → 仍要运行」即可；开启了「智能应用控制」的电脑可能会直接拦截。SHA256 见随附的 `.sha256` 文件。
 """
 
 TOKEN = os.environ.get("CODEX_GH_TOKEN") or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
